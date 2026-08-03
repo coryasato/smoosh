@@ -132,14 +132,61 @@ const Model = struct {
 ```
 (Fixed buffers, not `[]const u8`/`ArrayList`, because `Model` is a plain struct `UiApp` heap-allocates via `create` — see native-ui's Zig-0.16 idioms. Derived display strings — savings text, formatted sizes — are `pub fn` methods over the model, per "Derive, don't store.")
 
+### Msg sketch (high level)
+```zig
+const Msg = union(enum) {
+    pick_file,                          // "Choose Image…" clicked
+    dialog_result: DialogResult,        // host open-dialog callback
+    image_loaded: ImageLoadResult,      // fx.loadImage/registerImageBytes callback
+    set_format: Format,                 // format radio changed
+    smoosh,                             // "Smoosh" clicked
+    encode_result: EncodeResult,        // fx.spawn callback, one per format encoded
+    save_as,                            // "Save As…" clicked
+    save_as_dialog_result: DialogResult,// host save-dialog callback
+    save_as_result: SaveResult,         // fx.writeFile/copy callback
+    encoder_check_result: EncoderCheckResult, // launch-time `which avifenc`/`which cwebp`
+};
+```
+
 ## Next up (start of next session)
 
-The file-acquisition unknown is resolved — nothing left to spike before writing the real app. Next session should go straight to implementation:
+The file-acquisition unknown is resolved — nothing left to spike before writing the real app. Milestones are ordered by dependency; each ends with a `native build` + `native automate widget-click` (or equivalent) check against the *running* app, not just a compile check. Bracketed refs are the MVP success-criteria checkboxes (lines 9-17) each milestone satisfies.
 
-1. **Convert the project from TS-core to Zig-core.** Currently `src/core.ts` + `src/app.native` are still the original TS-core scaffold (app.zon has the placeholder "counter" window/description too). Per CLAUDE.md's "Why Zig, not TS-core," delete `src/core.ts`, add `src/main.zig`, and update `app.zon`'s `description`/window title away from the scaffold defaults. `docs/spikes/dialog-open-file-spike.zig` is the starting point for `main.zig`'s app/Runtime/dialog wiring — adapt it rather than rewriting from scratch.
-2. **Build out the real `Model`/`Msg`** per the "Core model sketch" above (file path, preview image id, per-format output paths/sizes, `Format`, `Status`, error message buffer).
-3. **Wire "Choose Image…"** using the spike's `pick_file` -> `HostBridge` -> `showOpenDialog` pattern, but land the result as a real path into `Model` (not just a display string) and follow up with an `fx.loadImage`/`fx.registerImageBytes` call for the preview.
-4. **Encoder detection at launch**: `fx.spawn` a presence check for `avifenc`/`cwebp` (e.g. `which avifenc`), surface the "Error states" messaging from this file if either is missing.
-5. **Wire "Smoosh"**: `fx.spawn` the actual `avifenc`/`cwebp` invocation(s) per the selected `Format`, auto-save next to source, compute before/after size + savings %, update `Status`.
-6. **Build the drop-zone UI** (`src/app.native`) per the "UI sketch" above, once 1–3 are working — the CLAUDE.md guidance is explicit that UI comes after the file-acquisition seam is proven, and it now is.
-7. Stretch, only after the above: investigate whether `.native` markup exposes an app-facing file-drop hook (see CLAUDE.md's "still open" note) — not required for v0.1 since the open dialog already works.
+**M1 — Zig-core skeleton.**
+Delete `src/core.ts`, add `src/main.zig`, update `app.zon`'s `description`/window title away from the "counter" scaffold defaults. Adapt `docs/spikes/dialog-open-file-spike.zig` for app/Runtime bring-up (hand-rolled `Runtime.initAt` + `MacPlatform.createWithOptions`, per CLAUDE.md's "File acquisition, honestly") — no dialog wiring yet, just an app that launches to an empty window.
+*Verify:* `native build` succeeds, app launches to a blank window.
+
+**M2 — Model/Msg skeleton.**
+Add the real `Model` (per "Core model sketch") and `Msg` (per "Msg sketch" above) to `main.zig`, with a no-op `update`. No UI yet.
+*Verify:* builds clean, `native check` passes.
+
+**M3 — File acquisition.** [✓ "pick an image via Choose Image…", ✓ "preview with original size"]
+Wire `pick_file` -> `HostCallBinding` -> `showOpenDialog` (spike pattern), landing the real path into `Model.path_buffer` (not a display string). Follow with `fx.loadImage`/`fx.registerImageBytes` for the preview and populate `original_size`.
+*Verify:* `native automate widget-click` on "Choose Image…" against a real file, confirm `Model` holds the real path + size, preview image id is set.
+
+**M4 — Encoder detection at launch.** [✓ error-state: encoder binary missing]
+`fx.spawn` a presence check for `avifenc`/`cwebp` (e.g. `which avifenc`) on startup, land results as `encoder_check_result`, surface the "Error states" messaging if either is missing.
+*Verify:* temporarily rename/hide one binary, confirm the correct `brew install` message renders; restore and confirm no error state.
+
+**M5 — Format selection.** [✓ "choose output: AVIF / WebP / Both"]
+Wire `set_format` from the three format controls to `Model.format`.
+*Verify:* click each option, confirm `Model.format` updates and the correct one renders selected.
+
+**M6 — Smoosh encode pipeline.** [✓ "Smoosh produces selected format(s) and auto-saves", ✓ "before/after size + savings % shown"]
+Wire `smoosh` -> `fx.spawn` the `avifenc`/`cwebp` invocation(s) per `Model.format`, auto-save next to source (silent overwrite per "Output handling"), land results as `encode_result`, compute before/after size + `savings_percent`, update `Status` through `compressing` -> `done`/`error`. Cover the "Encode failed" and "write failed" error states from this file.
+*Verify:* run against a real image for AVIF, WebP, and Both; confirm output files exist next to source with correct sizes and the UI shows accurate savings %.
+
+**M7 — Save As.** [✓ "optionally re-save output to a different location"]
+Wire `save_as` -> `showSaveDialog` -> copy/write the already-produced output(s) to the chosen location. Does not replace auto-save from M6.
+*Verify:* after a successful Smoosh, trigger Save As, confirm the file lands at the chosen path with matching bytes.
+
+**M8 — Drop-zone UI assembly** (`src/app.native`). [✓ "launches to a clean drop-zone UI", ✓ works at small window sizes]
+Build the real markup per the "UI sketch" above, binding every control to the `Msg`s wired in M3-M7. Confirm layout holds up at a small window size (per CLAUDE.md's "UI should work well at small window sizes").
+*Verify:* resize the window small, run the full empty -> loading -> ready -> compressing -> done flow via `native automate`, confirm no layout breakage.
+
+**M9 — Input size limits.** [✓ "reasonable input size limits with clear feedback"]
+Enforce the 80-100MB / 40-50 megapixel soft limit from "Input size limits" at file-load time (M3's `image_loaded` path), surfacing the matching error state.
+*Verify:* attempt to load an oversized test file, confirm the friendly limit message renders and no encode is attempted.
+
+**M10 — Stretch: file-drop hook.**
+Only after M1-M9 are solid and verified. Investigate whether `.native` markup exposes an app-facing `on-file-drop` seam (see CLAUDE.md's "still open" note). Not required for v0.1 — the open dialog already satisfies file acquisition.
