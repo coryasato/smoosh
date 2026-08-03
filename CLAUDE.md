@@ -35,25 +35,69 @@ Still open, now that the seam is proven: whether a drop-zone `on-file-drop` mark
 5. **Honest about constraints** — Native SDK has no built-in encoder. We start with system tools, then move to a fully native Zig pipeline.
 6. **macOS-first** — optimize for Apple Silicon and ImageIO. No Linux/Windows scope in v0.1.
 
-## Key Native SDK capabilities we will use
-- `file_drops` capability, `dialog` capability
+## Working in this repo
+
+**Read the `native-ui` skill before writing any `.native` markup or `UiApp` Zig**, and the
+`native-sdk` skill for scaffolding, `app.zon`, and packaging questions. They are the authoritative
+authoring guides; this file only records project-specific decisions.
+
+### Toolchain (verified 2026-08-03)
+- `native` CLI **0.8.0**, installed globally (`~/.npm-global/bin/native`) — not a devDependency.
+- Zig **0.16.0** (`/usr/local/bin/zig-aarch64-macos-0.16.0/zig`).
+- `node_modules/` + `package.json` + `tsconfig.json` are an **editor-only** surface for the
+  now-abandoned TS-core path. Builds never read them. Do not run installs to "fix" a build.
+
+### Commands
+```sh
+native dev      # Debug build + run, markup hot reload
+native build    # ReleaseFast binary into zig-out/bin/
+native check    # validate markup + app.zon
+native test     # app test suite
+native package --target macos [--signing ...]
+native automate snapshot                       # widget ids (bare numbers, printed as #id)
+native automate widget-click <view-label> <id> # drive the running app
+native automate screenshot <view-label>        # gpu_surface views only
+```
+`native dev --core` is TS-core only and does not apply here.
+Widget clicks take a **numeric id from `snapshot`**, not a label — snapshot first.
+
+### Repo layout
+- `src/main.zig` — the app (does not exist yet; created in M1).
+- `src/app.native` — markup view.
+- `src/core.ts` — **stale TS-core scaffold, delete in M1.** The build hard-panics if both it and
+  `main.zig` exist.
+- `README.md` — rewritten for Smoosh; keep the Status section honest as milestones land.
+- `package.json` / `tsconfig.json` — dead TS-core editor surface, deleted in M1 with `core.ts`.
+- `docs/spikes/` — reference implementations, not built as part of the app.
+
+### Gotcha: window config exists twice
+A hand-authored `main.zig` builds its own `native_sdk.ShellConfig` in Zig and passes it to
+`App.create(.{ .scene = ... })` — that is what actually renders. `app.zon`'s `.shell.windows` still
+drives identity, `native check`, and packaging. Edit both together or they silently disagree.
+
+## Native SDK surfaces this app uses
 - Native dialogs (`runtime.showOpenDialog`/`showSaveDialog`, wired through a custom `HostCallBinding` — see "File acquisition, honestly")
 - `fx.loadImage` / `fx.registerImageBytes` + `<image>` for previews
 - `fx.spawn` (for system tools in Phase A)
 - `fx.readFile` / `fx.writeFile`
 - Hot-reload on `.native` files (Debug builds, via `.markup.watch_path`)
+- Manifest: `capabilities = .{ "native_views", "gpu_surfaces" }` — markup renders onto a
+  gpu_surface, so `gpu_surfaces` stays. Permissions are just `command` + `view`; the dialog spike
+  needed nothing more. (An earlier draft of this file claimed `dialog` and `file_drops`
+  *capabilities* — no evidence either exists. Do not add them speculatively.)
 
 ## Conventions
 - Zig core (`src/main.zig`) — no TypeScript in this tree.
 - Messages are narrow and explicit.
 - Keep `update`/`update_fx` pure and small. Heavy work lives in effects (`fx`).
+- `Model` is a plain struct heap-allocated by `UiApp.create`: fixed-size buffers, not slices or
+  `ArrayList`. Derive display strings via `pub fn` methods rather than storing them.
+- `error` is a Zig keyword — enum states use `failed`, not `error`.
 - UI should work well at small window sizes (the app is meant to live in a corner of the desktop).
+- Verify against the *running* app via `native automate`. A clean `native build` proves nothing
+  about behavior.
 
 ## Current status
-See `PLAN.md`. Decisions locked:
-- System tools for MVP encoding
-- macOS only
-- Format choice: AVIF (default) / WebP / Both
-- Reasonable input size limits
-- Auto-save output next to source; overwrite existing output silently
-- Missing encoder binaries: detect at launch, show install instructions (no auto-install)
+Planning done, no app code written yet. **`PLAN.md` is the source of truth** for milestones,
+locked decisions, per-milestone model/session guidance, and open questions. Do not restate its
+contents here — link to it.

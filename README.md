@@ -1,48 +1,87 @@
 # Smoosh
 
-A native app authored in TypeScript and markup: the logic lives in
-`src/core.ts` (Model, Msg, update - the app-core subset, compiled to
-native code at build time; no JS runtime ships in the binary) and the
-view in `src/app.native`. There is no Zig in this tree and nothing to
-configure: the build detects `src/core.ts` and wires everything.
+A tiny native macOS app that compresses images into modern web formats — drop an
+image in, get AVIF and/or WebP back, next to the original. No upload, no browser
+tab, no account.
 
-## The loop
+It exists to replace the "open TinyPNG / Squoosh in a tab" workflow with
+something local and instant.
 
-```sh
-native dev --core   # fastest: run the core's logic under node -
-                    # dispatch messages as JSON lines, watch the model
-                    # and effect transcript (not a renderer)
-native dev          # build and run the real app (markup hot reload)
-native check        # verify core.ts (subset checker) + markup + app.zon
-native build        # ReleaseFast binary in zig-out/bin/
-native test         # the app's test suite
-```
+## Status
 
-Edit `src/core.ts` for behavior, `src/app.native` for the view, and
-`app.zon` for windows/identity/permissions. Markup binds the model's
-field names exactly as core.ts wrote them (`tickCount` -> `{tickCount}`),
-and exported single-model helpers bind as derived values (`{total}`).
+**Pre-implementation.** The architecture is decided and the risky unknown
+(native file dialogs from a hand-authored Zig core) has been spiked and proven,
+but no app code is written yet — `src/main.zig` does not exist.
 
-## Try the core loop
+See [PLAN.md](PLAN.md) for milestones, locked decisions, and open questions.
+See [CLAUDE.md](CLAUDE.md) for working context and toolchain notes.
 
-```sh
-printf '%s\n' '{"kind":"increment"}' '{"kind":"toggle_ticking"}' '{"advance":3000}' | native dev --core
-```
+## How it works
 
-## Editor support
+Built on the [Native SDK](https://native-sdk.dev): the view is declarative
+markup (`src/app.native`), the logic is plain Zig on a `Model` / `Msg` / `update`
+loop, and the SDK's own engine renders every pixel. No web view, no JS runtime in
+the binary.
 
-Stock editor TypeScript just works: `package.json` and `tsconfig.json`
-are the editor-and-versioning surface (the tsconfig mirrors the checker's
-own options, so editor errors match `native check`), and
-`node_modules/@native-sdk/core` is a CLI-managed copy of the SDK package
-so `@native-sdk/core` resolves with full IntelliSense. Builds never read
-any of it — delete node_modules and every `native` verb still works; the
-next `native check`/`dev`/`build` puts it back. Running `npm install`
-is optional for the same reason: the CLI materializes and refreshes the
-package itself, and an install simply lands the identical content once
-`@native-sdk/core` is on npm.
+Encoding is phased:
+
+- **Phase A (MVP)** — shell out to `avifenc` and `cwebp` through the effects
+  channel's `fx.spawn`. Fast to build, fast to iterate on the UI.
+- **Phase B (later)** — decode through Apple's ImageIO, encode through
+  statically linked libavif/libwebp. One self-contained binary.
+
+The Native SDK ships no image encoder, so Phase A depends on tools you install
+yourself. Smoosh detects them at launch and tells you what is missing — it never
+installs anything on your behalf.
 
 ## Requirements
 
-Node.js 22.15+ (on the 23 line: 23.5+) on PATH (the TypeScript-to-native
-transpiler runs at build time; your shipped binary carries none of it).
+- macOS (Apple Silicon targeted; no Linux or Windows in v0.1)
+- [`native`](https://native-sdk.dev) CLI **0.8.0**
+- Zig **0.16.0**
+- Encoders, for Phase A:
+  ```sh
+  brew install libavif   # provides avifenc
+  brew install webp      # provides cwebp
+  ```
+
+## Development
+
+```sh
+native dev      # Debug build + run, with markup hot reload
+native build    # ReleaseFast binary into zig-out/bin/
+native check    # validate markup + app.zon
+native test     # test suite
+```
+
+Driving the running app:
+
+```sh
+native automate snapshot                        # list widget ids
+native automate widget-click <view-label> <id>  # ids are bare numbers from snapshot
+native automate screenshot <view-label>
+```
+
+A clean `native build` proves the code compiles, not that it works — changes are
+verified against the running app.
+
+## Layout
+
+```
+src/main.zig      the app: Model, Msg, update, effects        (added in M1)
+src/app.native    the view                                    (added in M2)
+app.zon           identity, window, permissions, capabilities
+docs/spikes/      proven reference implementations; not built as part of the app
+PLAN.md           milestones and decisions
+CLAUDE.md         working context for AI assistants
+```
+
+`package.json` and `tsconfig.json` are leftovers from an abandoned TypeScript
+core and serve the editor only — the build never reads them. They come out in M1
+along with `src/core.ts`.
+
+## Non-goals for v0.1
+
+Batch processing, quality sliders, side-by-side comparison, animated images, SVG,
+in-app editing, cloud upload or history, and any dependency on Node, ImageMagick,
+or Sharp.
