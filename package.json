@@ -2,7 +2,7 @@
   "name": "smoosh",
   "version": "0.1.0",
   "private": true,
-  "description": "Editor-only surface, retired at M1. Smoosh is a Zig-core Native SDK app: the native CLI never reads this file, the Zig SDK resolves from a bun global install via .native/build/build.zig.zon, and @native-sdk/core exists solely to give the editor IntelliSense for the leftover src/core.ts. Delete this file, tsconfig.json, and src/core.ts together in M1.",
+  "description": "A tiny native macOS app that compresses images into modern web formats.",
   "license": "MIT",
   "dependencies": {
     "@native-sdk/core": "^0.8.0"

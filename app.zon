@@ -2,7 +2,7 @@
     .id = "dev.native_sdk.smoosh",
     .name = "smoosh",
     .display_name = "Smoosh",
-    .description = "A counter that lives in one native window.",
+    .description = "A tiny native macOS app that compresses images into modern web formats.",
     .version = "0.1.0",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
