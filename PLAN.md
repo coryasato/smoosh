@@ -54,7 +54,7 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 - When “Both” is selected, write two files (e.g. `photo.avif` + `photo.webp`) and show combined savings.
 
 ### File acquisition
-- Primary: native open dialog via `runtime.showOpenDialog`, called from a `HostCallBinding.request_fn` we bind ourselves in `src/main.zig` (see CLAUDE.md's "File acquisition, honestly"). Requires constructing `Runtime` by hand (`native_sdk.Runtime.init` + `runtime.run(app)`) instead of the CLI's `runner.runWithOptions` convenience wrapper, so `main.zig` can hold a `*Runtime` to close over. **Unspiked**: the exact `HostCallBinding` + `fx.hostRequest` wiring hasn't been built end-to-end yet; validate with a throwaway example before committing the real UI around it.
+- Primary: native open dialog via `runtime.showOpenDialog`, called from a `HostCallBinding.request_fn` we bind ourselves in `src/main.zig` (see CLAUDE.md's "File acquisition, honestly"). Requires constructing `Runtime` by hand (`native_sdk.Runtime.init` + `runtime.run(app)`) instead of the CLI's `runner.runWithOptions` convenience wrapper, so `main.zig` can hold a `*Runtime` to close over. **Spiked and confirmed working (2026-08-03)** end-to-end against a real macOS open panel — reference implementation at `docs/spikes/dialog-open-file-spike.zig`, ready to transplant.
 - Stretch (post-spike): file-drop widget events (`canvas_widget_file_drop` — internal runtime plumbing exists but no documented app-facing hook yet; investigate `ElementOptions` for a drop-target seam once the dialog path works) or file-association / CLI-arg opening (`native app.jpg`) as a zero-click alternative.
 - Accept common raster formats that macOS ImageIO / platform codecs can decode (JPEG, PNG, WebP, HEIC, etc.)
 
@@ -131,3 +131,15 @@ const Model = struct {
 };
 ```
 (Fixed buffers, not `[]const u8`/`ArrayList`, because `Model` is a plain struct `UiApp` heap-allocates via `create` — see native-ui's Zig-0.16 idioms. Derived display strings — savings text, formatted sizes — are `pub fn` methods over the model, per "Derive, don't store.")
+
+## Next up (start of next session)
+
+The file-acquisition unknown is resolved — nothing left to spike before writing the real app. Next session should go straight to implementation:
+
+1. **Convert the project from TS-core to Zig-core.** Currently `src/core.ts` + `src/app.native` are still the original TS-core scaffold (app.zon has the placeholder "counter" window/description too). Per CLAUDE.md's "Why Zig, not TS-core," delete `src/core.ts`, add `src/main.zig`, and update `app.zon`'s `description`/window title away from the scaffold defaults. `docs/spikes/dialog-open-file-spike.zig` is the starting point for `main.zig`'s app/Runtime/dialog wiring — adapt it rather than rewriting from scratch.
+2. **Build out the real `Model`/`Msg`** per the "Core model sketch" above (file path, preview image id, per-format output paths/sizes, `Format`, `Status`, error message buffer).
+3. **Wire "Choose Image…"** using the spike's `pick_file` -> `HostBridge` -> `showOpenDialog` pattern, but land the result as a real path into `Model` (not just a display string) and follow up with an `fx.loadImage`/`fx.registerImageBytes` call for the preview.
+4. **Encoder detection at launch**: `fx.spawn` a presence check for `avifenc`/`cwebp` (e.g. `which avifenc`), surface the "Error states" messaging from this file if either is missing.
+5. **Wire "Smoosh"**: `fx.spawn` the actual `avifenc`/`cwebp` invocation(s) per the selected `Format`, auto-save next to source, compute before/after size + savings %, update `Status`.
+6. **Build the drop-zone UI** (`src/app.native`) per the "UI sketch" above, once 1–3 are working — the CLAUDE.md guidance is explicit that UI comes after the file-acquisition seam is proven, and it now is.
+7. Stretch, only after the above: investigate whether `.native` markup exposes an app-facing file-drop hook (see CLAUDE.md's "still open" note) — not required for v0.1 since the open dialog already works.
