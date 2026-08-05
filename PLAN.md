@@ -323,20 +323,59 @@ Settled here:
 *Verified:* `native test` 10/10 pass; `native check` still clean with only the expected
 unbound-field warnings (no new ones).
 
-**M3 — File acquisition + preview.** *(Opus, fresh session)* [✓ "pick an image via Choose Image…", ✓ "preview with original size"]
-Wire `pick_file` -> `HostCallBinding` -> `showOpenDialog` (spike pattern), landing the real path into
-`Model.path_buffer` (not a display string). Follow with `fx.loadImage`/`fx.registerImageBytes` for the
-preview and populate `original_size`. Wire `reset` while here — it is trivial now and awkward to retrofit.
-*Opus because:* transplanting the host-call binding means holding the whole spike (237 lines of
-unfamiliar API) in context and adapting it to a different Model; the `Effects`/`feedHostResult`
-seam is the least forgiving code in the project.
-*Fresh session because:* the spike file is the context that matters here, and M1/M2's scaffold churn is noise.
-*Verify:* `native automate widget-click` on "Choose Image…" against a real fixture, confirm `Model`
-holds the real path + size and the preview renders.
+**M3 — File acquisition + preview.** *(Opus, fresh session)* [✓ "pick an image via Choose Image…", ✓ "preview with original size"] — **DONE**
+Transplanted the spike's `HostBridge` into `src/main.zig` and wired the pick chain. The load is four
+hops, one `update` arm each: `pick_file` -> `dialog.openFile` -> `file.stat` -> `sips` thumbnail ->
+`fx.loadImage` -> `.ready`. `reset` landed here too.
+Settled/found here:
+- **The preview MUST be a downscaled thumbnail — this is a hard SDK bound, not a shortcut.** Registered
+  images are capped at **1 MiB of DECODED RGBA** (`max_registered_canvas_image_pixel_bytes`, i.e. 512x512
+  exactly) and `fx.loadImage` refuses encoded sources past 1.25 MiB. *No real photo can ever be
+  registered directly* — `large.jpg` (5.6 MB) and even a 1 MB JPEG both blow the decoded bound. So
+  `stat_result` spawns `/usr/bin/sips -s format png -Z 160 <src> --out $TMPDIR/smoosh/preview.png`
+  and `fx.loadImage` reads *that*. Measured across every fixture: 160px thumbnails come out 752 B -
+  37 KB, three orders of magnitude inside the bound. (This means M3 uses `fx.spawn` before M5 does;
+  `sips` is a macOS system binary, so it needs no detection and no `brew install` path. Absolute
+  path, so it does not depend on the inherited `PATH`.)
+- **`fx.readFile` is the wrong tool for images and was never used.** It caps at 1 MiB
+  (`max_effect_file_bytes`) and returns `.truncated` past it — M2's note that `image_loaded` is "really
+  the `fx.readFile` result Msg" is superseded: `image_loaded` carries `EffectImageResult`, and
+  `fx.loadImage` does read + decode + register in one effect with one terminal Msg.
+- **`original_size` comes from a second host command we bind ourselves, `file.stat`**, which stats via
+  `std.Io.Dir.cwd().statFile` and answers the byte count as decimal text. A stat is far too cheap for a
+  worker thread or a `stat(1)` spawn, and `update` can never hold an `Io` — the bridge can.
+  **M7 should reuse it for the output files' sizes**; that reusability is why it is a separate command
+  rather than being folded into the dialog's reply.
+- **Only the async effects need a stale-result guard.** `thumbnail_result` and `image_loaded` check
+  `status == .loading` first: `.reset` cancels them and the cancellation arrives as an ordinary
+  terminal that is *indistinguishable from a genuine failure*, so without the guard pressing Reset
+  renders "Couldn't build a preview for photo.jpg". `dialog_result`/`stat_result` need no guard — our
+  `HostBridge` answers them synchronously inside `hostRequest`, and cancelling a host request delivers
+  no Msg at all. Both facts are pinned by tests (each guard was mutation-checked).
+- **Reset keeps `Model.format`** and clears everything else — format is a user preference, not per-file state.
+- Two Model fns beyond the sketch: `fileName()` (basename, what every error message names) and
+  `fileSummary(arena)` ("large.jpg (5.6 MB)"), plus `hasPreview()` gating the `<image>`. All derived,
+  none stored. `preview_width`/`preview_height` are stored, from `EffectImageResult` — they are source
+  data (the decode's real output), and binding them keeps the preview's aspect ratio honest.
+- **Known, deferred to M9:** the window logs `zero_canvas_layout` — the M2 shell plus M3's two new rows
+  overflow 480x320 by 77.5px, clipping the Smoosh/Save As row. Real, and exactly what M9's UI pass exists for.
+- Minor: `sips -Z` *upscales* sources smaller than 160px (`tiny.png` renders as a blurry 160x160). Harmless; M9 can clamp.
+*Verified:* `native test` 25/25 (nine new fake-executor tests covering the full chain, both cancel paths,
+every error state, and reset), `native check` clean with only the expected unbound-field warnings, `native build`
+clean. Live under `native dev` against a real `NSOpenPanel` driven to a real fixture: `large.jpg` rendered a
+160x120 preview with `large.jpg (5.6 MB)` and status "Ready to smoosh."; the thumbnail really existed at
+`$TMPDIR/smoosh/preview.png` (35219 B); Reset cleared it; `not-an-image.jpg` produced the exact
+supported-formats message with no preview. `dispatch_errors=0` throughout, screenshot confirms real pixels.
 
 **M4 — Input size limits.** *(Sonnet, share M3's session)* [✓ "reasonable input size limits with clear feedback"]
-Enforce the 80-100MB / 40-50 megapixel soft limit at file-load time, in the `image_loaded` path
-M3 just built, surfacing the matching error state.
+Enforce the 80-100MB / 40-50 megapixel soft limit at file-load time, surfacing the matching error state.
+*Where the two branches actually go, now that M3 exists:* the **byte-size** check belongs in
+`stat_result`, right after `original_size` lands and before the `sips` spawn. The **megapixel** check
+cannot use `image_loaded` — that result carries the *thumbnail's* dimensions (always ≤160px), not the
+source's. Get the source dimensions from the thumbnail spawn instead: add `-g pixelWidth -g pixelHeight`
+to the existing `sips` argv and parse them off `exit.output` (the spawn is already `.collect`), so the
+check costs no extra process. `oversized.jpg` is the fixture that separates the two branches
+(51.2 MP but only 5.7 MB).
 *Moved up from the old M9:* this is a branch inside M3's code path, not a separate feature. Writing
 it five milestones later means re-loading M3's context to add three lines.
 *Verify:* load the oversized fixture, confirm the friendly limit message renders and no preview loads.

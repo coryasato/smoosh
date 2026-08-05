@@ -18,6 +18,7 @@ const native_sdk = @import("native_sdk");
 const main = @import("main.zig");
 
 const canvas = native_sdk.canvas;
+const geometry = native_sdk.geometry;
 const testing = std.testing;
 
 const AppUi = main.AppUi;
@@ -51,6 +52,16 @@ fn findByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8) 
     if (widget.kind == kind and std.mem.eql(u8, widget.text, text)) return widget;
     for (widget.children) |child| {
         if (findByText(child, kind, text)) |found| return found;
+    }
+    return null;
+}
+
+/// For leaves with no text of their own to find them by (the preview
+/// `<image>`), where the kind alone is unambiguous in this view.
+fn findByKind(widget: canvas.Widget, kind: canvas.WidgetKind) ?canvas.Widget {
+    if (widget.kind == kind) return widget;
+    for (widget.children) |child| {
+        if (findByKind(child, kind)) |found| return found;
     }
     return null;
 }
@@ -255,4 +266,406 @@ test "statusLine names every Status, and .failed reports the error message" {
     model.error_message_len = message.len;
     model.status = .failed;
     try testing.expectEqualStrings(message, model.statusLine());
+}
+
+// ============================================================ M3: effects
+//
+// The dialog -> stat -> thumbnail -> preview chain, driven through the fake
+// executor (PLAN.md's "Testing strategy", tier 1): assert the REQUEST each
+// arm made, feed the answer, drain through the same `.wake` path live
+// platforms use, then assert the model. No GUI, no NSOpenPanel, no `sips`.
+
+const App = native_sdk.UiApp(Model, Msg);
+
+/// Where `main.thumbnail_path` points during tests. Never written to — the
+/// spawn is faked and `feedImageResult` delivers a recorded terminal — but
+/// it has to be non-empty, since `fx.loadImage` rejects an empty source
+/// outright and the rejection would mask what the test is checking.
+const test_thumbnail_path = "/tmp/smoosh-tests/preview.png";
+
+const Harness = struct {
+    harness: *native_sdk.TestHarness(),
+    app_state: *App,
+    app: native_sdk.App,
+
+    fn create() !Harness {
+        main.thumbnail_path = test_thumbnail_path;
+
+        const size = geometry.SizeF.init(main.window_width, main.window_height);
+        const harness = try native_sdk.TestHarness().create(testing.allocator, .{ .size = size });
+        errdefer harness.destroy(testing.allocator);
+        harness.null_platform.gpu_surfaces = true;
+
+        // `create`, not `init`: the Model carries three 4 KiB path buffers,
+        // and a by-value Model rides the stack (native-ui's Zig-0.16 idioms).
+        const app_state = try App.create(std.heap.page_allocator, .{
+            .name = "smoosh",
+            .scene = main.shell_scene,
+            .canvas_label = main.canvas_label,
+            .update_fx = main.update,
+            .markup = .{ .source = main.app_markup, .io = testing.io },
+        });
+        errdefer app_state.destroy();
+
+        const app = app_state.app();
+        try harness.start(app);
+        try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+            .label = main.canvas_label,
+            .size = size,
+            .scale_factor = 1,
+            .frame_index = 1,
+            .timestamp_ns = 1_000_000,
+            .nonblank = true,
+        } });
+        try testing.expect(app_state.installed);
+
+        app_state.effects.executor = .fake;
+        return .{ .harness = harness, .app_state = app_state, .app = app };
+    }
+
+    fn destroy(self: *Harness) void {
+        self.app_state.destroy();
+        self.harness.destroy(testing.allocator);
+    }
+
+    fn model(self: *Harness) *Model {
+        return &self.app_state.model;
+    }
+
+    fn fx(self: *Harness) *main.Effects {
+        return &self.app_state.effects;
+    }
+
+    fn send(self: *Harness, msg: Msg) !void {
+        try self.app_state.dispatch(&self.harness.runtime, 1, msg);
+    }
+
+    /// Consume the pending wake requests and deliver one `.wake` for the
+    /// batch — exactly how macOS marshals worker completions onto the loop.
+    fn drain(self: *Harness) !void {
+        var nudged = false;
+        while (self.harness.null_platform.takeWake()) |_| nudged = true;
+        if (nudged) try self.harness.runtime.dispatchPlatformEvent(self.app, .wake);
+    }
+
+    // ------------------------------------------------------------- steps
+    //
+    // The happy path, one fn per hop, so a test that only cares about the
+    // third hop's failure can walk to it without restating the first two.
+
+    fn pick(self: *Harness, path: []const u8) !void {
+        try self.send(.pick_file);
+        const request = self.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+        try testing.expectEqualStrings("dialog.openFile", request.name);
+        try self.fx().feedHostResult(request.key, true, path);
+        try self.drain();
+    }
+
+    fn stat(self: *Harness, size: []const u8) !void {
+        const request = self.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+        try testing.expectEqualStrings("file.stat", request.name);
+        try self.fx().feedHostResult(request.key, true, size);
+        try self.drain();
+    }
+
+    fn thumbnail(self: *Harness, code: i32) !void {
+        const request = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+        try self.fx().feedExit(request.key, code);
+        try self.drain();
+    }
+
+    fn preview(self: *Harness, outcome: native_sdk.EffectImageOutcome, w: u64, h: u64) !void {
+        const request = self.fx().pendingImageLoadAt(0) orelse return error.NoImageLoad;
+        try self.fx().feedImageResult(request.id, outcome, w, h, 0, "");
+        try self.drain();
+    }
+};
+
+test "picking a file lands the real path, its size, and a preview" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const path = "/Users/someone/Pictures/photo.jpg";
+    try h.pick(path);
+
+    // The path is the REAL one from the panel, not a display string.
+    try testing.expectEqualStrings(path, h.model().path());
+    try testing.expectEqual(Status.loading, h.model().status);
+
+    // ...and the stat request carries it as its payload, so the host side
+    // never has to guess which file update meant.
+    const stat_request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stat", stat_request.name);
+    try testing.expectEqualStrings(path, stat_request.payload);
+
+    try h.stat("2516582");
+    try testing.expectEqual(@as(u64, 2516582), h.model().original_size);
+
+    // The preview is a downscaled copy: `sips` reads the source and writes
+    // the thumbnail `fx.loadImage` then reads. Pin the whole argv — a
+    // silently reordered flag would still exit 0 on some other file.
+    const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+    try testing.expectEqual(@as(usize, 9), spawn.argv.len);
+    const expected_argv = [_][]const u8{
+        "/usr/bin/sips", "-s", "format", "png", "-Z", "160", path, "--out", test_thumbnail_path,
+    };
+    for (expected_argv, spawn.argv) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+
+    try h.thumbnail(0);
+
+    const load = h.fx().pendingImageLoadAt(0) orelse return error.NoImageLoad;
+    try testing.expectEqualStrings(test_thumbnail_path, load.path);
+
+    try h.preview(.loaded, 160, 120);
+    try testing.expectEqual(Status.ready, h.model().status);
+    try testing.expect(h.model().image_id != 0);
+    try testing.expect(h.model().hasPreview());
+    try testing.expectEqual(@as(u32, 160), h.model().preview_width);
+    try testing.expectEqual(@as(u32, 120), h.model().preview_height);
+    try testing.expectEqualStrings("", h.model().errorMessage());
+}
+
+test "cancelling the dialog is not an error state" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.pick_file);
+    const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try h.fx().feedHostResult(request.key, false, "cancelled");
+    try h.drain();
+
+    // Back where we started, with nothing to explain to the user.
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqualStrings("", h.model().path());
+    try testing.expectEqualStrings("", h.model().errorMessage());
+}
+
+test "cancelling a re-pick keeps the image already loaded" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("2516582");
+    try h.thumbnail(0);
+    try h.preview(.loaded, 160, 120);
+
+    try h.send(.pick_file);
+    const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try h.fx().feedHostResult(request.key, false, "cancelled");
+    try h.drain();
+
+    // `.ready`, not `.idle`: the previous image is still on screen, so
+    // claiming idle would contradict what the user is looking at.
+    try testing.expectEqual(Status.ready, h.model().status);
+    try testing.expect(h.model().hasPreview());
+}
+
+test "an unreadable file fails, naming the file" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/locked.jpg");
+    const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try h.fx().feedHostResult(request.key, false, "AccessDenied");
+    try h.drain();
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "locked.jpg") != null);
+    // PLAN.md's "Status → error mapping": `.failed` always surfaces the
+    // error buffer through the status line, never a canned string.
+    try testing.expectEqualStrings(h.model().errorMessage(), h.model().statusLine());
+}
+
+test "a non-image input fails with the supported-formats message" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/not-an-image.jpg");
+    try h.stat("128");
+    // `sips` is the real format gate — a text file renamed .jpg exits nonzero.
+    try h.thumbnail(1);
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    const message = h.model().errorMessage();
+    try testing.expect(std.mem.indexOf(u8, message, "not-an-image.jpg") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "JPEG") != null);
+    // No preview may survive a failed decode.
+    try testing.expect(!h.model().hasPreview());
+}
+
+test "a preview that will not decode fails instead of silently showing nothing" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("2516582");
+    try h.thumbnail(0);
+    try h.preview(.decode_failed, 0, 0);
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "photo.jpg") != null);
+    try testing.expect(!h.model().hasPreview());
+}
+
+test "a stat result that is not a number fails rather than reporting 0 bytes" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try h.fx().feedHostResult(request.key, true, "not a number");
+    try h.drain();
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expectEqual(@as(u64, 0), h.model().original_size);
+    // A "0 B" original would make M7's savings % nonsense, so this must
+    // never reach the encode path.
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
+}
+
+test "reset clears the file but keeps the chosen format" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    h.model().format = .both;
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("2516582");
+    try h.thumbnail(0);
+    try h.preview(.loaded, 160, 120);
+
+    try h.send(.reset);
+
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqualStrings("", h.model().path());
+    try testing.expectEqual(@as(u64, 0), h.model().original_size);
+    try testing.expect(!h.model().hasPreview());
+    // Format is a user preference, not per-file state.
+    try testing.expectEqual(Format.both, h.model().format);
+}
+
+test "an effect result that lands after reset is ignored" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("2516582");
+
+    // Reset while the thumbnail spawn is still in flight. Its cancel
+    // delivers a terminal exit, and a later real exit could too — neither
+    // may resurrect a file the user just cleared.
+    try h.send(.reset);
+    try h.drain();
+
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqualStrings("", h.model().path());
+    try testing.expect(!h.model().hasPreview());
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingImageLoadCount());
+}
+
+test "a preview cancelled by reset is not reported as a broken image" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("2516582");
+    try h.thumbnail(0);
+    try testing.expect(h.fx().pendingImageLoadAt(0) != null);
+
+    // Reset with the image load in flight. Cancelling it delivers a
+    // terminal whose outcome is `.cancelled`, not `.loaded` — which is
+    // exactly the shape of a real decode failure. Only the status guard
+    // tells them apart, so without it the user gets "Couldn't build a
+    // preview for photo.jpg" for pressing Reset.
+    try h.send(.reset);
+    try h.drain();
+
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqualStrings("", h.model().errorMessage());
+    try testing.expect(!h.model().hasPreview());
+}
+
+test "reset frees the effect keys so the next pick is not rejected" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/first.jpg");
+    try h.stat("100");
+    try h.send(.reset);
+    try h.drain();
+
+    // A duplicate active key rejects, so if reset leaked one the second
+    // pick would fail here rather than round-trip.
+    try h.pick("/Users/someone/Pictures/second.jpg");
+    try h.stat("200");
+    try h.thumbnail(0);
+    try h.preview(.loaded, 160, 90);
+
+    try testing.expectEqual(Status.ready, h.model().status);
+    try testing.expectEqualStrings("/Users/someone/Pictures/second.jpg", h.model().path());
+    try testing.expectEqual(@as(u64, 200), h.model().original_size);
+}
+
+// -------------------------------------------------------- M3: derived text
+
+test "fileName is the last path component" {
+    var model: Model = .{};
+    try testing.expectEqualStrings("", model.fileName());
+
+    const path = "/Users/someone/Pictures/holiday photo.jpg";
+    @memcpy(model.path_buffer[0..path.len], path);
+    model.path_len = path.len;
+    try testing.expectEqualStrings("holiday photo.jpg", model.fileName());
+}
+
+test "formatBytes scales across the units the UI shows" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectEqualStrings("0 B", main.formatBytes(arena, 0));
+    try testing.expectEqualStrings("512 B", main.formatBytes(arena, 512));
+    try testing.expectEqualStrings("1.0 KB", main.formatBytes(arena, 1024));
+    try testing.expectEqualStrings("2.4 MB", main.formatBytes(arena, 2_516_582));
+}
+
+test "fileSummary is empty with no file and names the file with one" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model: Model = .{};
+    try testing.expectEqualStrings("", model.fileSummary(arena));
+
+    const path = "/Users/someone/Pictures/photo.jpg";
+    @memcpy(model.path_buffer[0..path.len], path);
+    model.path_len = path.len;
+    model.original_size = 2_516_582;
+    try testing.expectEqualStrings("photo.jpg (2.4 MB)", model.fileSummary(arena));
+}
+
+test "the preview renders only once an image is registered" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model: Model = .{};
+    const empty = try buildTree(arena, &model);
+    try testing.expect(findByKind(empty.root, .image) == null);
+
+    model.image_id = 4;
+    model.preview_width = 160;
+    model.preview_height = 120;
+    const loaded = try buildTree(arena, &model);
+    const image = findByKind(loaded.root, .image) orelse return error.WidgetNotFound;
+    // The leaf draws the model's ImageId — the id is model data, never a
+    // markup literal.
+    try testing.expectEqual(@as(u64, 4), image.image_id);
+    // The bound dimensions are the thumbnail's real ones, so the preview
+    // keeps the source's aspect ratio instead of a hardcoded box. (Frames
+    // are zero here: `finalize` builds the tree, the runtime lays it out.
+    // The declared definite size is what the markup actually states.)
+    try testing.expectEqual(@as(f32, 160), image.layout.max_size.width);
+    try testing.expectEqual(@as(f32, 120), image.layout.max_size.height);
 }

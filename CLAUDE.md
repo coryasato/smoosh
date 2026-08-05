@@ -89,7 +89,11 @@ For a hand-authored root, window geometry is stated three times and all three mu
 
 ## Native SDK surfaces this app uses
 - Native dialogs (`runtime.showOpenDialog`/`showSaveDialog`, wired through a custom `HostCallBinding` — see "File acquisition, honestly")
-- `fx.loadImage` / `fx.registerImageBytes` + `<image>` for previews
+- `fx.loadImage` + `<image>` for previews — **of a `sips` thumbnail, never the source image.** Registered
+  images cap at 1 MiB of *decoded* RGBA (512x512) and `fx.loadImage` refuses encoded sources past
+  1.25 MiB, so no real photo can be registered directly. See PLAN.md's M3 entry.
+- A second host command we bind ourselves, `file.stat` — `update` can never hold an `Io`, the bridge can.
+  Reuse it for output sizes rather than adding a stat spawn.
 - `fx.spawn` (for system tools in Phase A)
 - `fx.readFile` / `fx.writeFile`
 - Hot-reload on `.native` files (Debug builds, via `.markup.watch_path`)
@@ -110,11 +114,15 @@ For a hand-authored root, window geometry is stated three times and all three mu
   about behavior.
 
 ## Current status
-**M1-M2a done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
+**M1-M3 done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
 an ugly-but-complete `src/app.native` every later milestone can drive via `native automate`;
 `test-images/` fixtures created. M2a: `src/tests.zig` — the tier-1 harness (markup builds, dispatch,
-chip payload coercion, model accessors) later milestones extend. `native build`/`check`/`test` all
-clean; M1 and M2 both verified live.
+chip payload coercion, model accessors) later milestones extend. M3: the real pick chain —
+`pick_file` -> `dialog.openFile` -> `file.stat` -> `sips` thumbnail -> `fx.loadImage` -> `.ready`,
+plus `reset`; `src/tests.zig` gained a fake-executor `Harness`. `native build`/`check`/`test` all
+clean (25/25); M1, M2, and M3 all verified live against a real `NSOpenPanel`.
+**Known and deferred to M9:** the view overflows 480x320 by ~78px (`zero_canvas_layout`), clipping the
+bottom button row. Expected — M2's shell was never laid out for real content.
 **`PLAN.md` is the source of truth** for milestones,
 locked decisions, per-milestone model/session guidance, and open questions. Do not restate its
 contents here — link to it.

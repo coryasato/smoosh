@@ -8,6 +8,13 @@
     <button size="sm" variant="ghost" on-press="reset">Reset</button>
   </row>
   <button on-press="pick_file">Choose Image…</button>
+  <!-- M3: the preview is a `sips`-generated thumbnail, not the source
+       image — registered images are capped at 512x512 decoded. Its real
+       dimensions ride the model so the aspect ratio stays honest. -->
+  <if test="{hasPreview}">
+    <image image="{image_id}" width="{preview_width}" height="{preview_height}" label="Preview of the chosen image" />
+  </if>
+  <text>{fileSummary}</text>
   <toggle-group gap="4" label="Format">
     <for each="formats" as="f">
       <toggle-button selected="{f == format}" on-toggle="set_format:{f}">{f}</toggle-button>
