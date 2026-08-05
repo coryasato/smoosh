@@ -195,6 +195,7 @@ pub const Msg = union(enum) {
     pick_file, // "Choose Image…" clicked
     dialog_result: native_sdk.EffectHostResult, // host open-dialog callback
     stat_result: native_sdk.EffectHostResult, // host file-size callback -> original_size
+    dimensions_result: native_sdk.EffectExit, // `sips -g` source pixel dimensions -> megapixel limit check
     thumbnail_result: native_sdk.EffectExit, // `sips` downscale for the preview
     image_loaded: native_sdk.EffectImageResult, // fx.loadImage callback (registers the preview pixels)
     set_format: Format, // format chip pressed
@@ -211,6 +212,7 @@ pub const Msg = union(enum) {
     pub const view_unbound = .{
         "dialog_result",
         "stat_result",
+        "dimensions_result",
         "thumbnail_result",
         "image_loaded",
         "encode_result",
@@ -250,6 +252,7 @@ const dialog_key: u64 = 1;
 const stat_key: u64 = 2;
 const thumbnail_key: u64 = 3;
 const preview_image_id: u64 = 4;
+const dimensions_key: u64 = 5;
 
 /// Host-call names our own `HostBridge` answers (see `main`). Not SDK
 /// vocabulary — we bind the seam, so we name it.
@@ -265,6 +268,44 @@ pub var thumbnail_path: []const u8 = "";
 /// budget is 1 MiB of DECODED RGBA (`max_registered_canvas_image_pixel_bytes`),
 /// i.e. 512x512 exactly — 160x160x4 = 100 KB leaves real headroom.
 const thumbnail_max_edge = "160";
+
+// -------------------------------------------------------- M4: input limits
+//
+// PLAN.md's "Input size limits": 80-100MB / 40-50 megapixels, whichever
+// comes first. Picked the top of both ranges — a local tool should be more
+// permissive than a web upload limit, and the failure mode we are guarding
+// against (exhausting memory on decode) only bites well past either number.
+
+const max_original_bytes: u64 = 100 * 1024 * 1024; // 100 MB
+const max_source_megapixels: f64 = 50.0;
+
+fn bytesToMb(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+}
+
+const Dimensions = struct { width: u32, height: u32 };
+
+/// Parses `sips -g pixelWidth -g pixelHeight -1 <path>`'s one-line output:
+/// `<path>|pixelWidth: <n>|pixelHeight: <n>|`. Returns null for anything
+/// that doesn't parse — in particular `sips` prints literal `<nil>` (and
+/// still exits 0) for a non-image or a missing file, which is fine: an
+/// unparseable result just means "dimensions unknown," and the thumbnail
+/// spawn right after is the real format gate (M3).
+fn parseDimensions(output: []const u8) ?Dimensions {
+    var width: ?u32 = null;
+    var height: ?u32 = null;
+    var it = std.mem.splitScalar(u8, output, '|');
+    while (it.next()) |segment| {
+        const colon = std.mem.indexOfScalar(u8, segment, ':') orelse continue;
+        const key = std.mem.trim(u8, segment[0..colon], " \t\r\n");
+        const value_text = std.mem.trim(u8, segment[colon + 1 ..], " \t\r\n");
+        const value = std.fmt.parseInt(u32, value_text, 10) catch continue;
+        if (std.mem.eql(u8, key, "pixelWidth")) width = value;
+        if (std.mem.eql(u8, key, "pixelHeight")) height = value;
+    }
+    if (width == null or height == null) return null;
+    return .{ .width = width.?, .height = height.? };
+}
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
@@ -302,6 +343,45 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // PLAN.md error state: "write/read to path failed".
                 return model.fail("Can't read \"{s}\".", .{model.fileName()});
             };
+            if (model.original_size > max_original_bytes) {
+                // PLAN.md error state: input exceeds the size/megapixel limit.
+                return model.fail(
+                    "\"{s}\" is {d:.1} MB — Smoosh handles files up to {d:.0} MB.",
+                    .{ model.fileName(), bytesToMb(model.original_size), bytesToMb(max_original_bytes) },
+                );
+            }
+            // The megapixel check needs the SOURCE's real dimensions, and
+            // `sips` refuses to combine `-g` (query) with `-s`/`-Z` (modify)
+            // in one invocation ("cannot get properties and modify file in
+            // the same invocation", confirmed against a real fixture) — so
+            // this is a second, separate `sips` call, not a free read off
+            // the thumbnail spawn's own output.
+            fx.spawn(.{
+                .key = dimensions_key,
+                .argv = &.{ "/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", "-1", model.path() },
+                .output = .collect,
+                .on_exit = Effects.exitMsg(.dimensions_result),
+            });
+        },
+
+        .dimensions_result => |exit| {
+            // Same staleness hazard as `thumbnail_result` below: `.reset`
+            // cancels this spawn too, and the cancellation is an ordinary
+            // terminal indistinguishable from a real (if useless) result.
+            if (model.status != .loading) return;
+            over_limit: {
+                if (exit.reason != .exited or exit.code != 0) break :over_limit;
+                const dims = parseDimensions(exit.output) orelse break :over_limit;
+                const megapixels = @as(f64, @floatFromInt(dims.width)) *
+                    @as(f64, @floatFromInt(dims.height)) / 1_000_000.0;
+                if (megapixels > max_source_megapixels) {
+                    // PLAN.md error state: input exceeds the size/megapixel limit.
+                    return model.fail(
+                        "\"{s}\" is {d:.0} megapixels — Smoosh handles images up to {d:.0} MP.",
+                        .{ model.fileName(), megapixels, max_source_megapixels },
+                    );
+                }
+            }
             // Phase A's system-tools rule applies to the PREVIEW too, and
             // `sips` ships with macOS — no detection, no brew install.
             // Absolute path so it does not depend on the inherited PATH.
@@ -359,6 +439,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // a duplicate. `cancel` on an idle key is a no-op.
             fx.cancel(dialog_key);
             fx.cancel(stat_key);
+            fx.cancel(dimensions_key);
             fx.cancel(thumbnail_key);
             fx.cancel(preview_image_id);
             _ = fx.unregisterImage(preview_image_id);

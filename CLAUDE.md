@@ -114,13 +114,19 @@ For a hand-authored root, window geometry is stated three times and all three mu
   about behavior.
 
 ## Current status
-**M1-M3 done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
+**M1-M4 done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
 an ugly-but-complete `src/app.native` every later milestone can drive via `native automate`;
 `test-images/` fixtures created. M2a: `src/tests.zig` — the tier-1 harness (markup builds, dispatch,
 chip payload coercion, model accessors) later milestones extend. M3: the real pick chain —
 `pick_file` -> `dialog.openFile` -> `file.stat` -> `sips` thumbnail -> `fx.loadImage` -> `.ready`,
-plus `reset`; `src/tests.zig` gained a fake-executor `Harness`. `native build`/`check`/`test` all
-clean (25/25); M1, M2, and M3 all verified live against a real `NSOpenPanel`.
+plus `reset`; `src/tests.zig` gained a fake-executor `Harness`. M4: the 100 MB / 50 MP input limits,
+enforced in the same chain — `stat_result` now short-circuits on byte size, and a new
+`dimensions_result` hop (a separate `sips -g pixelWidth -g pixelHeight -1` query — combining `-g`
+with the thumbnail's `-s`/`-Z` in one `sips` call errors out, confirmed by running it) short-circuits
+on megapixels before the thumbnail spawn. `native build`/`check`/`test` all clean (31/31 tests);
+M1-M3 verified live against a real `NSOpenPanel`, M4 verified via the fake-executor tests only (a
+live-automation attempt misfired — see PLAN.md's M4 entry for the full writeup and a flag for
+whoever next drives `NSOpenPanel` automation).
 **Known and deferred to M9:** the view overflows 480x320 by ~78px (`zero_canvas_layout`), clipping the
 bottom button row. Expected — M2's shell was never laid out for real content.
 **`PLAN.md` is the source of truth** for milestones,

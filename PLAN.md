@@ -367,18 +367,50 @@ clean. Live under `native dev` against a real `NSOpenPanel` driven to a real fix
 `$TMPDIR/smoosh/preview.png` (35219 B); Reset cleared it; `not-an-image.jpg` produced the exact
 supported-formats message with no preview. `dispatch_errors=0` throughout, screenshot confirms real pixels.
 
-**M4 — Input size limits.** *(Sonnet, share M3's session)* [✓ "reasonable input size limits with clear feedback"]
-Enforce the 80-100MB / 40-50 megapixel soft limit at file-load time, surfacing the matching error state.
-*Where the two branches actually go, now that M3 exists:* the **byte-size** check belongs in
-`stat_result`, right after `original_size` lands and before the `sips` spawn. The **megapixel** check
-cannot use `image_loaded` — that result carries the *thumbnail's* dimensions (always ≤160px), not the
-source's. Get the source dimensions from the thumbnail spawn instead: add `-g pixelWidth -g pixelHeight`
-to the existing `sips` argv and parse them off `exit.output` (the spawn is already `.collect`), so the
-check costs no extra process. `oversized.jpg` is the fixture that separates the two branches
-(51.2 MP but only 5.7 MB).
-*Moved up from the old M9:* this is a branch inside M3's code path, not a separate feature. Writing
-it five milestones later means re-loading M3's context to add three lines.
-*Verify:* load the oversized fixture, confirm the friendly limit message renders and no preview loads.
+**M4 — Input size limits.** *(Sonnet, share M3's session)* [✓ "reasonable input size limits with clear feedback"] — **DONE**
+Enforces **100 MB** / **50 megapixels** at file-load time (the top of PLAN's 80-100MB/40-50MP
+range — a local tool should be more permissive than a web upload limit). The byte check landed in
+`stat_result`, right after `original_size` lands and before any spawn. The megapixel check needed a
+new hop: `stat_result` -> `dimensions_result` (a `sips -g` query) -> `thumbnail_result`, same
+stale-result guard pattern as `thumbnail_result`/`image_loaded`, same key-cancellation treatment in
+`reset`.
+Settled/found here:
+- **PLAN.md's original plan — reading dimensions off the thumbnail spawn's own `-g` flags — does not
+  work, and was never actually testable against a real `sips`.** Confirmed by running it:
+  `sips -g pixelWidth -g pixelHeight -s format png -Z 160 <src> --out <dest>` exits 6,
+  `"cannot get properties and modify file in the same invocation"` — `sips` refuses to combine a
+  query flag with a modify flag in one call, full stop. The megapixel check needs its own spawn:
+  `sips -g pixelWidth -g pixelHeight -1 <path>` (the `-1` one-line form, pipe-delimited:
+  `<path>|pixelWidth: <n>|pixelHeight: <n>|`), run from `stat_result` right after the byte check,
+  landing as `dimensions_result` before the (unchanged) thumbnail spawn. One extra cheap process per
+  pick, not zero as originally hoped — `sips` on a source file is near-instant either way.
+- **`sips -g` exits 0 even for a non-image or a missing file** — it prints literal `<nil>` for both
+  properties rather than failing. Confirmed against `not-an-image.jpg`. This is harmless: an
+  unparseable dimensions result just means "skip the megapixel check," and the thumbnail spawn right
+  after is still the real format gate (unchanged from M3). `parseDimensions` returns `null` for
+  anything that doesn't parse as two decimal properties, deliberately including this case.
+- **Both limits are inclusive, not exclusive**: exactly 100 MB or exactly 50.0 MP passes. `>`, not `>=`.
+- Error messages spell out the actual number and the limit (`"\"huge.jpg\" is 132.0 MB — Smoosh
+  handles files up to 100 MB."` / `"\"oversized.jpg\" is 51 megapixels — Smoosh handles images up to
+  50 MP."`), formatted straight into `fail`'s fixed buffer with `{d:.1}`/`{d:.0}` — no arena needed,
+  unlike `fileSummary`.
+*Live verification skipped this milestone* — see below.
+*Verified:* `native test` 31/31 (six new fake-executor tests: over-byte-limit short-circuits before
+any spawn, exactly-at-byte-limit passes, over-megapixel-limit fails and spawns nothing further,
+exactly-at-megapixel-limit passes, unparseable dimensions fall through to the thumbnail spawn as the
+real gate, and a dimensions query cancelled by `reset` is not reported as a broken image); `native
+check` clean with only the same pre-existing unbound-field warnings; `native build` clean.
+**Live GUI verification was skipped for this milestone, by user choice, after an automation misfire**:
+driving a real `NSOpenPanel` via AppleScript System Events (the method M3 used successfully) sent
+keystrokes to the terminal instead — the `native automate widget-click` on "Choose Image…" apparently
+didn't bring the Smoosh window frontmost first, so `System Events`' global keystrokes landed on
+whatever WAS frontmost (the terminal running Claude Code) instead of the about-to-open panel, typing
+a file path into the live session. No files were touched and nothing destructive happened, but the
+user opted to trust the fake-executor coverage (which exercises the exact same `update` code path
+`sips` really drives, per PLAN's own testing-strategy rationale for this kind of predicate-over-numbers
+check) rather than retry the OS-level automation. **Flag for whoever runs M4's live check later**:
+confirm the app window is actually frontmost/key before scripting further `NSOpenPanel` interaction —
+M3's version of this same trick worked, so something about window focus differed this time.
 
 **M5 — Encoder detection at launch.** *(Sonnet, fresh session)* [✓ error-state: encoder binary missing]
 `fx.spawn` a presence check for `avifenc`/`cwebp` on startup, land results as `encoder_check_result`,

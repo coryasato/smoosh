@@ -368,6 +368,25 @@ const Harness = struct {
         try self.drain();
     }
 
+    /// M4's dimension query, fed as the standard happy-path result:
+    /// well under the 50 MP limit, so the chain proceeds to the thumbnail
+    /// spawn exactly as it did before M4 existed.
+    fn dimensions(self: *Harness, width: u64, height: u64) !void {
+        var buf: [64]u8 = undefined;
+        const output = std.fmt.bufPrint(&buf, "pixelWidth: {d}|pixelHeight: {d}|", .{ width, height }) catch unreachable;
+        try self.dimensionsRaw(output, 0);
+    }
+
+    /// The general form, for tests that need control over the raw `sips -g`
+    /// output or a nonzero exit — e.g. the `<nil>` shape `sips` prints for
+    /// a non-image file, or a genuinely failed query.
+    fn dimensionsRaw(self: *Harness, output: []const u8, code: i32) !void {
+        const request = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+        try self.fx().feedOutput(request.key, output);
+        try self.fx().feedExit(request.key, code);
+        try self.drain();
+    }
+
     fn thumbnail(self: *Harness, code: i32) !void {
         const request = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
         try self.fx().feedExit(request.key, code);
@@ -400,6 +419,18 @@ test "picking a file lands the real path, its size, and a preview" {
 
     try h.stat("2516582");
     try testing.expectEqual(@as(u64, 2516582), h.model().original_size);
+
+    // M4: the dimension query is a SEPARATE `sips` call (can't combine `-g`
+    // with `-s`/`-Z` in one invocation) that runs before the thumbnail spawn.
+    const dims_spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+    const expected_dims_argv = [_][]const u8{
+        "/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", "-1", path,
+    };
+    try testing.expectEqual(expected_dims_argv.len, dims_spawn.argv.len);
+    for (expected_dims_argv, dims_spawn.argv) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+    try h.dimensions(4000, 3000);
 
     // The preview is a downscaled copy: `sips` reads the source and writes
     // the thumbnail `fx.loadImage` then reads. Pin the whole argv — a
@@ -448,6 +479,7 @@ test "cancelling a re-pick keeps the image already loaded" {
 
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
+    try h.dimensions(4000, 3000);
     try h.thumbnail(0);
     try h.preview(.loaded, 160, 120);
 
@@ -484,6 +516,11 @@ test "a non-image input fails with the supported-formats message" {
 
     try h.pick("/Users/someone/Pictures/not-an-image.jpg");
     try h.stat("128");
+    // `sips -g` still exits 0 on a non-image, printing literal `<nil>` for
+    // both properties — confirmed against a real fixture. That must not
+    // itself be treated as an error; `sips` doing the real format check at
+    // the thumbnail step (next) is what should fail.
+    try h.dimensionsRaw("pixelWidth: <nil>|pixelHeight: <nil>|", 0);
     // `sips` is the real format gate — a text file renamed .jpg exits nonzero.
     try h.thumbnail(1);
 
@@ -501,6 +538,7 @@ test "a preview that will not decode fails instead of silently showing nothing" 
 
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
+    try h.dimensions(4000, 3000);
     try h.thumbnail(0);
     try h.preview(.decode_failed, 0, 0);
 
@@ -532,6 +570,7 @@ test "reset clears the file but keeps the chosen format" {
     h.model().format = .both;
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
+    try h.dimensions(4000, 3000);
     try h.thumbnail(0);
     try h.preview(.loaded, 160, 120);
 
@@ -552,7 +591,7 @@ test "an effect result that lands after reset is ignored" {
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
 
-    // Reset while the thumbnail spawn is still in flight. Its cancel
+    // Reset while the dimensions spawn is still in flight. Its cancel
     // delivers a terminal exit, and a later real exit could too — neither
     // may resurrect a file the user just cleared.
     try h.send(.reset);
@@ -570,6 +609,7 @@ test "a preview cancelled by reset is not reported as a broken image" {
 
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
+    try h.dimensions(4000, 3000);
     try h.thumbnail(0);
     try testing.expect(h.fx().pendingImageLoadAt(0) != null);
 
@@ -599,12 +639,119 @@ test "reset frees the effect keys so the next pick is not rejected" {
     // pick would fail here rather than round-trip.
     try h.pick("/Users/someone/Pictures/second.jpg");
     try h.stat("200");
+    try h.dimensions(4000, 3000);
     try h.thumbnail(0);
     try h.preview(.loaded, 160, 90);
 
     try testing.expectEqual(Status.ready, h.model().status);
     try testing.expectEqualStrings("/Users/someone/Pictures/second.jpg", h.model().path());
     try testing.expectEqual(@as(u64, 200), h.model().original_size);
+}
+
+// ============================================================ M4: limits
+//
+// PLAN.md's "Input size limits": 80-100MB / 40-50 megapixels, whichever
+// comes first. `oversized.jpg` is the fixture that separates the two
+// branches — 51.2 MP but only ~5.7 MB — so both need their own test, over
+// numbers rather than a real 51 MP decode (per the testing strategy).
+
+test "a file over the byte limit fails before any dimension query" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/huge.jpg");
+    // 132 MB — over the 100 MB limit.
+    try h.stat("138412032");
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    const message = h.model().errorMessage();
+    try testing.expect(std.mem.indexOf(u8, message, "huge.jpg") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "132.0 MB") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "100 MB") != null);
+    // The byte check must short-circuit before spawning anything else —
+    // an oversized file has no business being decoded even for a dimension
+    // query.
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
+}
+
+test "a file exactly at the byte limit is not rejected" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/exactly-100mb.jpg");
+    try h.stat("104857600"); // exactly 100 MB
+    try testing.expectEqual(Status.loading, h.model().status);
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+}
+
+test "a file under the byte limit but over the megapixel limit fails, naming the file" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // oversized.jpg's real shape: 8000x6400 = 51.2 MP, ~5.7 MB — well
+    // under the byte limit, over the megapixel one. This is the case that
+    // proves the two checks are independent branches.
+    try h.pick("/Users/someone/Pictures/oversized.jpg");
+    try h.stat("5955395");
+    try testing.expectEqual(Status.loading, h.model().status);
+    try h.dimensions(8000, 6400);
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    const message = h.model().errorMessage();
+    try testing.expect(std.mem.indexOf(u8, message, "oversized.jpg") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "51") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "50 MP") != null);
+    // No thumbnail may be spawned for a file that already failed the limit.
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
+    try testing.expect(!h.model().hasPreview());
+}
+
+test "a file exactly at the megapixel limit is not rejected" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/exactly-50mp.jpg");
+    try h.stat("5000000");
+    // 10000 x 5000 = 50,000,000 px = exactly 50.0 MP.
+    try h.dimensions(10000, 5000);
+
+    try testing.expectEqual(Status.loading, h.model().status);
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+}
+
+test "unparseable dimensions do not block the chain — the thumbnail spawn is the real gate" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/weird.jpg");
+    try h.stat("5000000");
+    // A failed or garbled dimension query is not itself an error — proceed
+    // to the thumbnail spawn and let `sips`'s real conversion decide.
+    try h.dimensionsRaw("", 1);
+
+    try testing.expectEqual(Status.loading, h.model().status);
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+    try h.thumbnail(0);
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingImageLoadCount());
+}
+
+test "a dimension query cancelled by reset is not reported as a broken image" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("2516582");
+    try testing.expect(h.fx().pendingSpawnAt(0) != null);
+
+    // Same hazard as the thumbnail/image-load cancel tests above: cancelling
+    // the in-flight dimensions spawn delivers an ordinary failed exit, which
+    // must not be mistaken for a real megapixel-limit failure.
+    try h.send(.reset);
+    try h.drain();
+
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqualStrings("", h.model().errorMessage());
+    try testing.expect(!h.model().hasPreview());
 }
 
 // -------------------------------------------------------- M3: derived text
