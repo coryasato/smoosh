@@ -6,15 +6,15 @@
 A beautiful, instant native macOS app that lets you drop an image and get back high-quality modern web formats (AVIF and/or WebP) without leaving your desktop.
 
 ## Success criteria for v0.1 (MVP)
-- [ ] App launches to a clean drop-zone UI
-- [ ] User can pick an image via "Choose Image…" (native open dialog via `runtime.showOpenDialog`, wired through a custom `HostCallBinding` — pattern proven, see "File acquisition, honestly" in CLAUDE.md); drag-and-drop is stretch, not required for v0.1
-- [ ] Image appears as preview with original size
-- [ ] User can choose output: AVIF (default), WebP, or Both
-- [ ] "Smoosh" produces the selected format(s) via system tools and auto-saves next to the source file
-- [ ] Before/after file size + savings % are shown
-- [ ] User can optionally re-save output to a different location via "Save As…"
-- [ ] Works on macOS only
-- [ ] Reasonable input size limits with clear feedback
+- [x] App launches to a clean drop-zone UI *(functionally — M2's scaffold markup still stands; M9 replaces it with the real "UI sketch")*
+- [x] User can pick an image via "Choose Image…" (native open dialog via `runtime.showOpenDialog`, wired through a custom `HostCallBinding` — pattern proven, see "File acquisition, honestly" in CLAUDE.md); drag-and-drop is stretch, not required for v0.1
+- [x] Image appears as preview with original size
+- [x] User can choose output: AVIF (default), WebP, or Both
+- [x] "Smoosh" produces the selected format(s) via system tools and auto-saves next to the source file
+- [x] Before/after file size + savings % are shown
+- [x] User can optionally re-save output to a different location via "Save As…"
+- [x] Works on macOS only
+- [x] Reasonable input size limits with clear feedback
 - [ ] Ships as a packaged `.app` that launches on a machine that never ran `native build`
 
 ## Non-goals (for now)
@@ -533,11 +533,60 @@ file loads was driven normally with `native automate widget-click`. **This resol
 answer is not "check frontmost first", it is that this seam is unreachable until the app is a real `.app`
 bundle (M10). Until then, treat the open panel as a manual step.
 
-**M8 — Save As.** *(Sonnet, share M7's session)* [✓ "optionally re-save output to a different location"]
-Wire `save_as` -> `showSaveDialog` -> copy the already-produced output(s) to the chosen location.
-Does not replace auto-save from M7.
-*Sonnet because:* it is M3's dialog pattern and M7's write path, both already in the session's context.
-*Verify:* after a successful Smoosh, trigger Save As, confirm the file lands at the chosen path with matching bytes.
+**M8 — Save As.** *(Sonnet, share M7's session)* [✓ "optionally re-save output to a different location"] — **DONE**
+`save_as` -> `showSaveDialog` -> copy the chosen output(s) to the chosen location. Does not replace M7's
+auto-save.
+Settled/found here:
+- **"Both" mode needed a real design decision PLAN's one-line sketch didn't cover**: `showSaveDialog`
+  only ever returns ONE path, but Smoosh can produce two files. Asked the user rather than guess; settled
+  on SEQUENTIAL rounds — one save-dialog-then-copy per landed format, one after another (AVIF's panel,
+  then WebP's), over a folder-picker (`showOpenDialog` with `allow_directories=true`, an SDK-sanctioned
+  idiom but one PLAN never mentions) or disabling Save As for "Both" (rejected: Both is the headline
+  feature, and silently disabling its own Save As reads as a regression). A cancelled round is silent and
+  the other format is still offered; only a copy failure is reported.
+- **`save_as_result` changed type from PLAN's sketch** (`fx.writeFile`'s `EffectFileResult`) **to
+  `EffectHostResult`**: `fx.writeFile`/`fx.readFile` cap at `max_effect_file_bytes` (1 MiB), and a real
+  encoder output can exceed that — the identical bound M3 already hit with the source image itself. Copy
+  goes through a THIRD host command bound by hand, `file.copy` (`std.Io.Dir.copyFileAbsolute`, unbounded),
+  payload shaped `"<source>\n<destination>"` — the same newline-joined convention the SDK's own multi-path
+  open-dialog results use.
+- **The Model tracks a `save_queue: [2]Output` + index**, not a per-format outcome enum like M7's
+  `EncodeOutcome`: the two save rounds are strictly SEQUENTIAL (never concurrent), so there is no
+  either-order join to handle — the queue is simpler and sufficient. `index == len` at rest (true even at
+  `0 == 0`) means "no round in flight"; `save_as` rebuilds the queue fresh every press.
+- **A save note lives in its own `save_message_buffer`**, not `warning_message_buffer`: an encode warning
+  and a save note are different facts about different actions, and folding them into one field would mean
+  one silently overwriting the other. `statusLine()` shows the save note first when present — the freshest
+  thing the user did — falling back to the ordinary status text otherwise; both `clearResults` (a new pick
+  or a re-`smoosh`) and `.reset` clear it, so it can never outlive the run it's about.
+- **Host requests turned out to need no staleness guard, confirmed rather than assumed**: dialogs block
+  the loop (same fact M3 already established for `dialog_result`/`stat_result`), so a save round can never
+  be mid-flight when another Msg is dispatched. The defensive `index >= len` guards on both result arms
+  are provably unreachable through the effects channel itself — mutation-tested by dispatching a raw
+  `save_as_dialog_result`/`save_as_result` Msg directly (bypassing `fx` entirely), the only way to reach
+  them at all.
+- **Mutation testing caught two real test gaps, not just main.zig bugs.** A same-key `fx.hostRequest`
+  re-issue REPLACES the pending one (the channel's documented behavior), which made a naive "second
+  Save As press -> still exactly one pending request" test pass whether or not the double-press guard
+  existed — the guard's removal was invisible until the test was rebuilt around a "Both" run with an
+  ALREADY-ADVANCED round (AVIF's copy done, WebP's dialog pending), where a missing guard visibly
+  swaps out the in-flight round instead of just no-op-ing. Separately, no test ever asserted the exact
+  `file.copy` payload text, so swapping source and destination in the format string — which would copy
+  the chosen destination OVER the real output, backwards — passed every existing assertion; added a test
+  pinning the full `"source\ndestination"` string.
+*Verified:* `native test` 78/78 (16 new: single-format and "Both" happy paths — including the copy
+payload's exact source/destination order — sequential-not-concurrent dialog ordering, both cancel
+shapes (one-of-two, all), a copy failure not blocking the next round, the two "nothing to save"/"already
+in flight" guards, both defensive dead-code guards via direct Msg dispatch, `clearResults`/`reset`
+interaction, and the destination filename deriving from the FORMAT's extension rather than the source's).
+Every mutation applied to the new logic was caught, including two where the first version of the test
+did not — tightened until each failed exactly the assertion it should, same discipline as M7. `native
+check` clean at zero warnings, `native build` clean. Live against `native dev` and real fixtures (open
+and save panels driven by the user by hand, per M7's now-standing rule — see CLAUDE.md): a "Both" run's
+two sequential save rounds (AVIF's panel, then WebP's) produced copies verified **MD5-identical** to a
+fresh by-hand encoder run at the exact expected sizes; a single-format (AVIF-only) run's Save As,
+cancelled at the panel, left the status bar reading exactly "Done." with `dispatch_errors=0` — matching
+the fake-executor coverage exactly.
 
 **M9 — UI/UX pass.** *(Opus, fresh session)* [✓ "launches to a clean drop-zone UI", ✓ works at small window sizes]
 Replace M2's ugly shell with the real markup per the "UI sketch", against the now-complete set of

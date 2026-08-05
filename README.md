@@ -12,10 +12,11 @@ something local and instant.
 **Working, unpolished.** Smoosh launches, you pick an image,
 see a preview and its size, choose AVIF / WebP / Both, and press Smoosh — the
 compressed files land next to the original and the before/after size and savings
-percentage are shown per format.
+percentage are shown per format. "Save As…" copies the produced file(s) to a
+location you choose, without touching the auto-saved originals.
 
-Not done yet: "Save As…" is inert, the window layout overflows at 480x320
-and clips the button row, and there is no packaged `.app`.
+Not done yet: the window layout overflows at 480x320 and clips the button row,
+and there is no packaged `.app`.
 
 See [PLAN.md](PLAN.md) for milestones, locked decisions, and open questions.
 See [CLAUDE.md](CLAUDE.md) for working context and toolchain notes.

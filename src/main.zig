@@ -167,6 +167,22 @@ pub const Model = struct {
     warning_message_buffer: [256]u8 = undefined,
     warning_message_len: usize = 0,
 
+    // M8: Save As. `showSaveDialog` only ever returns ONE path, so "Both"
+    // mode runs two dialog+copy rounds back to back rather than inventing a
+    // folder-picker PLAN never mentions — `save_queue` is that round-robin.
+    // `index == len` (true at rest, including 0 == 0) means "no save in
+    // flight"; `save_as` rebuilds the queue fresh on every press.
+    save_queue: [2]Output = undefined,
+    save_queue_len: usize = 0,
+    save_queue_index: usize = 0,
+    /// Accumulates one short note per format that actually resolved (a
+    /// cancel is silent — see `update`'s `.save_as_dialog_result` arm).
+    /// Its own buffer, not `warning_message_buffer`: a save note and an
+    /// encode warning are different facts, and folding them into one
+    /// field would mean one silently overwriting the other.
+    save_message_buffer: [256]u8 = undefined,
+    save_message_len: usize = 0,
+
     /// The chip iterable for the format toggle-group (see "Chips" in the
     /// native-ui skill) — must live inside Model for `for each` to see it.
     pub const formats = [_]Format{ .avif, .webp, .both };
@@ -197,9 +213,15 @@ pub const Model = struct {
         "error_message_len",
         "warning_message_buffer",
         "warning_message_len",
+        "save_queue",
+        "save_queue_len",
+        "save_queue_index",
+        "save_message_buffer",
+        "save_message_len",
         "path",
         "errorMessage",
         "warningMessage",
+        "saveMessage",
         "fileName",
     };
 
@@ -211,6 +233,9 @@ pub const Model = struct {
     }
     pub fn warningMessage(model: *const Model) []const u8 {
         return model.warning_message_buffer[0..model.warning_message_len];
+    }
+    pub fn saveMessage(model: *const Model) []const u8 {
+        return model.save_message_buffer[0..model.save_message_len];
     }
 
     /// The picked file's last path component — what the UI names, and
@@ -314,7 +339,10 @@ pub const Model = struct {
 
     /// Wipes the previous run's outputs. Called when a new run starts and
     /// when a new file lands — without it, a fresh pick would keep
-    /// rendering the last file's result lines.
+    /// rendering the last file's result lines. Also wipes any Save As note
+    /// (M8): it names a file this call is about to invalidate, and a save
+    /// can never be in flight here — dialogs block the loop, so `smoosh`/a
+    /// new pick can only run between rounds, never mid-save.
     fn clearResults(model: *Model) void {
         model.avif_outcome = .none;
         model.avif_path_len = 0;
@@ -323,12 +351,22 @@ pub const Model = struct {
         model.webp_path_len = 0;
         model.webp_size = 0;
         model.warning_message_len = 0;
+        model.save_queue_len = 0;
+        model.save_queue_index = 0;
+        model.save_message_len = 0;
     }
 
     /// M2 scaffold status line — just enough for the placeholder
     /// `<status-bar>` to bind to. Later milestones will likely replace this
     /// with something that also reports sizes/savings once those are real.
     pub fn statusLine(model: *const Model) []const u8 {
+        // A Save As note is the freshest thing the user did, so it wins
+        // over whatever `status` says — including a stale `.done` warning
+        // about the run that PRODUCED the file just saved. It cannot mask
+        // a genuine new `.failed`/`.done`: both `smoosh` and a new pick
+        // clear it (see `clearResults`), and `.reset` clears the whole
+        // model.
+        if (model.save_message_len > 0) return model.saveMessage();
         return switch (model.status) {
             .idle => "Drop or choose an image to get started.",
             .loading => "Loading…",
@@ -356,7 +394,13 @@ pub const Msg = union(enum) {
     encode_size_result: native_sdk.EffectHostResult, // host file-size callback -> avif_size/webp_size
     save_as, // "Save As…" clicked
     save_as_dialog_result: native_sdk.EffectHostResult, // host save-dialog callback
-    save_as_result: native_sdk.EffectFileResult, // fx.writeFile callback
+    // A THIRD host command we bind ourselves, `file.copy` — not
+    // `fx.writeFile`. `fx.writeFile`/`fx.readFile` cap at 1 MiB
+    // (`max_effect_file_bytes`), and a real encoder output can exceed
+    // that (M3 hit the identical bound with the preview, for the same
+    // reason: a bundled-effect ceiling sized for small payloads, not an
+    // arbitrary file). `std.Io.Dir.copyFileAbsolute` has no such cap.
+    save_as_result: native_sdk.EffectHostResult, // host copy-file callback
     encoder_check_result: native_sdk.EffectExit, // launch-time `which avifenc`/`which cwebp`
     reset, // clear current image, return to idle
 
@@ -429,11 +473,15 @@ const avif_encode_key: u64 = 8;
 const webp_encode_key: u64 = 9;
 const avif_stat_key: u64 = 10;
 const webp_stat_key: u64 = 11;
+const save_dialog_key: u64 = 12;
+const save_copy_key: u64 = 13;
 
 /// Host-call names our own `HostBridge` answers (see `main`). Not SDK
 /// vocabulary — we bind the seam, so we name it.
 const host_open_file = "dialog.openFile";
 const host_file_size = "file.stat";
+const host_save_file = "dialog.saveFile";
+const host_file_copy = "file.copy";
 
 /// Absolute so the check does not depend on the inherited PATH — but
 /// `which`'s OWN job is to search that PATH for `avifenc`/`cwebp`, which is
@@ -705,6 +753,69 @@ fn finishIfComplete(model: *Model) void {
     if (webp_failed) return model.warn("{s}", .{failureText(model, .webp, &webp_buffer)});
 }
 
+// --------------------------------------------------------- M8: Save As
+//
+// PLAN.md: "Wire save_as -> showSaveDialog -> copy the already-produced
+// output(s) to the chosen location. Does not replace auto-save from M7."
+// `showSaveDialog` only ever returns ONE path, and Smoosh can produce two
+// files ("Both"), so this is SEQUENTIAL rather than a folder-picker PLAN
+// never mentions: one save-dialog-then-copy round per landed format, one
+// after another. A user who cancels one round still gets offered the
+// other; only a copy failure is reported as a problem — a cancel is an
+// ordinary "not now", same as `dialog_result`'s cancel-is-not-an-error
+// precedent above.
+
+/// `/a/b/large.avif` -> `large.avif` — the default filename `HostBridge`
+/// hands the save panel. Truncates (silently, via `@min`) rather than
+/// erroring on a name longer than `buf`; a lost suffix in a default
+/// filename the user can freely retype is not worth a failure state.
+fn defaultSaveName(model: *const Model, output: Output, buf: []u8) []const u8 {
+    const path = outputPathOf(model, output);
+    const name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| path[slash + 1 ..] else path;
+    const len = @min(name.len, buf.len);
+    @memcpy(buf[0..len], name[0..len]);
+    return buf[0..len];
+}
+
+/// One line per format that actually resolved — never for a cancel, which
+/// is silent. Appended, not overwritten: "Both" can report on both formats
+/// in the one status line.
+fn appendSaveNote(model: *Model, comptime fmt: []const u8, args: anytype) void {
+    var note_buf: [128]u8 = undefined;
+    const note = std.fmt.bufPrint(&note_buf, fmt, args) catch return;
+    const existing = model.save_message_len;
+    const sep: []const u8 = if (existing > 0) " " else "";
+    if (existing + sep.len + note.len > model.save_message_buffer.len) return;
+    @memcpy(model.save_message_buffer[existing..][0..sep.len], sep);
+    @memcpy(model.save_message_buffer[existing + sep.len ..][0..note.len], note);
+    model.save_message_len = existing + sep.len + note.len;
+}
+
+/// Starts the save-dialog round for whatever `save_queue_index` currently
+/// points at. Called by `.save_as` for the first round and by the two
+/// result arms below for every subsequent one — the same "dialogs block
+/// the loop" fact that lets M3's pick chain issue one host request per arm
+/// with no staleness guard applies here too, so this needs none either.
+fn beginSaveRound(model: *Model, fx: *Effects) void {
+    var name_buf: [128]u8 = undefined;
+    const default_name = defaultSaveName(model, model.save_queue[model.save_queue_index], &name_buf);
+    fx.hostRequest(.{
+        .key = save_dialog_key,
+        .name = host_save_file,
+        .payload = default_name,
+        .on_result = Effects.hostMsg(.save_as_dialog_result),
+    });
+}
+
+/// Moves to the next queued format, if any. The queue sits at `index ==
+/// len` when nothing is in flight (true at rest, since both start at 0) —
+/// reached exactly when this increments past the last round, so nothing
+/// else needs to reset it.
+fn advanceSaveQueue(model: *Model, fx: *Effects) void {
+    model.save_queue_index += 1;
+    if (model.save_queue_index < model.save_queue_len) beginSaveRound(model, fx);
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .pick_file => {
@@ -847,6 +958,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.cancel(webp_encode_key);
             fx.cancel(avif_stat_key);
             fx.cancel(webp_stat_key);
+            fx.cancel(save_dialog_key);
+            fx.cancel(save_copy_key);
             _ = fx.unregisterImage(preview_image_id);
             // Format is a user preference, not per-file state — it is
             // the one thing Reset deliberately keeps.
@@ -927,9 +1040,61 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             finishIfComplete(model);
         },
 
-        .save_as => {},
-        .save_as_dialog_result => {},
-        .save_as_result => {},
+        .save_as => {
+            var queue: [2]Output = undefined;
+            var len: usize = 0;
+            if (model.hasAvifResult()) {
+                queue[len] = .avif;
+                len += 1;
+            }
+            if (model.hasWebpResult()) {
+                queue[len] = .webp;
+                len += 1;
+            }
+            if (len == 0) return; // nothing produced yet — nothing to save
+            // Defensive, like `smoosh`'s own re-press guard: a save round
+            // is only ever "in progress" while a dialog blocks the loop,
+            // which this dispatch cannot observe live, but a stray
+            // double-send under automation/tests should still be a no-op
+            // rather than clobbering a queue mid-round.
+            if (model.save_queue_index < model.save_queue_len) return;
+            model.save_queue = queue;
+            model.save_queue_len = len;
+            model.save_queue_index = 0;
+            model.save_message_len = 0;
+            beginSaveRound(model, fx);
+        },
+
+        .save_as_dialog_result => |result| {
+            if (model.save_queue_index >= model.save_queue_len) return;
+            if (!result.ok) return advanceSaveQueue(model, fx); // cancelled: silent, offer the next format
+            const output = model.save_queue[model.save_queue_index];
+            var payload_buf: [platform.max_dialog_path_bytes * 2 + 1]u8 = undefined;
+            const payload = std.fmt.bufPrint(&payload_buf, "{s}\n{s}", .{ outputPathOf(model, output), result.bytes }) catch {
+                appendSaveNote(model, "Couldn't save {s} — the destination path is too long.", .{outputLabel(output)});
+                return advanceSaveQueue(model, fx);
+            };
+            fx.hostRequest(.{
+                .key = save_copy_key,
+                .name = host_file_copy,
+                .payload = payload,
+                .on_result = Effects.hostMsg(.save_as_result),
+            });
+        },
+
+        .save_as_result => |result| {
+            if (model.save_queue_index >= model.save_queue_len) return;
+            const output = model.save_queue[model.save_queue_index];
+            if (result.ok) {
+                appendSaveNote(model, "Saved {s}.", .{outputLabel(output)});
+            } else {
+                // PLAN.md error state: write to output path failed — the
+                // same family of failure as M7's own write step, just at a
+                // user-chosen destination instead of next to the source.
+                appendSaveNote(model, "Couldn't save {s} — check the folder's permissions.", .{outputLabel(output)});
+            }
+            advanceSaveQueue(model, fx);
+        },
 
         .encoder_check_result => |exit| {
             const found = exit.reason == .exited and exit.code == 0;
@@ -988,6 +1153,7 @@ const HostBridge = struct {
     io: std.Io,
 
     var dialog_path_buf: [platform.max_dialog_paths_bytes]u8 = undefined;
+    var save_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
     var reply_buf: [128]u8 = undefined;
 
     /// What the open panel offers. Everything macOS ImageIO decodes that
@@ -1003,6 +1169,8 @@ const HostBridge = struct {
         const self: *HostBridge = @ptrCast(@alignCast(context));
         if (std.mem.eql(u8, name, host_open_file)) return self.openFile(key);
         if (std.mem.eql(u8, name, host_file_size)) return self.fileSize(key, payload);
+        if (std.mem.eql(u8, name, host_save_file)) return self.saveFile(key, payload);
+        if (std.mem.eql(u8, name, host_file_copy)) return self.copyFile(key, payload);
         self.reply(key, false, "unknown host command");
     }
 
@@ -1028,6 +1196,40 @@ const HostBridge = struct {
         };
         const text = std.fmt.bufPrint(&reply_buf, "{d}", .{stat.size}) catch "0";
         self.reply(key, true, text);
+    }
+
+    /// M8's save panel. `payload` is a bare default filename (e.g.
+    /// "large.avif") — no filter list, unlike the open panel: the
+    /// destination already carries the right extension via `default_name`,
+    /// and the user is free to rename, so there is nothing worth
+    /// restricting. `showSaveDialog` answers `null` on cancel, same
+    /// "false + a reason" shape `openFile` uses for its own cancel.
+    fn saveFile(self: *HostBridge, key: u64, default_name: []const u8) void {
+        const path = self.runtime.showSaveDialog(.{
+            .title = "Save a copy",
+            .default_name = default_name,
+        }, &save_path_buf) catch |err| {
+            return self.reply(key, false, @errorName(err));
+        };
+        if (path) |chosen| return self.reply(key, true, chosen);
+        self.reply(key, false, "cancelled");
+    }
+
+    /// `payload` is `"<source>\n<destination>"` — the same newline-joined
+    /// shape the SDK's own multi-path open-dialog results use. Unbounded,
+    /// unlike `fx.writeFile`/`fx.readFile` (capped at `max_effect_file_bytes`,
+    /// 1 MiB): a real encoder output can exceed that, the same bound M3 hit
+    /// with the source image itself.
+    fn copyFile(self: *HostBridge, key: u64, payload: []const u8) void {
+        const sep = std.mem.indexOfScalar(u8, payload, '\n') orelse {
+            return self.reply(key, false, "malformed copy request");
+        };
+        const source = payload[0..sep];
+        const destination = payload[sep + 1 ..];
+        std.Io.Dir.copyFileAbsolute(source, destination, self.io, .{}) catch |err| {
+            return self.reply(key, false, @errorName(err));
+        };
+        self.reply(key, true, "");
     }
 
     fn reply(self: *HostBridge, key: u64, ok: bool, bytes: []const u8) void {

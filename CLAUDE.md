@@ -114,7 +114,7 @@ For a hand-authored root, window geometry is stated three times and all three mu
   about behavior.
 
 ## Current status
-**M1-M7 done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
+**M1-M8 done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
 an ugly-but-complete `src/app.native` every later milestone can drive via `native automate`;
 `test-images/` fixtures created. M2a: `src/tests.zig` — the tier-1 harness (markup builds, dispatch,
 chip payload coercion, model accessors) later milestones extend. M3: the real pick chain —
@@ -143,14 +143,26 @@ only an all-failed run is `.failed`. The encoders write their own output files, 
 contradict a file already on disk. `native build`/`check`/`test` all clean (62/62 tests, `check` now at
 **zero** warnings after `Model.view_unbound` landed); M7 verified live against real fixtures for AVIF,
 Both, redo, and the negative-savings fixture.
-**Do not automate the open panel.** The app runs as a bare executable from `.zig-cache` and System Events
-cannot bring it frontmost (`set frontmost` silently no-ops), so global keystrokes land on whatever IS
-frontmost — this is what typed a path into a live Claude Code session during M4. Verified again in M7 and
-closed there: the seam is unreachable until the app is a real `.app` bundle (M10). Have the user pick the
-file by hand; everything after the file loads drives fine with `native automate widget-click`.
+**Do not automate the open panel — or, per M8, ANY native file dialog.** The app runs as a bare executable
+from `.zig-cache` and System Events cannot bring it frontmost (`set frontmost` silently no-ops), so global
+keystrokes land on whatever IS frontmost — this is what typed a path into a live Claude Code session
+during M4. Verified again in M7 (open panel) and M8 (save panel) and closed there: the seam is
+unreachable until the app is a real `.app` bundle (M10). Have the user drive every dialog by hand;
+everything else (button presses, chip selection, status/result assertions) drives fine with `native
+automate widget-click`.
+M8: "Save As…" — `save_as` -> `showSaveDialog` -> copy the chosen output(s) to the user's location,
+without touching M7's auto-saved originals. **Its headline decision: "Both" mode runs two save rounds
+SEQUENTIALLY** (one save-dialog-then-copy per landed format), not a folder picker — `showSaveDialog` only
+ever returns one path, and a folder picker is a real, different UI PLAN never specified, so this was
+asked rather than assumed. A cancelled round is silent and the other format is still offered. The copy
+itself goes through a THIRD hand-bound host command, `file.copy` — not `fx.writeFile`, whose 1 MiB cap
+(`max_effect_file_bytes`) a real encoder output can exceed, the same bound M3 already hit with the source
+image. `native build`/`check`/`test` all clean (78/78 tests, `check` still at zero warnings); M8 verified
+live — a "Both" run's two save rounds produced copies **MD5-identical** to a fresh by-hand encoder run,
+and cancelling a single-format save left the status bar unchanged with `dispatch_errors=0`.
 **Known and deferred to M9:** the view overflows 480x320 (`zero_canvas_layout`), clipping the
-bottom button row — worse now that M7 adds up to two result rows. Expected — M2's shell was never laid
-out for real content.
+bottom button row — worse now that M7/M8 add up to three status-area rows (two results + the save note).
+Expected — M2's shell was never laid out for real content.
 **`PLAN.md` is the source of truth** for milestones,
 locked decisions, per-milestone model/session guidance, and open questions. Do not restate its
 contents here — link to it.
