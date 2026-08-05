@@ -418,7 +418,7 @@ check) rather than retry the OS-level automation. **Flag for whoever runs M4's l
 confirm the app window is actually frontmost/key before scripting further `NSOpenPanel` interaction —
 M3's version of this same trick worked, so something about window focus differed this time.
 
-**M5 — Encoder detection at launch.** *(Sonnet, fresh session)* [✓ error-state: encoder binary missing]
+**M5 — Encoder detection at launch.** *(Sonnet, fresh session)* [✓ error-state: encoder binary missing] - **DONE**
 `fx.spawn` a presence check for `avifenc`/`cwebp` on startup, land results as `encoder_check_result`,
 surface the "Error states" messaging if either is missing. While here, run both encoders by hand on a
 fixture and **pin the confirmed argv back into "Encoder invocations" above** — M7 depends on it.
@@ -451,9 +451,18 @@ renders the ordinary idle status line ("Drop or choose an image to get started."
 exact message the fake-executor test predicts. Restored PATH and reran; idle line returned. `native
 build`/`check` clean.
 
-**M6 — Format selection.** *(Sonnet, share M5's session)* [✓ "choose output: AVIF / WebP / Both"]
+**M6 — Format selection.** *(Sonnet, share M5's session)* [✓ "choose output: AVIF / WebP / Both"] - **DONE**
 Wire `set_format` from the three format controls to `Model.format`.
 *Verify:* click each option, confirm `Model.format` updates and the correct one renders selected.
+*Implementation:* one line — `.set_format => |format| model.format = format,`. The chip -> payload
+coercion and the `selected="{f == format}"` binding were already proven at the markup level in M2a;
+`update` moving `Model.format` was the only piece M2a could not test without a real `update` arm.
+*Verified:* `native test` 39/39 (two new tests: each option moves `Model.format` in one send, and
+`format` survives a full pick chain unclobbered — the same "format is a standing preference"
+invariant `reset` already protects). Live: `native dev` + `native automate widget-click main-canvas
+<id>` against all three chips — `avif` selected by default, clicking `webp` moved `state=[selected]`
+to it and cleared `avif`'s, clicking `both` did the same. `native build`/`check` clean (same
+pre-existing unbound-field warnings only).
 
 **M7 — Smoosh encode pipeline.** *(Opus, fresh session)* [✓ "Smoosh produces selected format(s) and auto-saves", ✓ "before/after size + savings % shown"]
 Wire `smoosh` -> `fx.spawn` the encoder invocation(s) per `Model.format`, auto-save next to source

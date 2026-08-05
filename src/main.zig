@@ -490,7 +490,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.* = .{ .format = format };
         },
 
-        .set_format => {},
+        .set_format => |format| model.format = format,
         .smoosh => {},
         .encode_result => {},
         .save_as => {},

@@ -114,7 +114,7 @@ For a hand-authored root, window geometry is stated three times and all three mu
   about behavior.
 
 ## Current status
-**M1-M5 done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
+**M1-M6 done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
 an ugly-but-complete `src/app.native` every later milestone can drive via `native automate`;
 `test-images/` fixtures created. M2a: `src/tests.zig` — the tier-1 harness (markup builds, dispatch,
 chip payload coercion, model accessors) later milestones extend. M3: the real pick chain —
@@ -128,11 +128,13 @@ on megapixels before the thumbnail spawn. M5: launch-time `avifenc`/`cwebp` dete
 first paint) spawning `/usr/bin/which avifenc` / `/usr/bin/which cwebp`; missing either surfaces the
 named `brew install libavif`/`brew install webp` message through the existing `.failed` status path.
 Also pinned the M7 encoder argv (`avifenc -q 58 --speed 6`, `cwebp -q 80`) by running both against
-real fixtures — no changes needed. `native build`/`check`/`test` all clean (37/37 tests); M1-M3
-verified live against a real `NSOpenPanel`, M4 verified via the fake-executor tests only (a
-live-automation attempt misfired — see PLAN.md's M4 entry for the full writeup and a flag for
-whoever next drives `NSOpenPanel` automation), M5 verified live via `native dev` with a `PATH`
-excluding the encoders (see PLAN.md's M5 entry).
+real fixtures — no changes needed. M6: `set_format` now moves `Model.format` (`update`'s only new
+line); the chip payload coercion and `selected` binding were already proven at the markup level in
+M2a. `native build`/`check`/`test` all clean (39/39 tests); M1-M3 verified live against a real
+`NSOpenPanel`, M4 verified via the fake-executor tests only (a live-automation attempt misfired —
+see PLAN.md's M4 entry for the full writeup and a flag for whoever next drives `NSOpenPanel`
+automation), M5 verified live via `native dev` with a `PATH` excluding the encoders, M6 verified
+live via `native automate widget-click` on all three format chips (see PLAN.md's M5/M6 entries).
 **Known and deferred to M9:** the view overflows 480x320 by ~78px (`zero_canvas_layout`), clipping the
 bottom button row. Expected — M2's shell was never laid out for real content.
 **`PLAN.md` is the source of truth** for milestones,

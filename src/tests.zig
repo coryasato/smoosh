@@ -884,6 +884,41 @@ test "the missing-encoder failure is decided only once both checks land, in eith
     try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "avifenc") != null);
 }
 
+// ==================================================== M6: format selection
+//
+// The chip -> `set_format:{f}` payload coercion and the `selected="{f ==
+// format}"` binding are already proven at the markup level (M2a, above) —
+// what M6 actually adds is `update` moving `Model.format`. `.avif` is the
+// model default, so the AVIF case here also stands in as "sending your own
+// current selection is a no-op."
+
+test "set_format moves Model.format, one send per option" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try testing.expectEqual(Format.avif, h.model().format);
+    for (Model.formats) |format| {
+        try h.send(.{ .set_format = format });
+        try testing.expectEqual(format, h.model().format);
+    }
+}
+
+test "format survives picking a file, unlike the rest of the model" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .webp });
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("2516582");
+    try h.dimensions(4000, 3000);
+    try h.thumbnail(0);
+    try h.preview(.loaded, 160, 120);
+
+    // The pick chain touches file/preview state only; format is a
+    // standing preference, not something a load can clobber.
+    try testing.expectEqual(Format.webp, h.model().format);
+}
+
 // -------------------------------------------------------- M3: derived text
 
 test "fileName is the last path component" {
