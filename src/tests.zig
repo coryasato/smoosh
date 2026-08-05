@@ -142,6 +142,52 @@ test "widget ids are stable across a rebuild" {
     try testing.expectEqual(smoosh_before.id, smoosh_after.id);
 }
 
+test "widget ids survive the conditional rows appearing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The preview and the two result lines are `<if>` children of the root
+    // column, so they come and go. Unkeyed same-kind siblings take
+    // POSITIONAL identity, which means a conditional that starts rendering
+    // re-disambiguates every sibling after it and all their ids move. That
+    // really happened: driving M7 live, the Smoosh button took three
+    // different ids across idle -> ready -> done, breaking automation
+    // scripts mid-run. The `key` on each root child is what pins this, and
+    // the test above cannot catch it — it only changes `status`, which
+    // alters no structure.
+    var empty: Model = .{};
+    const before = try buildTree(arena, &empty);
+
+    var full: Model = .{
+        .status = .done,
+        .image_id = 4,
+        .preview_width = 160,
+        .preview_height = 120,
+        .original_size = 5_846_465,
+        .avif_size = 717_003,
+        .avif_outcome = .ok,
+        .webp_size = 671_054,
+        .webp_outcome = .ok,
+    };
+    const after = try buildTree(arena, &full);
+    // Precondition: the two trees really do differ structurally, or this
+    // test would pass without proving anything.
+    try testing.expect(findByKind(before.root, .image) == null);
+    try testing.expect(findByKind(after.root, .image) != null);
+
+    for ([_][]const u8{ "Smoosh", "Save As…", "Choose Image…", "Reset" }) |label| {
+        const empty_widget = try expectByText(before.root, .button, label);
+        const full_widget = try expectByText(after.root, .button, label);
+        try testing.expectEqual(empty_widget.id, full_widget.id);
+    }
+    for (Model.formats) |format| {
+        const empty_chip = try expectByText(before.root, .toggle_button, @tagName(format));
+        const full_chip = try expectByText(after.root, .toggle_button, @tagName(format));
+        try testing.expectEqual(empty_chip.id, full_chip.id);
+    }
+}
+
 // ---------------------------------------------------------------- dispatch
 
 test "every control dispatches the message it claims" {
@@ -428,6 +474,57 @@ const Harness = struct {
         const request = self.fx().pendingImageLoadAt(0) orelse return error.NoImageLoad;
         try self.fx().feedImageResult(request.id, outcome, w, h, 0, "");
         try self.drain();
+    }
+
+    // ------------------------------------------------------ M7: encoding
+    //
+    // These find their request by CONTENT (argv[0], the stat payload's
+    // extension) rather than by slot index, because the whole point of M7
+    // is that the two encodes are independent: a test must be able to
+    // answer them in EITHER order without the helper caring.
+
+    /// The full pick chain, landing in `.ready` with a preview — the state
+    /// `smoosh` requires. Dimensions and thumbnail take their happy path.
+    fn load(self: *Harness, path: []const u8, size: []const u8) !void {
+        try self.pick(path);
+        try self.stat(size);
+        try self.dimensions(4000, 3000);
+        try self.thumbnail(0);
+        try self.preview(.loaded, 160, 120);
+    }
+
+    /// The pending encode spawn whose argv[0] is `program`, or null.
+    fn encodeSpawn(self: *Harness, program: []const u8) ?@TypeOf(self.fx().pendingSpawnAt(0).?) {
+        var index: usize = 0;
+        while (self.fx().pendingSpawnAt(index)) |request| : (index += 1) {
+            if (std.mem.eql(u8, request.argv[0], program)) return request;
+        }
+        return null;
+    }
+
+    fn encodeExit(self: *Harness, program: []const u8, code: i32) !void {
+        const request = self.encodeSpawn(program) orelse return error.NoSpawn;
+        try self.fx().feedExit(request.key, code);
+        try self.drain();
+    }
+
+    /// Answers the output-size stat for whichever format's destination path
+    /// ends in `extension`.
+    fn encodeSize(self: *Harness, extension: []const u8, ok: bool, size: []const u8) !void {
+        var index: usize = 0;
+        while (self.fx().pendingHostAt(index)) |request| : (index += 1) {
+            if (std.mem.endsWith(u8, request.payload, extension)) {
+                try self.fx().feedHostResult(request.key, ok, size);
+                return self.drain();
+            }
+        }
+        return error.NoHostRequest;
+    }
+
+    /// One format's whole happy path: a clean exit, then its output size.
+    fn encodeOk(self: *Harness, program: []const u8, extension: []const u8, size: []const u8) !void {
+        try self.encodeExit(program, 0);
+        try self.encodeSize(extension, true, size);
     }
 };
 
@@ -917,6 +1014,477 @@ test "format survives picking a file, unlike the rest of the model" {
     // The pick chain touches file/preview state only; format is a
     // standing preference, not something a load can clobber.
     try testing.expectEqual(Format.webp, h.model().format);
+}
+
+// ==================================================== M7: encode pipeline
+//
+// The sizes below are REAL: PLAN.md's "Encoder invocations" recorded them
+// by running the pinned argv against `test-images/` in M5. `large.jpg`
+// (5,846,465 B) -> AVIF 717,003 / WebP 671,054; `tiny.png` (312 B) -> AVIF
+// 315 (LARGER than the source) / WebP 68.
+
+const large_jpg = "/Users/someone/Pictures/large.jpg";
+const large_jpg_bytes = "5846465";
+
+test "AVIF alone spawns the pinned avifenc argv and writes next to the source" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    try testing.expectEqual(Status.compressing, h.model().status);
+    // Exactly one encode: selecting AVIF must not also run cwebp.
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+
+    const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+    const expected_argv = [_][]const u8{
+        "avifenc",  "-q",  "58",
+        "--speed",  "6",   large_jpg,
+        "/Users/someone/Pictures/large.avif",
+    };
+    try testing.expectEqual(expected_argv.len, spawn.argv.len);
+    for (expected_argv, spawn.argv) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+
+    try h.encodeOk("avifenc", ".avif", "717003");
+
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().hasAvifResult());
+    try testing.expect(!h.model().hasWebpResult());
+    try testing.expectEqual(@as(u64, 717003), h.model().avif_size);
+    try testing.expectEqualStrings("Done.", h.model().statusLine());
+}
+
+test "WebP alone spawns the pinned cwebp argv, whose output flag is -o" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .webp });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+    const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+    // cwebp takes its destination after `-o`, unlike avifenc's positional
+    // second argument — a reordering here would silently write the wrong file.
+    const expected_argv = [_][]const u8{
+        "cwebp", "-q", "80", large_jpg, "-o", "/Users/someone/Pictures/large.webp",
+    };
+    try testing.expectEqual(expected_argv.len, spawn.argv.len);
+    for (expected_argv, spawn.argv) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+
+    try h.encodeOk("cwebp", ".webp", "671054");
+
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().hasWebpResult());
+    try testing.expect(!h.model().hasAvifResult());
+    try testing.expectEqual(@as(u64, 671054), h.model().webp_size);
+}
+
+test "Both runs two encodes at once and joins them" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    // Concurrent, not sequential: both spawns are in flight before either
+    // answers. A pipeline that chained them would show one here.
+    try testing.expectEqual(@as(usize, 2), h.fx().pendingSpawnCount());
+
+    try h.encodeOk("avifenc", ".avif", "717003");
+    // One format done is not the run done.
+    try testing.expectEqual(Status.compressing, h.model().status);
+
+    try h.encodeOk("cwebp", ".webp", "671054");
+
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().hasAvifResult());
+    try testing.expect(h.model().hasWebpResult());
+    try testing.expectEqualStrings("", h.model().warningMessage());
+}
+
+test "Both joins in whichever order the encoders finish" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    // cwebp answers FIRST this time. Real encoders finish in whatever order
+    // the OS gives them, so the join must not depend on the spawn order.
+    try h.encodeOk("cwebp", ".webp", "671054");
+    try testing.expectEqual(Status.compressing, h.model().status);
+    try h.encodeOk("avifenc", ".avif", "717003");
+
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expectEqual(@as(u64, 717003), h.model().avif_size);
+    try testing.expectEqual(@as(u64, 671054), h.model().webp_size);
+}
+
+// ---------------------------------------------- the partial-failure rule
+
+test "AVIF succeeding while WebP fails is a done run that names WebP" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeExit("cwebp", 1);
+
+    // THE decision (PLAN.md's "Open decisions", settled in M7): `.done`,
+    // not `.failed`. avifenc already wrote large.avif to disk — claiming
+    // the run failed would contradict the file sitting next to the source.
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().hasAvifResult());
+    try testing.expect(!h.model().hasWebpResult());
+    // The loss is never silent: the status bar is the only place the
+    // missing format can be named, since it has no result line.
+    const warning = h.model().warningMessage();
+    try testing.expect(std.mem.indexOf(u8, warning, "WebP") != null);
+    try testing.expectEqualStrings(warning, h.model().statusLine());
+    // ...and the error buffer stays empty, so nothing can mistake this for
+    // a failed run.
+    try testing.expectEqualStrings("", h.model().errorMessage());
+}
+
+test "WebP succeeding while AVIF fails is the same rule, mirrored" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    try h.encodeExit("avifenc", 1);
+    try h.encodeOk("cwebp", ".webp", "671054");
+
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().hasWebpResult());
+    try testing.expect(!h.model().hasAvifResult());
+    try testing.expect(std.mem.indexOf(u8, h.model().warningMessage(), "AVIF") != null);
+}
+
+test "Both formats failing is a failed run, not a done one" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    try h.encodeExit("avifenc", 1);
+    try h.encodeExit("cwebp", 1);
+
+    // The floor under the partial-success rule: nothing landed, so nothing
+    // may claim success. This also keeps PLAN.md's "`.failed` is always
+    // paired with an error message" true.
+    try testing.expectEqual(Status.failed, h.model().status);
+    const message = h.model().errorMessage();
+    try testing.expect(std.mem.indexOf(u8, message, "AVIF") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "WebP") != null);
+    try testing.expectEqualStrings(message, h.model().statusLine());
+    try testing.expect(!h.model().hasAvifResult());
+    try testing.expect(!h.model().hasWebpResult());
+}
+
+test "the only selected format failing is an ordinary failed run" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeExit("avifenc", 1);
+
+    // Single-format mode reaches the SAME branch as "both failed" — there
+    // is no separate code path for it, which is the point of the rule.
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "AVIF") != null);
+    // A format that was never requested must not be blamed.
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "WebP") == null);
+}
+
+// ------------------------------------------------- encoders and encoding
+
+test "a missing encoder fails only its own format" {
+    var h = try Harness.createBare();
+    defer h.destroy();
+
+    // avifenc present, cwebp absent — the machine M5 would have failed
+    // outright at launch. In Both mode the AVIF half must still work.
+    try h.resolveEncoders(true, false);
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    // No point spawning a binary that is not there.
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+    try testing.expect(h.encodeSpawn("cwebp") == null);
+
+    try h.encodeOk("avifenc", ".avif", "717003");
+
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().hasAvifResult());
+    try testing.expect(std.mem.indexOf(u8, h.model().warningMessage(), "brew install webp") != null);
+}
+
+test "a missing encoder for the only selected format fails, naming its brew install" {
+    var h = try Harness.createBare();
+    defer h.destroy();
+
+    try h.resolveEncoders(false, true);
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    // Decided without any spawn at all, so the run is over in one dispatch.
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "brew install libavif") != null);
+}
+
+test "an encoder that exits clean without leaving a file is a write failure" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeExit("avifenc", 0);
+    // The output stat is what proves the file landed — PLAN.md's "write to
+    // output path failed" state has no other signal, since the encoder
+    // writes its own destination.
+    try h.encodeSize(".avif", false, "AccessDenied");
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    const message = h.model().errorMessage();
+    try testing.expect(std.mem.indexOf(u8, message, "large.jpg") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "permissions") != null);
+    try testing.expect(!h.model().hasAvifResult());
+}
+
+test "smooshing a WebP source to WebP is skipped rather than overwriting the source" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load("/Users/someone/Pictures/photo.webp", "204800");
+    try h.send(.smoosh);
+
+    // cwebp would have been handed the same path to read AND write.
+    // "Overwrite silently" (PLAN.md's Output handling) is about a previous
+    // OUTPUT, never the user's source file.
+    try testing.expect(h.encodeSpawn("cwebp") == null);
+    try testing.expect(h.encodeSpawn("avifenc") != null);
+
+    try h.encodeOk("avifenc", ".avif", "98304");
+
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(std.mem.indexOf(u8, h.model().warningMessage(), "already a WebP") != null);
+}
+
+test "the output path replaces the source extension, not a dot in a parent directory" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // No extension on the file, and a dot in a directory above it: the
+    // naive "last dot in the whole path" rule would write
+    // /Users/someone/my.photos.avif and clobber a directory name.
+    try h.load("/Users/someone/my.photos/holiday", "204800");
+    try h.send(.smoosh);
+
+    const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+    try testing.expectEqualStrings(
+        "/Users/someone/my.photos/holiday.avif",
+        spawn.argv[spawn.argv.len - 1],
+    );
+}
+
+// ------------------------------------------------------------- reporting
+
+test "an output larger than the source reads as larger, not a broken percentage" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // tiny.png really does grow as AVIF (312 B -> 315 B), measured in M5.
+    // PLAN.md asks that this display sanely rather than as a failure.
+    try h.send(.{ .set_format = .both });
+    try h.load("/Users/someone/Pictures/tiny.png", "312");
+    try h.send(.smoosh);
+    try h.encodeOk("avifenc", ".avif", "315");
+    try h.encodeOk("cwebp", ".webp", "68");
+
+    try testing.expectEqual(Status.done, h.model().status);
+    const avif_line = h.model().avifResult(arena);
+    try testing.expect(std.mem.indexOf(u8, avif_line, "larger") != null);
+    try testing.expect(std.mem.indexOf(u8, avif_line, "−") == null);
+    // The other format compressed fine in the same run — one growing does
+    // not make the run a failure, or the other line wrong.
+    try testing.expect(std.mem.indexOf(u8, h.model().webpResult(arena), "−78%") != null);
+}
+
+test "formatSavings covers smaller, larger, and unchanged outputs" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectEqualStrings("−88%", main.formatSavings(arena, 5_846_465, 717_003));
+    try testing.expectEqualStrings("−89%", main.formatSavings(arena, 5_846_465, 671_054));
+    try testing.expectEqualStrings("+1% larger", main.formatSavings(arena, 312, 315));
+    // Neither a saving nor a loss worth a number.
+    try testing.expectEqualStrings("same size", main.formatSavings(arena, 1000, 1000));
+    // No original size means no honest percentage to report.
+    try testing.expectEqualStrings("", main.formatSavings(arena, 0, 100));
+}
+
+test "result lines render only for the formats that landed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeExit("cwebp", 1);
+
+    try testing.expectEqualStrings("AVIF  700.2 KB  −88%", h.model().avifResult(arena));
+    try testing.expectEqualStrings("", h.model().webpResult(arena));
+
+    // ...and the view agrees: exactly one result line is in the tree.
+    const tree = try buildTree(arena, h.model());
+    try testing.expect(findByText(tree.root, .text, "AVIF  700.2 KB  −88%") != null);
+    try testing.expect(findByText(tree.root, .text, "") == null);
+}
+
+// ------------------------------------------------------ lifecycle guards
+
+test "smooshing with no image loaded does nothing" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.smoosh);
+
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
+}
+
+test "re-smooshing clears the previous run's results" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeExit("cwebp", 1);
+    try testing.expect(h.model().warning_message_len > 0);
+
+    // "Re-running Smoosh on the same source is treated as redo this"
+    // (PLAN.md's Output handling) — including redoing the format that
+    // failed, and dropping the warning it left behind.
+    try h.send(.smoosh);
+    try testing.expectEqual(Status.compressing, h.model().status);
+    try testing.expect(!h.model().hasAvifResult());
+    try testing.expectEqualStrings("", h.model().warningMessage());
+
+    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk("cwebp", ".webp", "671054");
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expectEqualStrings("", h.model().warningMessage());
+}
+
+test "a second Smoosh press while encoding is ignored" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.send(.smoosh);
+
+    // A duplicate active key would be REJECTED by the effects channel, so
+    // without the guard the second press would deliver a spurious failure.
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+    try h.encodeOk("avifenc", ".avif", "717003");
+    try testing.expectEqual(Status.done, h.model().status);
+}
+
+test "an encode result that lands after reset is ignored" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    // Same hazard the load chain hit twice: cancelling the encode delivers
+    // an ordinary nonzero terminal, indistinguishable from a real failure.
+    try h.send(.reset);
+    try h.drain();
+
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqualStrings("", h.model().errorMessage());
+    try testing.expectEqualStrings("", h.model().warningMessage());
+    try testing.expect(!h.model().hasAvifResult());
+}
+
+test "picking a new file clears the previous file's results" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk("avifenc", ".avif", "717003");
+    try testing.expect(h.model().hasAvifResult());
+
+    // Without the clear, the new file's "Ready to smoosh" screen would
+    // still be showing the OLD file's savings line.
+    try h.pick("/Users/someone/Pictures/other.jpg");
+    try testing.expect(!h.model().hasAvifResult());
+    try testing.expectEqual(@as(u64, 0), h.model().avif_size);
+
+    try h.stat("204800");
+    try h.dimensions(4000, 3000);
+    try h.thumbnail(0);
+    try h.preview(.loaded, 160, 120);
+    try testing.expectEqual(Status.ready, h.model().status);
+}
+
+test "changing the format mid-encode does not change what the run produces" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    // The chips stay live while encoding, so narrow the selection to AVIF
+    // while BOTH encodes are still in flight — the ordering that actually
+    // exposes the hazard. The join must be driven by what was REQUESTED
+    // (the per-format `.pending` outcome), never by re-reading
+    // `Model.format`: a join that re-read it would call the run finished
+    // the moment AVIF landed and silently drop the WebP file still on its
+    // way, leaving a file on disk the UI never mentions.
+    try h.send(.{ .set_format = .avif });
+    try h.encodeOk("avifenc", ".avif", "717003");
+    try testing.expectEqual(Status.compressing, h.model().status);
+
+    try h.encodeOk("cwebp", ".webp", "671054");
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().hasWebpResult());
 }
 
 // -------------------------------------------------------- M3: derived text

@@ -114,7 +114,7 @@ For a hand-authored root, window geometry is stated three times and all three mu
   about behavior.
 
 ## Current status
-**M1-M6 done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
+**M1-M7 done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
 an ugly-but-complete `src/app.native` every later milestone can drive via `native automate`;
 `test-images/` fixtures created. M2a: `src/tests.zig` — the tier-1 harness (markup builds, dispatch,
 chip payload coercion, model accessors) later milestones extend. M3: the real pick chain —
@@ -134,9 +134,23 @@ M2a. `native build`/`check`/`test` all clean (39/39 tests); M1-M3 verified live 
 `NSOpenPanel`, M4 verified via the fake-executor tests only (a live-automation attempt misfired —
 see PLAN.md's M4 entry for the full writeup and a flag for whoever next drives `NSOpenPanel`
 automation), M5 verified live via `native dev` with a `PATH` excluding the encoders, M6 verified
-live via `native automate widget-click` on all three format chips (see PLAN.md's M5/M6 entries).
-**Known and deferred to M9:** the view overflows 480x320 by ~78px (`zero_canvas_layout`), clipping the
-bottom button row. Expected — M2's shell was never laid out for real content.
+live via `native automate widget-click` on all three format chips (see PLAN.md's M5/M6 entries). M7: the
+encode pipeline — `smoosh` -> one `fx.spawn` per requested format -> `encode_result` -> a `file.stat` per
+output -> `.done`/`.failed`, with per-format result lines and savings. **Its headline decision, recorded in
+full in PLAN.md's M7 entry: partial failure is partial SUCCESS** — in "Both" mode the two encodes are
+independent, one landing while the other fails is `.done` with the failure named in the status bar, and
+only an all-failed run is `.failed`. The encoders write their own output files, so anything else would
+contradict a file already on disk. `native build`/`check`/`test` all clean (62/62 tests, `check` now at
+**zero** warnings after `Model.view_unbound` landed); M7 verified live against real fixtures for AVIF,
+Both, redo, and the negative-savings fixture.
+**Do not automate the open panel.** The app runs as a bare executable from `.zig-cache` and System Events
+cannot bring it frontmost (`set frontmost` silently no-ops), so global keystrokes land on whatever IS
+frontmost — this is what typed a path into a live Claude Code session during M4. Verified again in M7 and
+closed there: the seam is unreachable until the app is a real `.app` bundle (M10). Have the user pick the
+file by hand; everything after the file loads drives fine with `native automate widget-click`.
+**Known and deferred to M9:** the view overflows 480x320 (`zero_canvas_layout`), clipping the
+bottom button row — worse now that M7 adds up to two result rows. Expected — M2's shell was never laid
+out for real content.
 **`PLAN.md` is the source of truth** for milestones,
 locked decisions, per-milestone model/session guidance, and open questions. Do not restate its
 contents here — link to it.

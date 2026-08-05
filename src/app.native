@@ -1,28 +1,47 @@
 <!-- M2 scaffold: every control M3-M8 need to drive via `native automate`.
      No styling/layout polish here on purpose — M9 replaces this wholesale
      with the real "UI sketch" from PLAN.md once every message actually
-     works. Validate with: native check -->
+     works. Validate with: native check
+
+     Every direct child of the root column carries a `key`. Without one,
+     unkeyed same-kind siblings take POSITIONAL identity, so each `<if>`
+     below that starts rendering re-disambiguates everything after it and
+     the widget ids all move — confirmed live in M7, where the Smoosh
+     button took three different ids across idle -> ready -> done. Keys
+     pin identity regardless of which conditionals are currently in the
+     tree, which is what `native automate` scripts (and engine-owned
+     widget state) rely on. -->
 <column gap="12" padding="16">
-  <row gap="8" cross="center">
+  <row key="header" gap="8" cross="center">
     <text grow="1">Smoosh</text>
     <button size="sm" variant="ghost" on-press="reset">Reset</button>
   </row>
-  <button on-press="pick_file">Choose Image…</button>
+  <button key="choose" on-press="pick_file">Choose Image…</button>
   <!-- M3: the preview is a `sips`-generated thumbnail, not the source
        image — registered images are capped at 512x512 decoded. Its real
        dimensions ride the model so the aspect ratio stays honest. -->
   <if test="{hasPreview}">
-    <image image="{image_id}" width="{preview_width}" height="{preview_height}" label="Preview of the chosen image" />
+    <image key="preview" image="{image_id}" width="{preview_width}" height="{preview_height}" label="Preview of the chosen image" />
   </if>
-  <text>{fileSummary}</text>
-  <toggle-group gap="4" label="Format">
+  <text key="summary">{fileSummary}</text>
+  <!-- M7: one line per format that actually landed. Per-format rather than
+       a summed "combined savings" — no client ever downloads both files, so
+       each line reports what would really be served. A format that failed
+       shows no line; the status bar names it. -->
+  <if test="{hasAvifResult}">
+    <text key="avif-result">{avifResult}</text>
+  </if>
+  <if test="{hasWebpResult}">
+    <text key="webp-result">{webpResult}</text>
+  </if>
+  <toggle-group key="formats" gap="4" label="Format">
     <for each="formats" as="f">
       <toggle-button selected="{f == format}" on-toggle="set_format:{f}">{f}</toggle-button>
     </for>
   </toggle-group>
-  <row gap="8">
+  <row key="actions" gap="8">
     <button variant="primary" on-press="smoosh">Smoosh</button>
     <button on-press="save_as">Save As…</button>
   </row>
-  <status-bar>{statusLine}</status-bar>
+  <status-bar key="status">{statusLine}</status-bar>
 </column>

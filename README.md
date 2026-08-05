@@ -9,9 +9,13 @@ something local and instant.
 
 ## Status
 
-**Pre-implementation.** The architecture is decided and the risky unknown
-(native file dialogs from a hand-authored Zig core) has been spiked and proven,
-but no app code is written yet — `src/main.zig` does not exist.
+**Working, unpolished.** Smoosh launches, you pick an image,
+see a preview and its size, choose AVIF / WebP / Both, and press Smoosh — the
+compressed files land next to the original and the before/after size and savings
+percentage are shown per format.
+
+Not done yet: "Save As…" is inert, the window layout overflows at 480x320
+and clips the button row, and there is no packaged `.app`.
 
 See [PLAN.md](PLAN.md) for milestones, locked decisions, and open questions.
 See [CLAUDE.md](CLAUDE.md) for working context and toolchain notes.

@@ -464,19 +464,74 @@ invariant `reset` already protects). Live: `native dev` + `native automate widge
 to it and cleared `avif`'s, clicking `both` did the same. `native build`/`check` clean (same
 pre-existing unbound-field warnings only).
 
-**M7 — Smoosh encode pipeline.** *(Opus, fresh session)* [✓ "Smoosh produces selected format(s) and auto-saves", ✓ "before/after size + savings % shown"]
-Wire `smoosh` -> `fx.spawn` the encoder invocation(s) per `Model.format`, auto-save next to source
-(silent overwrite per "Output handling"), land results as `encode_result`, compute before/after size
-and `savings_percent`, drive `Status` through `compressing` -> `done`/`failed`. Cover the "encode failed"
-and "write failed" error states.
-*Opus because:* this is the highest-complexity milestone — "Both" means two concurrent spawns whose
-results arrive independently and must be joined before `done`, on top of a purity constraint that
-keeps all of it in `update_fx`. Partial-failure handling (AVIF succeeds, WebP fails) is a real design
-decision, not a wiring task; make it explicitly and record the answer here.
-*Fresh session because:* it needs the encode design loaded, not six milestones of UI wiring.
-*Verify:* run against real fixtures for AVIF, WebP, and Both; confirm output files exist next to source
-with correct sizes and accurate savings %. Include the already-tiny PNG fixture — confirm negative
-savings displays sanely rather than as a broken percentage.
+**M7 — Smoosh encode pipeline.** *(Opus, fresh session)* [✓ "Smoosh produces selected format(s) and auto-saves", ✓ "before/after size + savings % shown"] — **DONE**
+`smoosh` -> one `fx.spawn` per requested format -> `encode_result` -> a `file.stat` per output ->
+`encode_size_result` -> `.done`/`.failed`. The pinned M5 argv is used verbatim, with a bare `avifenc`/
+`cwebp` as argv[0] (the PATH resolution M5's `which` check was proving).
+Settled/found here:
+- **PARTIAL FAILURE: partial success wins.** In "Both" mode the two encodes are INDEPENDENT — if one
+  succeeds and the other fails, the run is `.done`, the successful format's numbers are shown, and the
+  failed one is named in the status bar. Only when NO requested format landed is the run `.failed`.
+  *The deciding fact is that the encoders write their own output files:* by the time WebP's nonzero exit
+  arrives, `photo.avif` is already on disk next to the source, so failing the whole run would mean either
+  claiming failure with a good file sitting right there, or deleting a file the user can see. It also makes
+  a missing encoder degrade instead of block — a machine with only `avifenc` still gets its AVIF out of a
+  "Both" run, where M5's launch check alone would have dead-ended it. The all-failed floor keeps the
+  "Status → error mapping" invariant intact, and in single-format mode it IS the ordinary failure path —
+  no special case, one branch.
+- **The join must never re-read `Model.format`.** Completion is "neither format is `.pending`", tracked on
+  a per-format `EncodeOutcome` (`none`/`pending`/`ok` + four failure reasons). The chips stay live while
+  encoding, so a join that re-read the current selection would end the run early when the user narrows
+  Both -> AVIF mid-flight, silently orphaning the WebP file still being written. Caught by mutation
+  testing, not by the first version of the test — the original test changed the format too late to expose it.
+- **`.done` needed its own warning buffer**, separate from `error_message_buffer`. The two coexist in
+  exactly the case this milestone exists to handle, and keeping them apart is what preserves "`.failed` is
+  always paired with an error message, and no other path sets `.failed`".
+- **A zero exit is not a result.** The output's size comes from a `file.stat` on the destination (M3's own
+  host command, kept separate for precisely this reuse), which doubles as the only available signal for
+  the "write to output path failed" state — the encoder writes its own destination, so there is no
+  separate write step to fail.
+- **Encoding a `.webp` source to WebP is skipped, not performed** (`same_path`): the destination would BE
+  the source, handing the encoder one file to read and overwrite. "Overwrite silently" is about a previous
+  OUTPUT, never the user's original. Not in PLAN's original error list; found while deriving output paths.
+- **Output paths scope the extension search to the last path component** — `/a/my.photos/holiday` must
+  become `/a/my.photos/holiday.avif`, not `/a/my.photos.avif`.
+- **`savings_percent` was deleted from the Model sketch**, not implemented: it is pure arithmetic over
+  `original_size` and each output size, so it is derived per rebuild ("Derive, don't store"). Negative
+  savings is real and reads as `+1% larger`; a sub-half-percent difference either way reads `same size`.
+- **"Combined savings" for Both mode resolved as per-format lines, not a sum.** A summed total describes a
+  download that never happens — no client fetches both files — so each line reports what would really be
+  served if that format were chosen. Degrades cleanly to one line when the other format failed.
+- **Widget ids were NOT stable across conditional rows, and now are.** Every `<if>` child of the root
+  column that starts rendering re-disambiguates its unkeyed same-kind siblings, so ids after it all move —
+  the Smoosh button took three different ids across idle -> ready -> done, which broke an automation script
+  mid-run during this milestone's own live check. Fixed by giving every root child a `key`. This predates
+  M7 (M3's preview `<if>` did it too); M2a's id-stability test could not catch it because it only changes
+  `status`, which alters no structure. A second test now covers it.
+- **`Model.view_unbound` landed**, taking `native check` from 17 warnings to zero. M2 deliberately left
+  them, reasoning "M3-M8 genuinely bind these soon"; what remains after M7 is permanently update-side, so
+  naming it makes a future warning mean something again.
+*Verified:* `native test` 62/62 (23 new: both single-format argvs pinned, Both joined in either order,
+both partial-failure directions, the all-failed floor, missing-encoder per format, write-failure, the
+same-path skip, output-path derivation, negative savings, lifecycle guards, and the id-stability
+regression). **All 11 mutations applied to the new logic were caught** — including two that initially were
+NOT, which is how the format-mid-encode gap and a compile-broken mutation were found; the tests were
+tightened until each failed exactly the assertion it should. `native check` clean with zero warnings,
+`native build` clean.
+*Live (against `native dev`, real fixtures, `dispatch_errors` clean — the only two were my own malformed
+automation command strings):* `large.jpg` as AVIF wrote `test-images/large.avif` at 717,003 B and rendered
+`AVIF  700.2 KB  −88%`; switching to Both and re-pressing Smoosh redid AVIF and added
+`test-images/large.webp` at 671,054 B rendering `WebP  655.3 KB  −89%`; `tiny.png` as Both wrote 315 B and
+68 B rendering `AVIF  315 B  +1% larger` and `WebP  68 B  −78%` — the negative-savings case displaying
+sanely, as required. Every size matches the by-hand encoder run exactly. Widget ids confirmed identical
+across `.done` and `.idle` after the `key` fix.
+**Live automation of the open panel was NOT used, and should not be**: the app runs as a bare executable
+from `.zig-cache`, and System Events cannot bring it frontmost (`set frontmost` silently no-ops), which is
+the exact condition behind M4's misfire — global keystrokes land on whatever IS frontmost, i.e. the
+terminal. The two file picks in this milestone were performed by hand by the user; everything after the
+file loads was driven normally with `native automate widget-click`. **This resolves M4's open flag:** the
+answer is not "check frontmost first", it is that this seam is unreachable until the app is a real `.app`
+bundle (M10). Until then, treat the open panel as a manual step.
 
 **M8 — Save As.** *(Sonnet, share M7's session)* [✓ "optionally re-save output to a different location"]
 Wire `save_as` -> `showSaveDialog` -> copy the already-produced output(s) to the chosen location.
@@ -510,9 +565,10 @@ acquisition. If the seam does not exist, record that finding in CLAUDE.md and cl
 the same shape as the spike work that produced the Zig-core decision.
 
 ## Open decisions
-- Partial failure in "Both" mode: report success-with-warning, or fail the whole operation? (decide
-  in M7 — write the fake-executor test for AVIF-ok/WebP-failed first; the decision is much easier
-  to make once the two orderings are in front of you)
+- ~~Partial failure in "Both" mode: report success-with-warning, or fail the whole operation?~~
+  **Resolved in M7: success-with-warning**, with an all-failed floor that stays `.failed`. The
+  encoders write their own output files, so a failed whole-operation would contradict a good file
+  already on disk. Full rationale in the M7 entry above.
 - Signed/notarized vs unsigned for v0.1 (decide in M10)
 - ~~Whether `native check` is meaningful for a zig-core tree~~ **Resolved in M1: yes.** It validates
   markup + app.zon, and once `native test` has emitted `zig-out/model-contract.zon` it also

@@ -88,6 +88,42 @@ pub const Status = enum { idle, loading, ready, compressing, done, failed };
 // NOTE: `failed`, not `error` — `error` is a Zig keyword and won't parse as
 // a bare enum field.
 
+/// Where ONE output format got to in the current smoosh run. M7's
+/// partial-failure decision (PLAN.md "Open decisions") lives in this type:
+/// the two formats carry their own outcome, so "Both" is two independent
+/// encodes joined at the end rather than one all-or-nothing operation.
+///
+/// `.none` means "not part of this run" and `.pending` means "spawned,
+/// still waiting" — which is what makes the join immune to the user
+/// changing `Model.format` mid-encode: completion is "neither is
+/// `.pending`", never a re-read of the current selection.
+///
+/// The failure tags are separate rather than one `.failed` because each
+/// one is a different sentence to the user, and PLAN.md's "Error states"
+/// names them individually.
+pub const EncodeOutcome = enum {
+    none,
+    pending,
+    ok,
+    /// The encoder binary is not installed (M5's launch check said so).
+    missing_encoder,
+    /// The output path would BE the source path — encoding a `.webp` to
+    /// WebP would have the encoder read and overwrite the same file.
+    same_path,
+    /// The encoder ran and exited nonzero (or was killed).
+    encode_failed,
+    /// The encoder claimed success but the output could not be stat'd —
+    /// PLAN.md's "write to output path failed" state.
+    write_failed,
+
+    fn isFailure(outcome: EncodeOutcome) bool {
+        return switch (outcome) {
+            .none, .pending, .ok => false,
+            .missing_encoder, .same_path, .encode_failed, .write_failed => true,
+        };
+    }
+};
+
 pub const Model = struct {
     // file
     path_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
@@ -97,14 +133,18 @@ pub const Model = struct {
     image_id: u64 = 0,
     preview_width: u32 = 0,
     preview_height: u32 = 0,
-    // result
+    // result — per format, because the two encodes succeed or fail
+    // independently (see `EncodeOutcome`). No `savings_percent` field:
+    // the percentage is pure arithmetic over `original_size` and each
+    // output size, so it is derived per rebuild ("Derive, don't store").
     avif_path_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
     avif_path_len: usize = 0,
     avif_size: u64 = 0,
+    avif_outcome: EncodeOutcome = .none,
     webp_path_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
     webp_path_len: usize = 0,
     webp_size: u64 = 0,
-    savings_percent: f32 = 0,
+    webp_outcome: EncodeOutcome = .none,
     // options
     format: Format = .avif,
     // encoders — M5's launch-time `which avifenc`/`which cwebp` presence
@@ -117,16 +157,60 @@ pub const Model = struct {
     status: Status = .idle,
     error_message_buffer: [256]u8 = undefined,
     error_message_len: usize = 0,
+    /// A `.done` run that still lost a format. Distinct from
+    /// `error_message_buffer` because the two coexist in exactly the case
+    /// M7's partial-failure decision creates: AVIF landed, WebP did not,
+    /// and the run is a success WITH something to say. PLAN.md's
+    /// "`.failed` is always paired with an error message, and no other
+    /// path sets `.failed`" survives precisely because this is its own
+    /// buffer rather than a second meaning for that one.
+    warning_message_buffer: [256]u8 = undefined,
+    warning_message_len: usize = 0,
 
     /// The chip iterable for the format toggle-group (see "Chips" in the
     /// native-ui skill) — must live inside Model for `for each` to see it.
     pub const formats = [_]Format{ .avif, .webp, .both };
+
+    /// State `update` owns, which the markup reaches only through the
+    /// derived fns below (`statusLine`, `fileSummary`, `avifResult`, ...).
+    /// Declared now rather than in M2 because until M7 most of these were
+    /// "not bound YET" (M2's recorded reason for leaving the warnings
+    /// alone); what is left over after M7 is permanently update-side, so
+    /// naming it here makes a future `native check` warning mean something
+    /// again instead of arriving into a standing list of 17.
+    pub const view_unbound = .{
+        "path_buffer",
+        "path_len",
+        "original_size",
+        "avif_path_buffer",
+        "avif_path_len",
+        "avif_size",
+        "avif_outcome",
+        "webp_path_buffer",
+        "webp_path_len",
+        "webp_size",
+        "webp_outcome",
+        "avifenc_present",
+        "cwebp_present",
+        "status",
+        "error_message_buffer",
+        "error_message_len",
+        "warning_message_buffer",
+        "warning_message_len",
+        "path",
+        "errorMessage",
+        "warningMessage",
+        "fileName",
+    };
 
     pub fn path(model: *const Model) []const u8 {
         return model.path_buffer[0..model.path_len];
     }
     pub fn errorMessage(model: *const Model) []const u8 {
         return model.error_message_buffer[0..model.error_message_len];
+    }
+    pub fn warningMessage(model: *const Model) []const u8 {
+        return model.warning_message_buffer[0..model.warning_message_len];
     }
 
     /// The picked file's last path component — what the UI names, and
@@ -151,6 +235,40 @@ pub const Model = struct {
         return std.fmt.allocPrint(arena, "{s} ({s})", .{
             model.fileName(),
             formatBytes(arena, model.original_size),
+        }) catch "";
+    }
+
+    // ------------------------------------------------------ M7: results
+    //
+    // One line per format, shown only for a format that actually landed
+    // — the "per-format, side by side" reading of PLAN.md's "combined
+    // savings" for Both mode. A summed total would describe a download
+    // that never happens (no client fetches both files), so each line
+    // reports what would really be served if that format were chosen.
+
+    pub fn hasAvifResult(model: *const Model) bool {
+        return model.avif_outcome == .ok;
+    }
+    pub fn hasWebpResult(model: *const Model) bool {
+        return model.webp_outcome == .ok;
+    }
+
+    /// "AVIF  700.2 KB  −88%". Empty unless AVIF landed this run.
+    pub fn avifResult(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (!model.hasAvifResult()) return "";
+        return model.resultLine(arena, "AVIF", model.avif_size);
+    }
+    /// "WebP  655.3 KB  −89%". Empty unless WebP landed this run.
+    pub fn webpResult(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (!model.hasWebpResult()) return "";
+        return model.resultLine(arena, "WebP", model.webp_size);
+    }
+
+    fn resultLine(model: *const Model, arena: std.mem.Allocator, label: []const u8, size: u64) []const u8 {
+        return std.fmt.allocPrint(arena, "{s}  {s}  {s}", .{
+            label,
+            formatBytes(arena, size),
+            formatSavings(arena, model.original_size, size),
         }) catch "";
     }
 
@@ -182,6 +300,31 @@ pub const Model = struct {
         model.status = .failed;
     }
 
+    /// The partial-success counterpart to `fail`: says what was lost
+    /// WITHOUT claiming the run failed. Deliberately does not touch
+    /// `status` — the caller has already decided this run is `.done`.
+    fn warn(model: *Model, comptime fmt: []const u8, args: anytype) void {
+        const written = std.fmt.bufPrint(&model.warning_message_buffer, fmt, args) catch blk: {
+            const fallback = "Some formats didn't finish.";
+            @memcpy(model.warning_message_buffer[0..fallback.len], fallback);
+            break :blk model.warning_message_buffer[0..fallback.len];
+        };
+        model.warning_message_len = written.len;
+    }
+
+    /// Wipes the previous run's outputs. Called when a new run starts and
+    /// when a new file lands — without it, a fresh pick would keep
+    /// rendering the last file's result lines.
+    fn clearResults(model: *Model) void {
+        model.avif_outcome = .none;
+        model.avif_path_len = 0;
+        model.avif_size = 0;
+        model.webp_outcome = .none;
+        model.webp_path_len = 0;
+        model.webp_size = 0;
+        model.warning_message_len = 0;
+    }
+
     /// M2 scaffold status line — just enough for the placeholder
     /// `<status-bar>` to bind to. Later milestones will likely replace this
     /// with something that also reports sizes/savings once those are real.
@@ -191,7 +334,10 @@ pub const Model = struct {
             .loading => "Loading…",
             .ready => "Ready to smoosh.",
             .compressing => "Smooshing…",
-            .done => "Done.",
+            // A partially successful run is `.done` — the result lines
+            // show what landed, and the status bar is the only place the
+            // format that did NOT land can be named.
+            .done => if (model.warning_message_len > 0) model.warningMessage() else "Done.",
             .failed => model.errorMessage(),
         };
     }
@@ -207,6 +353,7 @@ pub const Msg = union(enum) {
     set_format: Format, // format chip pressed
     smoosh, // "Smoosh" clicked
     encode_result: native_sdk.EffectExit, // fx.spawn callback, one per format encoded
+    encode_size_result: native_sdk.EffectHostResult, // host file-size callback -> avif_size/webp_size
     save_as, // "Save As…" clicked
     save_as_dialog_result: native_sdk.EffectHostResult, // host save-dialog callback
     save_as_result: native_sdk.EffectFileResult, // fx.writeFile callback
@@ -222,6 +369,7 @@ pub const Msg = union(enum) {
         "thumbnail_result",
         "image_loaded",
         "encode_result",
+        "encode_size_result",
         "save_as_dialog_result",
         "save_as_result",
         "encoder_check_result",
@@ -244,6 +392,22 @@ pub fn formatBytes(arena: std.mem.Allocator, bytes: u64) []const u8 {
     }) catch "";
 }
 
+/// "−88%" when the output is smaller than the source, "+1% larger" when it
+/// is not. The negative case is REAL, not an error: `test-images/tiny.png`
+/// (312 B) encodes to a 315-byte AVIF, confirmed by running the pinned argv
+/// in M5. PLAN.md asks that this "display sanely rather than as a broken
+/// percentage" — so the sign flips and the word changes, rather than
+/// printing "−-1%". Differences under half a percent round to nothing
+/// meaningful in either direction, so they say so outright.
+pub fn formatSavings(arena: std.mem.Allocator, original: u64, output: u64) []const u8 {
+    if (original == 0) return "";
+    const ratio = @as(f64, @floatFromInt(output)) / @as(f64, @floatFromInt(original));
+    const percent = (1.0 - ratio) * 100.0;
+    if (percent >= 0.5) return std.fmt.allocPrint(arena, "−{d:.0}%", .{percent}) catch "";
+    if (percent <= -0.5) return std.fmt.allocPrint(arena, "+{d:.0}% larger", .{-percent}) catch "";
+    return "same size";
+}
+
 pub const Effects = native_sdk.Effects(Msg);
 
 // ------------------------------------------------------------- effect keys
@@ -261,6 +425,10 @@ const preview_image_id: u64 = 4;
 const dimensions_key: u64 = 5;
 const avifenc_check_key: u64 = 6;
 const cwebp_check_key: u64 = 7;
+const avif_encode_key: u64 = 8;
+const webp_encode_key: u64 = 9;
+const avif_stat_key: u64 = 10;
+const webp_stat_key: u64 = 11;
 
 /// Host-call names our own `HostBridge` answers (see `main`). Not SDK
 /// vocabulary — we bind the seam, so we name it.
@@ -348,6 +516,195 @@ pub fn initFx(model: *Model, fx: *Effects) void {
     });
 }
 
+// ------------------------------------------------------ M7: encode pipeline
+//
+// THE PARTIAL-FAILURE DECISION (PLAN.md's "Open decisions", settled here):
+// in "Both" mode the two encodes are INDEPENDENT. If one succeeds and the
+// other fails, the run is `.done` — the successful format's numbers are
+// shown and the failed one is named in the status bar. Only when NO
+// requested format landed is the run `.failed`.
+//
+// The deciding fact is that `avifenc`/`cwebp` write their own output files:
+// by the time WebP's nonzero exit arrives, `photo.avif` is already on disk
+// next to the source. Failing the whole run would mean either claiming
+// failure with a good file sitting right there, or deleting a file the user
+// can see. It also makes a missing encoder degrade instead of blocking — a
+// machine with only `avifenc` still gets its AVIF out of a "Both" run.
+//
+// The floor keeps PLAN.md's "Status → error mapping" intact: a run where
+// everything failed is `.failed` with a message, which in single-format mode
+// is just the ordinary failure path — no special case.
+
+/// ONE encodable output format. `Format.both` is a REQUEST for two of
+/// these; every per-format path below works on this type, never on `Format`,
+/// which is exactly what keeps the two encodes independent.
+const Output = enum { avif, webp };
+
+/// Pinned in M5 by running both against real fixtures (PLAN.md's "Encoder
+/// invocations"). argv[0] is a bare name, not an absolute path: M5's
+/// `which` check proved the PATH resolution these spawns depend on.
+const avif_quality = "58";
+const avif_speed = "6";
+const webp_quality = "80";
+
+fn outputLabel(output: Output) []const u8 {
+    return switch (output) {
+        .avif => "AVIF",
+        .webp => "WebP",
+    };
+}
+
+fn outcomeOf(model: *const Model, output: Output) EncodeOutcome {
+    return switch (output) {
+        .avif => model.avif_outcome,
+        .webp => model.webp_outcome,
+    };
+}
+
+fn setOutcome(model: *Model, output: Output, outcome: EncodeOutcome) void {
+    switch (output) {
+        .avif => model.avif_outcome = outcome,
+        .webp => model.webp_outcome = outcome,
+    }
+}
+
+fn outputPathOf(model: *const Model, output: Output) []const u8 {
+    return switch (output) {
+        .avif => model.avif_path_buffer[0..model.avif_path_len],
+        .webp => model.webp_path_buffer[0..model.webp_path_len],
+    };
+}
+
+/// `/a/b/photo.jpg` + `.avif` -> `/a/b/photo.avif` (PLAN.md's "Output
+/// handling": next to the source). The extension search is scoped to the
+/// last path component so a dot in a PARENT directory can never be mistaken
+/// for one; a name with no dot of its own just gets the extension appended.
+/// Returns null only when the result would not fit the buffer.
+fn outputPath(buffer: []u8, source: []const u8, extension: []const u8) ?[]const u8 {
+    const name_start = if (std.mem.lastIndexOfScalar(u8, source, '/')) |slash| slash + 1 else 0;
+    const stem_end = blk: {
+        const dot = std.mem.lastIndexOfScalar(u8, source[name_start..], '.') orelse break :blk source.len;
+        // A leading dot is a hidden file (".profile"), not an extension.
+        if (dot == 0) break :blk source.len;
+        break :blk name_start + dot;
+    };
+    if (stem_end + extension.len > buffer.len) return null;
+    @memcpy(buffer[0..stem_end], source[0..stem_end]);
+    @memcpy(buffer[stem_end..][0..extension.len], extension);
+    return buffer[0 .. stem_end + extension.len];
+}
+
+/// Starts one format, or records why it could not start. Every path out of
+/// here leaves the format's outcome non-`.none`, so the join below always
+/// terminates.
+fn beginEncode(model: *Model, fx: *Effects, output: Output) void {
+    // M5 resolves both checks before any user input is possible; `null`
+    // would mean the boot check never answered, and attempting the spawn
+    // is more useful than refusing on a guess.
+    const encoder_present = switch (output) {
+        .avif => model.avifenc_present orelse true,
+        .webp => model.cwebp_present orelse true,
+    };
+    if (!encoder_present) return setOutcome(model, output, .missing_encoder);
+
+    const extension = switch (output) {
+        .avif => ".avif",
+        .webp => ".webp",
+    };
+    const buffer: []u8 = switch (output) {
+        .avif => &model.avif_path_buffer,
+        .webp => &model.webp_path_buffer,
+    };
+    const destination = outputPath(buffer, model.path(), extension) orelse
+        return setOutcome(model, output, .encode_failed);
+    // A `.webp` source encoded to WebP would hand the encoder the same
+    // path to read and write. "Overwrite silently" is about a previous
+    // OUTPUT, never the user's source file.
+    if (std.mem.eql(u8, destination, model.path())) {
+        return setOutcome(model, output, .same_path);
+    }
+    switch (output) {
+        .avif => model.avif_path_len = destination.len,
+        .webp => model.webp_path_len = destination.len,
+    }
+
+    setOutcome(model, output, .pending);
+    fx.spawn(.{
+        .key = switch (output) {
+            .avif => avif_encode_key,
+            .webp => webp_encode_key,
+        },
+        .argv = switch (output) {
+            .avif => &.{ "avifenc", "-q", avif_quality, "--speed", avif_speed, model.path(), destination },
+            .webp => &.{ "cwebp", "-q", webp_quality, model.path(), "-o", destination },
+        },
+        // `.collect` rather than `.lines`: the encoders' progress output is
+        // of no use to the UI, and collect is the mode that also delivers
+        // `stderr_tail` on a nonzero exit.
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.encode_result),
+    });
+}
+
+/// One failed format's user-facing sentence. Written into `buffer` (caller
+/// owned) for the cases that must name the file; the rest are static.
+fn failureText(model: *const Model, output: Output, buffer: []u8) []const u8 {
+    const label = outputLabel(output);
+    return switch (outcomeOf(model, output)) {
+        // PLAN.md error state: encoder binary missing. Same wording as
+        // M5's launch-time check, scoped to the one format that needs it.
+        .missing_encoder => switch (output) {
+            .avif => "AVIF needs avifenc. Install with: brew install libavif",
+            .webp => "WebP needs cwebp. Install with: brew install webp",
+        },
+        .same_path => switch (output) {
+            .avif => "Skipped AVIF — the source is already an AVIF file.",
+            .webp => "Skipped WebP — the source is already a WebP file.",
+        },
+        // PLAN.md error state: write to output path failed. Names the
+        // source file, which is also where the output was headed.
+        .write_failed => std.fmt.bufPrint(
+            buffer,
+            "Couldn't save the {s} next to \"{s}\" — check the folder's permissions.",
+            .{ label, model.fileName() },
+        ) catch "Couldn't save the compressed file.",
+        // PLAN.md error state: encode failed. Deliberately short and
+        // non-technical; the encoder's stderr is not surfaced in v0.1.
+        else => std.fmt.bufPrint(buffer, "{s} encoding failed.", .{label}) catch "Encoding failed.",
+    };
+}
+
+/// The join. Fires once no requested format is still `.pending` — which is
+/// why it never reads `Model.format`: a user who changes the format chip
+/// mid-encode cannot change what this run was asked to produce.
+fn finishIfComplete(model: *Model) void {
+    if (model.avif_outcome == .pending or model.webp_outcome == .pending) return;
+
+    var avif_buffer: [256]u8 = undefined;
+    var webp_buffer: [256]u8 = undefined;
+    const avif_failed = model.avif_outcome.isFailure();
+    const webp_failed = model.webp_outcome.isFailure();
+
+    if (!model.hasAvifResult() and !model.hasWebpResult()) {
+        // Nothing landed. In single-format mode this is just "the encode
+        // failed"; in Both mode it is both sentences, and either way it is
+        // the one path that may set `.failed`.
+        if (avif_failed and webp_failed) return model.fail("{s} {s}", .{
+            failureText(model, .avif, &avif_buffer),
+            failureText(model, .webp, &webp_buffer),
+        });
+        if (avif_failed) return model.fail("{s}", .{failureText(model, .avif, &avif_buffer)});
+        if (webp_failed) return model.fail("{s}", .{failureText(model, .webp, &webp_buffer)});
+        return; // Nothing was requested at all — leave the status alone.
+    }
+
+    // At least one format landed: the run succeeded. Exactly one of the two
+    // can be a failure here (both failing is the branch above).
+    model.status = .done;
+    if (avif_failed) return model.warn("{s}", .{failureText(model, .avif, &avif_buffer)});
+    if (webp_failed) return model.warn("{s}", .{failureText(model, .webp, &webp_buffer)});
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .pick_file => {
@@ -367,6 +724,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             model.setPath(result.bytes);
+            // A new file invalidates the previous file's outputs — without
+            // this, the result lines would keep describing the old one.
+            model.clearResults();
             fx.hostRequest(.{
                 .key = stat_key,
                 .name = host_file_size,
@@ -483,6 +843,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.cancel(dimensions_key);
             fx.cancel(thumbnail_key);
             fx.cancel(preview_image_id);
+            fx.cancel(avif_encode_key);
+            fx.cancel(webp_encode_key);
+            fx.cancel(avif_stat_key);
+            fx.cancel(webp_stat_key);
             _ = fx.unregisterImage(preview_image_id);
             // Format is a user preference, not per-file state — it is
             // the one thing Reset deliberately keeps.
@@ -491,8 +855,78 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
 
         .set_format => |format| model.format = format,
-        .smoosh => {},
-        .encode_result => {},
+
+        .smoosh => {
+            // `hasPreview` is the real gate, not `status == .ready`: it is
+            // also true after a failed encode, so a retry works, and false
+            // after a failed LOAD, where there is nothing to encode.
+            if (!model.hasPreview()) return;
+            if (model.status == .compressing) return;
+
+            model.clearResults();
+            model.status = .compressing;
+            // Two independent encodes, not one operation with two steps.
+            if (model.format != .webp) beginEncode(model, fx, .avif);
+            if (model.format != .avif) beginEncode(model, fx, .webp);
+            // Every requested format may have short-circuited (both
+            // encoders missing), in which case the run is already over.
+            finishIfComplete(model);
+        },
+
+        .encode_result => |exit| {
+            // Same staleness hazard as the load chain: `.reset` cancels
+            // these spawns and the cancellation arrives as an ordinary
+            // nonzero terminal.
+            if (model.status != .compressing) return;
+            const output: Output = if (exit.key == avif_encode_key)
+                .avif
+            else if (exit.key == webp_encode_key)
+                .webp
+            else
+                return;
+            if (exit.reason != .exited or exit.code != 0) {
+                setOutcome(model, output, .encode_failed);
+                return finishIfComplete(model);
+            }
+            // A zero exit is not yet a result: the output's SIZE is half of
+            // what M7 has to show. `file.stat` (M3's own host command, kept
+            // separate for exactly this reuse — PLAN.md M3) answers it, and
+            // its failure is also how a file that never landed is caught.
+            fx.hostRequest(.{
+                .key = switch (output) {
+                    .avif => avif_stat_key,
+                    .webp => webp_stat_key,
+                },
+                .name = host_file_size,
+                .payload = outputPathOf(model, output),
+                .on_result = Effects.hostMsg(.encode_size_result),
+            });
+        },
+
+        .encode_size_result => |result| {
+            if (model.status != .compressing) return;
+            const output: Output = if (result.key == avif_stat_key)
+                .avif
+            else if (result.key == webp_stat_key)
+                .webp
+            else
+                return;
+            const size = if (result.ok)
+                std.fmt.parseInt(u64, result.bytes, 10) catch null
+            else
+                null;
+            if (size) |bytes| {
+                switch (output) {
+                    .avif => model.avif_size = bytes,
+                    .webp => model.webp_size = bytes,
+                }
+                setOutcome(model, output, .ok);
+            } else {
+                setOutcome(model, output, .write_failed);
+            }
+            finishIfComplete(model);
+        },
+
         .save_as => {},
         .save_as_dialog_result => {},
         .save_as_result => {},
