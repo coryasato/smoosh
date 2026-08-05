@@ -176,11 +176,10 @@ gpu_surface (the spike's own `ShellConfig` declares exactly that, metal/bgra8_un
 and the open dialog worked. No separate `dialog` permission was needed. (CLAUDE.md's "Key Native
 SDK capabilities" list claims `dialog` and `file_drops` capabilities — that appears to be wrong.)
 
-**Gotcha — the window config exists twice.** A hand-authored `main.zig` builds its own
-`native_sdk.ShellConfig` in Zig (window label/title/size, the view's gpu_* fields) and passes it as
-`App.create(.{ .scene = ... })`; that is what the runtime actually renders. `app.zon`'s
-`.shell.windows` still drives identity, `native check`, and packaging. Both must be edited together
-or they will silently disagree.
+**Gotcha — the window config exists in THREE places** (corrected in M1; it was written as two).
+`platform.AppInfo.main_window.default_frame` is the one that actually sizes the NSWindow and
+defaults to 720x480; the `ShellConfig` passed to `App.create` drives view layout; `app.zon`'s
+`.shell.windows` drives identity/`native check`/packaging. Full writeup in CLAUDE.md.
 
 ### Verification strategy
 Every milestone below ends with a check against the *running* app, not a compile check.
@@ -189,6 +188,37 @@ Every milestone below ends with a check against the *running* app, not a compile
 - Test fixtures (create once, in M2, under `test-images/`, gitignored): a small PNG, a large JPEG,
   a HEIC from an iPhone, a WebP, an already-tiny PNG (to see a *negative* savings case), a
   non-image file renamed `.jpg`, and one file over the size limit.
+
+### Testing strategy
+Two tiers, in this order. Reaching for the GUI to answer a question a unit test answers faster is
+the failure mode to avoid.
+
+**Tier 1 — `native test` (`src/tests.zig`, landed with M2).** Deterministic, no GUI, no processes,
+no network. This is where a milestone's logic gets proven. The seam is the same dispatch path the
+runtime uses: build the markup against the real `Model`, find a widget, ask the tree for the `Msg`,
+feed it to `update`.
+- Effects milestones drive `Effects` in fake-executor mode (`fx.executor = .fake`) — assert the
+  *request* the arm made, then feed the answer and drain:
+  - **M3**: `pendingHostAt(0)` names `dialog.openFile`; `feedHostResult(key, true, "/path/…")` then
+    a `.wake` drain must land the real path in `Model.path_buffer` and a nonzero `image_id`.
+  - **M4**: the oversized fixture's *dimensions/size* reach the limit branch — test the predicate
+    over numbers, not a real 51 MP decode.
+  - **M5**: `pendingSpawnAt(0)` argv is the presence check; `feedExit(key, 1)` produces the
+    `brew install` message with no `PATH` manipulation.
+  - **M7**: "Both" is the reason this tier exists — two spawns, results fed in *either* order, and
+    the partial-failure case (AVIF `feedExit(0)`, WebP `feedExit(1)`) is how the open decision below
+    actually gets made. Also pin the negative-savings arithmetic here; the tiny-PNG fixture is the
+    live confirmation, not the primary check.
+- What tier 1 does *not* cover: whether the host actually shows an `NSOpenPanel`, whether the
+  encoder binary really exists, whether anything renders. Those are tier 2 by definition.
+
+**Tier 2 — `native automate` against `native dev`.** Proves the real seam end to end.
+`native build` is ReleaseFast and has neither automation nor hot reload (M1's gate) — verification
+runs against `native dev`.
+
+**Fixtures are gitignored**, so tier-1 tests must never read `test-images/`. Anything image-shaped
+in a unit test uses in-repo bytes: `canvas.png.writeRgba8` to encode a raw RGBA fixture plus
+`harness.null_platform.image_decode = true` for the decode→register→draw path.
 
 ## Milestones — v0.1
 
@@ -207,6 +237,7 @@ disjoint from what came before, and carrying over stale detail hurts more than i
 |---|-----------|-------|---------|
 | M1 | Zig-core skeleton + app.zon cleanup | Opus | fresh |
 | M2 | Model/Msg + minimal markup shell | Sonnet | share M1 |
+| M2a | Test harness (`src/tests.zig`) | Opus | share M2 |
 | M3 | File acquisition + preview | Opus | fresh |
 | M4 | Input size limits | Sonnet | share M3 |
 | M5 | Encoder detection at launch | Sonnet | fresh |
@@ -219,26 +250,78 @@ disjoint from what came before, and carrying over stale detail hurts more than i
 
 ---
 
-**M1 — Zig-core skeleton + app.zon cleanup.** *(Opus, fresh session)*
-Delete `src/core.ts`, `package.json`, and `tsconfig.json` (all three are the abandoned TS-core
-editor surface; the build reads none of them). Add `src/main.zig`. Apply every item under
-"app.zon changes required" above.
-Adapt `docs/spikes/dialog-open-file-spike.zig` for app/Runtime bring-up (`MacPlatform.createWithOptions`
-+ `Runtime.initAt`, per CLAUDE.md's "File acquisition, honestly") — no dialog wiring yet, just an app
-that launches to an empty window. Also decide here how automation gets gated, since `build_options`
-is unreachable from a hand-authored root (CLAUDE.md note 2) — `builtin.mode == .Debug` is the default answer.
-*Opus because:* this is the one milestone with no reference pattern in-tree for the app.zon/manifest
-side, and a wrong runtime bring-up blocks everything downstream.
-*Verify:* `native build` succeeds, app launches to a blank window, `native check` passes.
+**M1 — Zig-core skeleton + app.zon cleanup.** *(Opus, fresh session)* — **DONE**
+Deleted `src/core.ts`, `package.json`, `tsconfig.json`, `bun.lock`, `node_modules/`. Added
+`src/main.zig` (platform + Runtime stood up by hand per the spike, no dialog wiring yet) and a
+placeholder `src/app.native`. Applied every "app.zon changes required" item.
+Settled here:
+- **Automation gate: `builtin.mode == .Debug`.** `dev` in `main.zig` gates both the automation
+  server (`native_sdk.automation.Server.init(init.io, ".zig-cache/native-sdk-automation", title)`)
+  and markup `watch_path`. So `native dev` gets hot reload + automation; `native build`
+  (ReleaseFast) gets neither. **Verification must run against `native dev`, not `native build`.**
+- **The window config lives in three places, not two** — see the corrected gotcha above.
+- `Model`/`Msg` are deliberate stubs (`Model = struct {}`, `Msg = union(enum) { noop }` with
+  `view_unbound`); M2 replaces both with the real sketches.
+*Verified:* `native build` clean, `native check` clean (typed, after `native test` built the model
+contract), `native test` passes, and the live app renders a 480x320 centered window with
+`gpu_nonblank=true` and zero dispatch errors under `native automate`.
 
-**M2 — Model/Msg + minimal markup shell.** *(Sonnet, share M1's session)*
-Add the real `Model` and `Msg` (per the sketches above) with a no-op `update`. Add a deliberately
-ugly `src/app.native` containing every control the later milestones need to click — "Choose Image…",
-the three format options, "Smoosh", "Save As…", and a status/error text line. No styling, no layout
-work; this exists so M3-M8 have something `native automate` can drive. Create the `test-images/`
-fixtures from "Verification strategy".
-*Shares M1's session because:* it is the same file, the same build loop, and directly consumes M1's decisions.
-*Verify:* builds clean, `native check` passes, `native automate` can see and click every control.
+**M2 — Model/Msg + minimal markup shell.** *(Sonnet, share M1's session)* — **DONE**
+Added the real `Model`/`Msg` to `src/main.zig` and a deliberately ugly `src/app.native` with every
+control M3-M8 need: "Choose Image…", an `avif`/`webp`/`both` chip row, "Smoosh", "Save As…", "Reset",
+and a `<status-bar>{statusLine}</status-bar>` line. `update` is a no-op switch (one empty arm per
+`Msg` tag) — each milestone fills in its own arm.
+Settled/found here:
+- **Path buffers are `[platform.max_dialog_path_bytes]u8` (4096), not the sketch's literal 1024.**
+  The spike's own dialog wiring sizes `path_buf` this way to hold whatever `showOpenDialog` returns,
+  and M3 transplants that pattern directly — matching it now avoids a resize when M3 lands.
+- **Effect payload types are real SDK types**, not placeholders: `dialog_result`/`save_as_dialog_result:
+  native_sdk.EffectHostResult`, `image_loaded`/`save_as_result: native_sdk.EffectFileResult`,
+  `encode_result`/`encoder_check_result: native_sdk.EffectExit`. Also corrected against the SDK: images
+  register *synchronously* via `fx.registerImageBytes` inside an `update` arm (no completion Msg of
+  their own) — so `image_loaded` is really the `fx.readFile` result Msg, and M3's arm calls
+  `registerImageBytes` on its bytes in the same handler.
+- **The chip pattern needs `pub const formats = [_]Format{...}` declared *inside* `Model`** (not
+  file-scope next to it) for `for each="formats"` to resolve — binding resolution only sees Model's
+  own decls.
+- **`native check` warns** on every model field/fn M2 doesn't bind yet (`path_len`, `original_size`,
+  `avif_size`, `status`, the `path`/`errorMessage` fns, ...) — expected and left alone rather than
+  papered over with `view_unbound`, since M3-M8 genuinely bind these soon; `view_unbound` is for
+  permanently update-only/Zig-view-only state, not "not wired yet."
+- **The two unwired chips (`webp`, `both`) go "uncontrolled" once clicked**: since `selected="{f ==
+  format}"` never evaluates true for them (format never leaves `.avif` under a no-op `update`), the
+  runtime retains their own pressed visual state per click instead of the model overriding it — the
+  documented behavior for a toggle whose source never asserts `true`. Confirmed live (all three chips
+  render selected after clicking each once); resolves itself the moment M6 wires `set_format` for real,
+  since `format` will then actually move and each chip's source will assert both true and false.
+- Created the `test-images/` fixtures (gitignored): `small.png`, `tiny.png` (already-tiny, negative-savings
+  case), `large.jpg` (~5.6 MB), `photo.heic` (via `sips`), `photo.webp` (via `cwebp`), `not-an-image.jpg`
+  (plain text renamed), `oversized.jpg` (8000x6400 = 51.2 MP, clears the 40-50 MP limit while staying
+  ~5.7 MB — exercises the megapixel branch distinct from the file-size branch). Confirmed `avifenc`,
+  `cwebp`, `dwebp`, `sips`, and `magick` are all already installed on the dev machine.
+*Verified:* `native build`/`test`/`check` all clean (check's warnings are the expected unbound-field
+kind above); live under `native dev`, the snapshot shows all 8 controls with correct roles/labels,
+clicking each of Choose Image…/avif/webp/both/Smoosh/Save As…/Reset delivered with zero dispatch
+errors, and a screenshot confirms the rendered layout.
+
+**M2a — test harness.** *(share M2's session)* — **DONE**
+Added `src/tests.zig` (+ `test { _ = @import("tests.zig"); }` in `main.zig`, the scaffold's
+convention) with the tier-1 seam every later milestone extends: `buildTree`/`findByText`/
+`expectByText`/`expectMsgTag` helpers, then 8 tests over what M1-M2 actually produced — markup
+builds against the real `Model` in all six `Status` values, all 8 controls are present, widget ids
+survive a rebuild, each button dispatches its claimed `Msg`, each chip coerces its loop variable
+into a typed `set_format` payload, `selected="{f == format}"` is model-driven for every `Format`,
+the path/error accessors slice correctly at 0 and at `max_dialog_path_bytes`, and `statusLine`
+returns a distinct non-empty line per status with `.failed` deferring to `errorMessage()`.
+Settled here:
+- **`update`'s arms are deliberately untested.** They are empty until M3-M8 fill them in; tests
+  asserting "nothing happened" would be deleted one per milestone. Msg-tag exhaustiveness is
+  already a compile error via `update`'s switch, so it needs no test either.
+- **The tests were mutation-checked, not just run green**: flipping `selected="{f == format}"` to
+  `selected="false"` and `set_format:{f}` to `set_format:{format}` each failed exactly one test.
+  Do this for any new assertion here — a markup test that cannot fail is worse than none.
+*Verified:* `native test` 10/10 pass; `native check` still clean with only the expected
+unbound-field warnings (no new ones).
 
 **M3 — File acquisition + preview.** *(Opus, fresh session)* [✓ "pick an image via Choose Image…", ✓ "preview with original size"]
 Wire `pick_file` -> `HostCallBinding` -> `showOpenDialog` (spike pattern), landing the real path into
@@ -316,7 +399,12 @@ acquisition. If the seam does not exist, record that finding in CLAUDE.md and cl
 the same shape as the spike work that produced the Zig-core decision.
 
 ## Open decisions
-- Partial failure in "Both" mode: report success-with-warning, or fail the whole operation? (decide in M7)
+- Partial failure in "Both" mode: report success-with-warning, or fail the whole operation? (decide
+  in M7 — write the fake-executor test for AVIF-ok/WebP-failed first; the decision is much easier
+  to make once the two orderings are in front of you)
 - Signed/notarized vs unsigned for v0.1 (decide in M10)
-- Whether `native check` is meaningful for a zig-core tree (its help text describes core validation
-  as "src/core.ts through the subset checker"; markup + app.zon validation should still apply — confirm in M1)
+- ~~Whether `native check` is meaningful for a zig-core tree~~ **Resolved in M1: yes.** It validates
+  markup + app.zon, and once `native test` has emitted `zig-out/model-contract.zon` it also
+  type-checks every binding path, message tag, and payload against the real `Model`/`Msg`. Without
+  that artifact it degrades to grammar-only with a loud note — so run `native test` before `check`
+  if you want the typed pass.

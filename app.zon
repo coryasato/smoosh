@@ -18,7 +18,7 @@
                 .restore_state = false,
                 .restore_policy = "center_on_primary",
                 .views = .{
-                    .{ .label = "main-canvas", .kind = "gpu_surface", .fill = true, .role = "Counter canvas", .accessibility_label = "Counter", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
+                    .{ .label = "main-canvas", .kind = "gpu_surface", .fill = true, .role = "Smoosh canvas", .accessibility_label = "Smoosh", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
                 },
             },
         },
@@ -29,6 +29,4 @@
             .external_links = .{ .action = "deny" },
         },
     },
-    .web_engine = "system",
-    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
 }

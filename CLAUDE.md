@@ -62,18 +62,30 @@ native automate screenshot <view-label>        # gpu_surface views only
 Widget clicks take a **numeric id from `snapshot`**, not a label — snapshot first.
 
 ### Repo layout
-- `src/main.zig` — the app (does not exist yet; created in M1).
+- `src/main.zig` — the app. Hand-authored root: builds its own platform + Runtime.
 - `src/app.native` — markup view.
-- `src/core.ts` — **stale TS-core scaffold, delete in M1.** The build hard-panics if both it and
-  `main.zig` exist.
+- `src/tests.zig` — unit tests, pulled in by a `test {}` block at the bottom of `main.zig` (the
+  scaffold's convention). Run with `native test`. See PLAN.md's "Testing strategy" for the two
+  tiers and what belongs in each.
 - `README.md` — rewritten for Smoosh; keep the Status section honest as milestones land.
-- `package.json` / `tsconfig.json` — dead TS-core editor surface, deleted in M1 with `core.ts`.
 - `docs/spikes/` — reference implementations, not built as part of the app.
 
-### Gotcha: window config exists twice
-A hand-authored `main.zig` builds its own `native_sdk.ShellConfig` in Zig and passes it to
-`App.create(.{ .scene = ... })` — that is what actually renders. `app.zon`'s `.shell.windows` still
-drives identity, `native check`, and packaging. Edit both together or they silently disagree.
+(`src/core.ts`, `package.json`, `tsconfig.json`, `bun.lock`, and `node_modules/` were the abandoned
+TS-core editor surface and were deleted in M1. There is no npm/bun surface in this tree at all.)
+
+### Gotcha: window config exists in THREE places
+For a hand-authored root, window geometry is stated three times and all three must move together
+(confirmed the hard way in M1 — see the block comment in `src/main.zig`):
+
+1. **`platform.AppInfo.main_window.default_frame`** — the host creates the real NSWindow from this,
+   *before* the scene loads, and it defaults to **720x480**. The size passed to
+   `MacPlatform.createWithOptions` only sizes the *surface*, not the window. Omit `main_window` and
+   you get a 720x480 window no matter what the scene or `app.zon` says — this was the actual M1
+   symptom. The CLI runner derives these `WindowOptions` from `app.zon` at comptime; a hand-authored
+   root has no such path, so it must state them in Zig.
+2. **`native_sdk.ShellConfig`** passed to `App.create(.{ .scene = ... })` — what the runtime lays
+   views out against (`ShellWindow` label/title/size, the view's `gpu_*` fields).
+3. **`app.zon`'s `.shell.windows`** — identity, `native check`, and packaging.
 
 ## Native SDK surfaces this app uses
 - Native dialogs (`runtime.showOpenDialog`/`showSaveDialog`, wired through a custom `HostCallBinding` — see "File acquisition, honestly")
@@ -98,6 +110,11 @@ drives identity, `native check`, and packaging. Edit both together or they silen
   about behavior.
 
 ## Current status
-Planning done, no app code written yet. **`PLAN.md` is the source of truth** for milestones,
+**M1-M2a done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
+an ugly-but-complete `src/app.native` every later milestone can drive via `native automate`;
+`test-images/` fixtures created. M2a: `src/tests.zig` — the tier-1 harness (markup builds, dispatch,
+chip payload coercion, model accessors) later milestones extend. `native build`/`check`/`test` all
+clean; M1 and M2 both verified live.
+**`PLAN.md` is the source of truth** for milestones,
 locked decisions, per-milestone model/session guidance, and open questions. Do not restate its
 contents here — link to it.
