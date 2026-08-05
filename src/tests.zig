@@ -288,7 +288,21 @@ const Harness = struct {
     app_state: *App,
     app: native_sdk.App,
 
+    /// Every non-M5 test's entry point: boots the app AND resolves the
+    /// M5 launch-time encoder check to "both present" — the happy path —
+    /// so `avifenc`/`cwebp` presence never shows up as a stray pending
+    /// spawn in a test that has nothing to do with M5.
     fn create() !Harness {
+        var h = try Harness.createBare();
+        try h.resolveEncoders(true, true);
+        return h;
+    }
+
+    /// Boots the app and stops right after install, before the M5 launch
+    /// check is resolved — `avifenc`'s and `cwebp`'s presence spawns are
+    /// still pending. Only M5's own tests call this directly; everything
+    /// else goes through `create`.
+    fn createBare() !Harness {
         main.thumbnail_path = test_thumbnail_path;
 
         const size = geometry.SizeF.init(main.window_width, main.window_height);
@@ -303,9 +317,15 @@ const Harness = struct {
             .scene = main.shell_scene,
             .canvas_label = main.canvas_label,
             .update_fx = main.update,
+            .init_fx = main.initFx,
             .markup = .{ .source = main.app_markup, .io = testing.io },
         });
         errdefer app_state.destroy();
+
+        // Fake BEFORE the installing frame: `init_fx`'s boot spawns (M5's
+        // encoder presence check) must be RECORDED, not actually executed
+        // — the same ordering `native_sdk`'s own init_fx test uses.
+        app_state.effects.executor = .fake;
 
         const app = app_state.app();
         try harness.start(app);
@@ -319,8 +339,19 @@ const Harness = struct {
         } });
         try testing.expect(app_state.installed);
 
-        app_state.effects.executor = .fake;
         return .{ .harness = harness, .app_state = app_state, .app = app };
+    }
+
+    /// Feeds M5's two boot-time presence spawns, in the order `init_fx`
+    /// issued them (`avifenc` then `cwebp`), and drains once.
+    fn resolveEncoders(self: *Harness, avifenc_present: bool, cwebp_present: bool) !void {
+        const avifenc_req = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+        try testing.expectEqualStrings("avifenc", avifenc_req.argv[avifenc_req.argv.len - 1]);
+        try self.fx().feedExit(avifenc_req.key, if (avifenc_present) 0 else 1);
+        const cwebp_req = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+        try testing.expectEqualStrings("cwebp", cwebp_req.argv[cwebp_req.argv.len - 1]);
+        try self.fx().feedExit(cwebp_req.key, if (cwebp_present) 0 else 1);
+        try self.drain();
     }
 
     fn destroy(self: *Harness) void {
@@ -752,6 +783,105 @@ test "a dimension query cancelled by reset is not reported as a broken image" {
     try testing.expectEqual(Status.idle, h.model().status);
     try testing.expectEqualStrings("", h.model().errorMessage());
     try testing.expect(!h.model().hasPreview());
+}
+
+// ================================================== M5: encoder detection
+//
+// `init_fx` fires both presence checks on the installing frame, before
+// `create` resolves them via `resolveEncoders` — these tests go through
+// `createBare` instead, so the two spawns are still there to inspect and
+// feed directly.
+
+test "the launch-time presence check runs which against both encoders" {
+    var h = try Harness.createBare();
+    defer h.destroy();
+
+    const avifenc_req = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+    try testing.expectEqualStrings("/usr/bin/which", avifenc_req.argv[0]);
+    try testing.expectEqualStrings("avifenc", avifenc_req.argv[1]);
+    try testing.expectEqual(@as(usize, 2), avifenc_req.argv.len);
+    try h.fx().feedExit(avifenc_req.key, 0);
+
+    const cwebp_req = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+    try testing.expectEqualStrings("/usr/bin/which", cwebp_req.argv[0]);
+    try testing.expectEqualStrings("cwebp", cwebp_req.argv[1]);
+    try h.fx().feedExit(cwebp_req.key, 0);
+    try h.drain();
+
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqualStrings("", h.model().errorMessage());
+}
+
+test "both encoders present at launch is not an error" {
+    var h = try Harness.createBare();
+    defer h.destroy();
+
+    try h.resolveEncoders(true, true);
+
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqualStrings("", h.model().errorMessage());
+}
+
+test "avifenc missing at launch fails, naming avifenc's brew install" {
+    var h = try Harness.createBare();
+    defer h.destroy();
+
+    try h.resolveEncoders(false, true);
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    const message = h.model().errorMessage();
+    try testing.expect(std.mem.indexOf(u8, message, "avifenc") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "brew install libavif") != null);
+    // Only the missing tool's install command belongs here — cwebp is fine.
+    try testing.expect(std.mem.indexOf(u8, message, "webp") == null);
+    try testing.expectEqualStrings(h.model().errorMessage(), h.model().statusLine());
+}
+
+test "cwebp missing at launch fails, naming cwebp's brew install" {
+    var h = try Harness.createBare();
+    defer h.destroy();
+
+    try h.resolveEncoders(true, false);
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    const message = h.model().errorMessage();
+    try testing.expect(std.mem.indexOf(u8, message, "cwebp") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "brew install webp") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "libavif") == null);
+}
+
+test "both encoders missing at launch names both brew installs" {
+    var h = try Harness.createBare();
+    defer h.destroy();
+
+    try h.resolveEncoders(false, false);
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    const message = h.model().errorMessage();
+    try testing.expect(std.mem.indexOf(u8, message, "avifenc") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "cwebp") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "brew install libavif webp") != null);
+}
+
+test "the missing-encoder failure is decided only once both checks land, in either order" {
+    var h = try Harness.createBare();
+    defer h.destroy();
+
+    // cwebp answers FIRST this time — the join must not fire (or fail
+    // early) on a single result, regardless of which check lands first.
+    const cwebp_req = h.fx().pendingSpawnAt(1) orelse return error.NoSpawn;
+    try testing.expectEqualStrings("cwebp", cwebp_req.argv[1]);
+    try h.fx().feedExit(cwebp_req.key, 0);
+    try h.drain();
+    try testing.expectEqual(Status.idle, h.model().status);
+
+    const avifenc_req = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+    try testing.expectEqualStrings("avifenc", avifenc_req.argv[1]);
+    try h.fx().feedExit(avifenc_req.key, 1);
+    try h.drain();
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "avifenc") != null);
 }
 
 // -------------------------------------------------------- M3: derived text

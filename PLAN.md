@@ -40,12 +40,18 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 - Quality defaults: AVIF ~q55–60, WebP ~q80 (tunable later).
 - No ImageMagick. No Sharp. No sidecars.
 
-*Encoder invocations (starting point — confirm flags against the installed versions during M5, libavif's quality flags changed across releases):*
+*Encoder invocations — pinned in M5, confirmed against the installed versions (libavif 1.4.2 /
+avifenc "Version: 1.4.2", libwebp 1.6.0 / `cwebp -version` "1.6.0") by running both by hand against
+`test-images/large.jpg` (4000x3000, 5.6 MB) and `test-images/tiny.png` (312 B, the negative-savings
+fixture). Both flag sets work as originally sketched — no changes needed:*
 ```
 avifenc -q 58 --speed 6 <input> <output.avif>
 cwebp  -q 80 <input> -o <output.webp>
 ```
-Pin the resolved argv here once verified so M7 has no open questions.
+`large.jpg` (5,846,465 B) -> AVIF 717,003 B, WebP 671,054 B, both exit 0. `tiny.png` (312 B) -> AVIF
+315 B, WebP 68 B — confirms the negative-savings case encodes cleanly rather than erroring (AVIF is
+*larger* than the tiny source; M7's savings-percent math needs to display that sanely, not treat it
+as a failure). M7 can use this argv as-is.
 
 **Phase B — Native (later)**
 - Move encoding into Zig.
@@ -419,6 +425,31 @@ fixture and **pin the confirmed argv back into "Encoder invocations" above** —
 *Fresh session because:* first `fx.spawn` use; nothing from M3/M4 transfers.
 *Verify:* run with a `PATH` that excludes the binary, confirm the correct `brew install` message
 renders; restore `PATH` and confirm no error state.
+*Implementation:* used `UiApp.Options.init_fx` — the SDK's boot-command hook, not a hand-rolled
+lifecycle Msg — since it "runs exactly once, on the installing frame, before the first view build,"
+which is exactly "checked at launch." `initFx` spawns `/usr/bin/which avifenc` and
+`/usr/bin/which cwebp` (`.collect` output, absolute `which` so the check itself needs no PATH, while
+`which`'s own job is searching that PATH — the same resolution a real encode spawn's argv[0] would
+get). Both land through the existing `encoder_check_result: EffectExit` Msg (already in the M2 sketch,
+disambiguated by `exit.key`); `Model` gained two `?bool` fields (`avifenc_present`, `cwebp_present`)
+that stay `null` until each answers, so the join fires only once both are known, in either order.
+Three distinct `fail()` messages (avifenc only / cwebp only / both) rather than one templated string,
+each naming its own `brew install` command — `libavif` for avifenc, `webp` (not `libwebp`) for cwebp,
+confirmed against `brew info`.
+*Test harness change:* `Harness.create()` now boots through a new `Harness.createBare()` +
+`resolveEncoders(true, true)` pair — `createBare` sets `effects.executor = .fake` **before**
+`harness.start`, matching the SDK's own `init_fx` test, so the boot spawns are recorded rather than
+actually executed; `resolveEncoders` then feeds both as present so M3/M4's tests see the same
+`pendingSpawnAt(0)` shape they always did. M5's own tests call `createBare` directly and drive the
+two presence spawns themselves (missing-avifenc, missing-cwebp, missing-both, present/present, and an
+order-independence check feeding cwebp before avifenc).
+*Verified:* `native test` 37/37 (six new tests). Live: `native dev` with the normal dev-machine PATH
+renders the ordinary idle status line ("Drop or choose an image to get started."); relaunched with
+`PATH` narrowed to exclude `/opt/homebrew/bin` (so `avifenc`/`cwebp` are unresolvable, while `native`,
+`node`, and `zig` stay reachable) and `native automate snapshot` showed the status-bar text update to
+"Smoosh needs avifenc and cwebp to compress images. Install with: brew install libavif webp" — the
+exact message the fake-executor test predicts. Restored PATH and reran; idle line returned. `native
+build`/`check` clean.
 
 **M6 — Format selection.** *(Sonnet, share M5's session)* [✓ "choose output: AVIF / WebP / Both"]
 Wire `set_format` from the three format controls to `Model.format`.

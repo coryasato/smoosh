@@ -107,6 +107,12 @@ pub const Model = struct {
     savings_percent: f32 = 0,
     // options
     format: Format = .avif,
+    // encoders — M5's launch-time `which avifenc`/`which cwebp` presence
+    // check. `null` until that hop answers; both land before any user
+    // input is possible, so `update`'s arms below never need to guard on
+    // this being unresolved.
+    avifenc_present: ?bool = null,
+    cwebp_present: ?bool = null,
     // ui
     status: Status = .idle,
     error_message_buffer: [256]u8 = undefined,
@@ -253,11 +259,19 @@ const stat_key: u64 = 2;
 const thumbnail_key: u64 = 3;
 const preview_image_id: u64 = 4;
 const dimensions_key: u64 = 5;
+const avifenc_check_key: u64 = 6;
+const cwebp_check_key: u64 = 7;
 
 /// Host-call names our own `HostBridge` answers (see `main`). Not SDK
 /// vocabulary — we bind the seam, so we name it.
 const host_open_file = "dialog.openFile";
 const host_file_size = "file.stat";
+
+/// Absolute so the check does not depend on the inherited PATH — but
+/// `which`'s OWN job is to search that PATH for `avifenc`/`cwebp`, which is
+/// exactly what a real encode spawn (M7) would do resolving argv[0] the
+/// same way, so the check is honest about what it is proving.
+const which_path = "/usr/bin/which";
 
 /// Where `sips` writes the downscaled preview, resolved once in `main`
 /// (see the "Preview is a thumbnail" note there). `pub var` so tests can
@@ -305,6 +319,33 @@ fn parseDimensions(output: []const u8) ?Dimensions {
     }
     if (width == null or height == null) return null;
     return .{ .width = width.?, .height = height.? };
+}
+
+// ------------------------------------------------------- M5: encoder check
+//
+// PLAN.md: "Detect presence of avifenc/cwebp at launch. If missing, show
+// which tool is absent and the exact brew install command." `init_fx` is
+// the SDK's boot-command hook — it runs exactly once, on the installing
+// frame, before the first view builds, so a launch that starts missing an
+// encoder shows the error on the very first paint rather than a flash of
+// the normal drop-zone.
+
+/// TEA's boot command (`UiApp.Options.init_fx`). Fires the two presence
+/// checks; `update`'s `.encoder_check_result` arm joins them.
+pub fn initFx(model: *Model, fx: *Effects) void {
+    _ = model;
+    fx.spawn(.{
+        .key = avifenc_check_key,
+        .argv = &.{ which_path, "avifenc" },
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.encoder_check_result),
+    });
+    fx.spawn(.{
+        .key = cwebp_check_key,
+        .argv = &.{ which_path, "cwebp" },
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.encoder_check_result),
+    });
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -455,7 +496,40 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .save_as => {},
         .save_as_dialog_result => {},
         .save_as_result => {},
-        .encoder_check_result => {},
+
+        .encoder_check_result => |exit| {
+            const found = exit.reason == .exited and exit.code == 0;
+            if (exit.key == avifenc_check_key) {
+                model.avifenc_present = found;
+            } else if (exit.key == cwebp_check_key) {
+                model.cwebp_present = found;
+            }
+            // Join: only decide once BOTH checks have answered, in
+            // whichever order they land.
+            const avifenc_present = model.avifenc_present orelse return;
+            const cwebp_present = model.cwebp_present orelse return;
+            if (avifenc_present and cwebp_present) return;
+            // PLAN.md error state: encoder binary missing. Three distinct
+            // messages (not one templated over a joined tool list) so each
+            // names the exact `brew install` command for what is actually
+            // missing.
+            if (!avifenc_present and !cwebp_present) {
+                return model.fail(
+                    "Smoosh needs avifenc and cwebp to compress images. Install with: brew install libavif webp",
+                    .{},
+                );
+            }
+            if (!avifenc_present) {
+                return model.fail(
+                    "Smoosh needs avifenc to create AVIF files. Install with: brew install libavif",
+                    .{},
+                );
+            }
+            return model.fail(
+                "Smoosh needs cwebp to create WebP files. Install with: brew install webp",
+                .{},
+            );
+        },
     }
 }
 
@@ -592,6 +666,7 @@ pub fn main(init: std.process.Init) !void {
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .update_fx = update,
+        .init_fx = initFx,
         .markup = .{
             .source = app_markup,
             .watch_path = if (dev) "src/app.native" else null,
