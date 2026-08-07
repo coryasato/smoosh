@@ -9,14 +9,16 @@ something local and instant.
 
 ## Status
 
-**Working, unpolished.** Smoosh launches, you pick an image,
-see a preview and its size, choose AVIF / WebP / Both, and press Smoosh — the
-compressed files land next to the original and the before/after size and savings
-percentage are shown per format. "Save As…" copies the produced file(s) to a
-location you choose, without touching the auto-saved originals.
+**Feature-complete, not yet packaged.** Smoosh launches to a drop zone, you pick
+an image, see a preview and its size, choose AVIF / WebP / Both, and press
+Smoosh — the compressed files land next to the original and the before/after size
+and savings percentage are shown per format. "Save As…" copies the produced
+file(s) to a location you choose, without touching the auto-saved originals.
 
-Not done yet: the window layout overflows at 480x320 and clips the button row,
-and there is no packaged `.app`.
+The drop zone is click-to-choose: file drops are not wired up yet, so nothing in
+the UI claims they are.
+
+Not done yet: there is no packaged `.app`.
 
 See [PLAN.md](PLAN.md) for milestones, locked decisions, and open questions.
 See [CLAUDE.md](CLAUDE.md) for working context and toolchain notes.

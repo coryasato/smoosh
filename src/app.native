@@ -1,7 +1,15 @@
-<!-- M2 scaffold: every control M3-M8 need to drive via `native automate`.
-     No styling/layout polish here on purpose — M9 replaces this wholesale
-     with the real "UI sketch" from PLAN.md once every message actually
-     works. Validate with: native check
+<!-- M9: the real view. Replaces M2's scaffold, which existed only so
+     M3-M8 had something to drive via `native automate`.
+
+     Two shapes, one column: with no file the middle is a pressable drop
+     zone that fills the window; with one it is a card — preview on the
+     left, the file's name/size and per-format results on the right. The
+     chrome around them (header, format chips, actions, status) never
+     moves, so the window never reflows out from under a press.
+
+     The copy says "click", not "drop": file drops are M11's open
+     question, not v0.1 behaviour, and a zone that promises a drop it
+     cannot accept is the one dishonest thing a drop zone can do.
 
      Every direct child of the root column carries a `key`. Without one,
      unkeyed same-kind siblings take POSITIONAL identity, so each `<if>`
@@ -10,38 +18,96 @@
      button took three different ids across idle -> ready -> done. Keys
      pin identity regardless of which conditionals are currently in the
      tree, which is what `native automate` scripts (and engine-owned
-     widget state) rely on. -->
+     widget state) rely on. Validate with: native check -->
 <column gap="12" padding="16">
   <row key="header" gap="8" cross="center">
-    <text grow="1">Smoosh</text>
+    <text grow="1" size="heading">Smoosh</text>
     <button size="sm" variant="ghost" on-press="reset">Reset</button>
   </row>
-  <button key="choose" on-press="pick_file">Choose Image…</button>
-  <!-- M3: the preview is a `sips`-generated thumbnail, not the source
-       image — registered images are capped at 512x512 decoded. Its real
-       dimensions ride the model so the aspect ratio stays honest. -->
-  <if test="{hasPreview}">
-    <image key="preview" image="{image_id}" width="{preview_width}" height="{preview_height}" label="Preview of the chosen image" />
+
+  <!-- The middle band. Both arms carry `grow="1"` so the window's spare
+       height lands here rather than stretching the control rows. -->
+  <if test="{hasFile}">
+    <row key="file" gap="12" cross="center" grow="1">
+      <!-- M3: the preview is a `sips`-generated thumbnail, not the source
+           image — registered images are capped at 512x512 decoded. Drawn
+           at `previewWidth`/`previewHeight`, which clamp the thumbnail to
+           the SOURCE's real dimensions: `sips -Z` upscales anything
+           smaller than 160px, and a 312-byte icon has no business
+           rendering as a blurry 160x160. -->
+      <if test="{hasPreview}">
+        <!-- A FIXED 168x168 frame (4px around the 160px thumbnail's longest
+             edge) with the image centred inside. The image keeps its honest
+             size, so an 8x8 icon draws 8x8 rather than a blurry 160x160 —
+             but the card's geometry no longer depends on it, which is what
+             stops a small source from rendering as a lost dot in an empty
+             row. -->
+        <panel key="preview-frame" width="168" height="168" background="surface_subtle" radius="md">
+          <column grow="1" main="center" cross="center">
+            <image image="{image_id}" width="{previewWidth}" height="{previewHeight}" label="Preview of the chosen image" />
+          </column>
+        </panel>
+      </if>
+      <column key="details" grow="1" gap="4">
+        <text key="name"><span weight="medium">{fileName}</span></text>
+        <text key="original" foreground="text_muted">Original {originalSize}</text>
+        <!-- M7: one line per format that actually landed. Per-format rather
+             than a summed "combined savings" — no client ever downloads both
+             files, so each line reports what would really be served. A format
+             that failed shows no line; the status bar names it. -->
+        <if test="{hasAvifResult}">
+          <text key="avif-result" foreground="success">{avifResult}</text>
+        </if>
+        <if test="{hasWebpResult}">
+          <text key="webp-result" foreground="success">{webpResult}</text>
+        </if>
+      </column>
+    </row>
   </if>
-  <text key="summary">{fileSummary}</text>
-  <!-- M7: one line per format that actually landed. Per-format rather than
-       a summed "combined savings" — no client ever downloads both files, so
-       each line reports what would really be served. A format that failed
-       shows no line; the status bar names it. -->
-  <if test="{hasAvifResult}">
-    <text key="avif-result">{avifResult}</text>
-  </if>
-  <if test="{hasWebpResult}">
-    <text key="webp-result">{webpResult}</text>
-  </if>
-  <toggle-group key="formats" gap="4" label="Format">
-    <for each="formats" as="f">
-      <toggle-button selected="{f == format}" on-toggle="set_format:{f}">{f}</toggle-button>
-    </for>
-  </toggle-group>
-  <row key="actions" gap="8">
-    <button variant="primary" on-press="smoosh">Smoosh</button>
-    <button on-press="save_as">Save As…</button>
+  <else>
+    <panel key="dropzone" grow="1" padding="16" background="surface_subtle" radius="lg"
+           on-press="pick_file" label="Choose an image to compress">
+      <column gap="6" grow="1" main="center" cross="center">
+        <icon name="folder-open" width="28" height="28" foreground="text_muted" />
+        <text text-alignment="center">Click to choose an image</text>
+        <text foreground="text_muted" text-alignment="center">JPEG, PNG, HEIC, WebP, TIFF or GIF, up to 100 MB</text>
+      </column>
+    </panel>
+  </else>
+
+  <row key="format" gap="8" cross="center">
+    <text foreground="text_muted">Format</text>
+    <toggle-group gap="4" label="Format">
+      <for each="formats" as="f">
+        <toggle-button size="sm" selected="{f.value == format}" on-toggle="set_format:{f.value}">{f.label}</toggle-button>
+      </for>
+    </toggle-group>
   </row>
-  <status-bar key="status">{statusLine}</status-bar>
+
+  <!-- One size register per row: all three buttons take the default
+       control height, so the row reads as one band. Smoosh and Save As
+       disable on exactly the guards `update`'s own arms enforce
+       (`canSmoosh`/`canSave`) — a press that would be a silent no-op is
+       better shown as unavailable. -->
+  <row key="actions" gap="8" cross="center">
+    <button icon="folder-open" on-press="pick_file">Choose Image…</button>
+    <spacer grow="1" />
+    <button on-press="save_as" disabled="{not canSave}">Save As…</button>
+    <button variant="primary" on-press="smoosh" disabled="{not canSmoosh}">Smoosh</button>
+  </row>
+
+  <row key="status" gap="8" cross="center">
+    <if test="{isBusy}">
+      <spinner key="busy" width="14" height="14" />
+    </if>
+    <!-- A failure and a success both land in the same line of text, so the
+         failure gets a mark of its own. Beside the bar rather than
+         recolouring it: two `<status-bar>`s behind an if/else would give
+         the status line two different widget ids, and automation scripts
+         address it as one. -->
+    <if test="{isFailed}">
+      <icon key="failed" name="alert" width="14" height="14" foreground="destructive" label="Failed" />
+    </if>
+    <status-bar grow="1">{statusLine}</status-bar>
+  </row>
 </column>

@@ -160,9 +160,19 @@ itself goes through a THIRD hand-bound host command, `file.copy` — not `fx.wri
 image. `native build`/`check`/`test` all clean (78/78 tests, `check` still at zero warnings); M8 verified
 live — a "Both" run's two save rounds produced copies **MD5-identical** to a fresh by-hand encoder run,
 and cancelling a single-format save left the status bar unchanged with `dispatch_errors=0`.
-**Known and deferred to M9:** the view overflows 480x320 (`zero_canvas_layout`), clipping the
-bottom button row — worse now that M7/M8 add up to three status-area rows (two results + the save note).
-Expected — M2's shell was never laid out for real content.
+M9: the real view replaces M2's scaffold — a header, one middle band that swaps between a pressable
+drop zone and a file card (preview left, name/size/results right), the format chips, the actions row
+and the status line; the chrome around the band never moves, so widget ids survive the swap. The
+window is now **540x400 with a declared minimum**, which closes M3's deferred `zero_canvas_layout`
+overflow. Three decisions worth carrying: **the drop zone says "click", not "drop"** (drops are M11's
+open question and do not work — the UI must not promise them); **error messages no longer name the
+file** (`<status-bar>` is one line that takes no `wrap` and elides at ~65 chars, and the file card
+names the file in every failable state — so the message only explains); and **the preview is clamped
+to the source's real dimensions inside a fixed 168x168 frame**, since `sips -Z` upscales small
+sources. `native build`/`check`/`test` all clean (85/85 tests, zero `check` warnings); every new
+assertion mutation-checked. Watch for the `success_text` trap: it is the on-success-fill foreground
+and renders nearly invisible as page text — `success` is the token for tinted text, and only a
+screenshot catches it (snapshots report names, not contrast).
 **`PLAN.md` is the source of truth** for milestones,
 locked decisions, per-milestone model/session guidance, and open questions. Do not restate its
 contents here — link to it.

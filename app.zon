@@ -13,8 +13,10 @@
             .{
                 .label = "main",
                 .title = "Smoosh",
-                .width = 480,
-                .height = 320,
+                .width = 540,
+                .height = 400,
+                .min_width = 420,
+                .min_height = 400,
                 .restore_state = false,
                 .restore_policy = "center_on_primary",
                 .views = .{

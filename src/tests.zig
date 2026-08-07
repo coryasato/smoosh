@@ -66,6 +66,21 @@ fn findByKind(widget: canvas.Widget, kind: canvas.WidgetKind) ?canvas.Widget {
     return null;
 }
 
+/// The drop zone has no text of its own — it is a `panel` whose bound
+/// `on-press` is the only thing making it a hit target. Find it by what it
+/// dispatches rather than by kind alone: the preview frame is a panel too.
+fn findPanelDispatching(tree: anytype, widget: canvas.Widget, expected: std.meta.Tag(Msg)) ?canvas.Widget {
+    if (widget.kind == .panel) {
+        if (tree.msgForPointer(widget.id, .up)) |msg| {
+            if (std.meta.activeTag(msg) == expected) return widget;
+        }
+    }
+    for (widget.children) |child| {
+        if (findPanelDispatching(tree, child, expected)) |found| return found;
+    }
+    return null;
+}
+
 /// A miss fails the test with the mismatch spelled out instead of a
 /// null-unwrap panic: the usual cause is app.native and this file drifting
 /// apart after an edit.
@@ -77,6 +92,31 @@ fn expectByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8
         );
         return error.WidgetNotFound;
     };
+}
+
+/// The M9 view splits on `hasFile`, so a test about the file card (or about
+/// a control that only enables once there is something to act on) has to
+/// give the model a path — the same thing `dialog_result` does live.
+fn setPath(model: *Model, path: []const u8) void {
+    @memcpy(model.path_buffer[0..path.len], path);
+    model.path_len = path.len;
+}
+
+/// A model as it stands right after a successful pick: file, preview, and
+/// `.ready`. What the empty model is to the drop zone, this is to the file
+/// card.
+fn readyModel() Model {
+    var model: Model = .{
+        .status = .ready,
+        .image_id = 4,
+        .preview_width = 160,
+        .preview_height = 120,
+        .source_width = 4000,
+        .source_height = 3000,
+        .original_size = 5_846_465,
+    };
+    setPath(&model, "/Users/someone/Pictures/photo.jpg");
+    return model;
 }
 
 fn expectMsgTag(expected: std.meta.Tag(Msg), actual: ?Msg) !void {
@@ -117,10 +157,119 @@ test "the view exposes every control M3-M8 drive" {
     _ = try expectByText(tree.root, .button, "Smoosh");
     _ = try expectByText(tree.root, .button, "Save As…");
     _ = try expectByText(tree.root, .button, "Reset");
-    // One chip per Format, labelled by the enum tag name.
-    for (Model.formats) |format| {
-        _ = try expectByText(tree.root, .toggle_button, @tagName(format));
+    // One chip per Format, labelled by `Format.label` — the item-method
+    // binding M9 introduced, so the chips read "AVIF"/"WebP"/"Both"
+    // instead of the lowercase Zig tag names.
+    for (Model.formats) |chip| {
+        _ = try expectByText(tree.root, .toggle_button, chip.label);
     }
+}
+
+test "the empty state offers a drop zone that picks a file" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // M9's headline: with no file the middle of the window is one big
+    // pressable target, not just a button in a row. It is a `panel` with a
+    // bound `on-press`, which is what makes it a hit target at all — an
+    // unbound panel would swallow the click into dead space.
+    var model: Model = .{};
+    const empty = try buildTree(arena, &model);
+    _ = try expectByText(empty.root, .text, "Click to choose an image");
+    // The copy itself is not pressable: the press falls through to the
+    // nearest pressable ancestor, which is the panel.
+    const zone = findPanelDispatching(empty, empty.root, .pick_file) orelse {
+        std.debug.print("no panel in the empty view dispatches pick_file\n", .{});
+        return error.WidgetNotFound;
+    };
+    try expectMsgTag(.pick_file, empty.msgForPointer(zone.id, .up));
+
+    // ...and it is gone the moment a file lands, replaced by the file card.
+    var ready = readyModel();
+    const card = try buildTree(arena, &ready);
+    try testing.expect(findByText(card.root, .text, "Click to choose an image") == null);
+    _ = try expectByText(card.root, .text, "photo.jpg");
+}
+
+test "Smoosh and Save As disable on exactly the guards update enforces" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Nothing picked: both actions are dead ends in `update` (`.smoosh`
+    // returns on `!hasPreview`, `.save_as` on an empty queue), so the view
+    // says so rather than accepting a press that does nothing.
+    var empty: Model = .{};
+    const idle = try buildTree(arena, &empty);
+    try testing.expect((try expectByText(idle.root, .button, "Smoosh")).state.disabled);
+    try testing.expect((try expectByText(idle.root, .button, "Save As…")).state.disabled);
+
+    // A picked file enables Smoosh — and only Smoosh: nothing has been
+    // encoded, so there is still nothing to save.
+    var ready = readyModel();
+    const with_file = try buildTree(arena, &ready);
+    try testing.expect(!(try expectByText(with_file.root, .button, "Smoosh")).state.disabled);
+    try testing.expect((try expectByText(with_file.root, .button, "Save As…")).state.disabled);
+
+    // Mid-encode, Smoosh goes quiet again (the arm's own re-press guard).
+    ready.status = .compressing;
+    const busy = try buildTree(arena, &ready);
+    try testing.expect((try expectByText(busy.root, .button, "Smoosh")).state.disabled);
+
+    // A landed output enables Save As.
+    ready.status = .done;
+    ready.avif_outcome = .ok;
+    ready.avif_size = 717_003;
+    const done = try buildTree(arena, &ready);
+    try testing.expect(!(try expectByText(done.root, .button, "Save As…")).state.disabled);
+    try testing.expect(!(try expectByText(done.root, .button, "Smoosh")).state.disabled);
+}
+
+test "the busy spinner tracks isBusy, not any single Status" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two statuses mean "wait", and they are reached by different chains
+    // (a pick vs. an encode) — the spinner is bound to the predicate that
+    // unions them, so neither can render a frozen-looking window.
+    for (std.enums.values(Status)) |status| {
+        var model: Model = .{ .status = status };
+        const tree = try buildTree(arena, &model);
+        const spinner = findByKind(tree.root, .spinner);
+        try testing.expectEqual(status == .loading or status == .compressing, spinner != null);
+    }
+}
+
+test "only a failed run marks the status line" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Every message — "Done.", a partial-success warning, and a hard
+    // failure — reaches the user as the same line of text, so the alert
+    // icon is the only thing separating the last from the first two.
+    var done = readyModel();
+    done.status = .done;
+    const ok = try buildTree(arena, &done);
+    try testing.expect(findByText(ok.root, .icon, "alert") == null);
+
+    // A partial-success run is NOT a failure: it warns on the status line
+    // and keeps its result lines, and marking it would say otherwise.
+    const warning = "AVIF landed; WebP failed.";
+    @memcpy(done.warning_message_buffer[0..warning.len], warning);
+    done.warning_message_len = warning.len;
+    const partial = try buildTree(arena, &done);
+    try testing.expect(findByText(partial.root, .icon, "alert") == null);
+
+    var failed = readyModel();
+    failed.status = .failed;
+    const bad = try buildTree(arena, &failed);
+    try testing.expect(findByText(bad.root, .icon, "alert") != null);
+    // And the card still names the file in the failed state — which is
+    // what lets the message itself stop quoting the filename (see `fail`).
+    _ = try expectByText(bad.root, .text, "photo.jpg");
 }
 
 test "widget ids are stable across a rebuild" {
@@ -159,17 +308,12 @@ test "widget ids survive the conditional rows appearing" {
     var empty: Model = .{};
     const before = try buildTree(arena, &empty);
 
-    var full: Model = .{
-        .status = .done,
-        .image_id = 4,
-        .preview_width = 160,
-        .preview_height = 120,
-        .original_size = 5_846_465,
-        .avif_size = 717_003,
-        .avif_outcome = .ok,
-        .webp_size = 671_054,
-        .webp_outcome = .ok,
-    };
+    var full = readyModel();
+    full.status = .done;
+    full.avif_size = 717_003;
+    full.avif_outcome = .ok;
+    full.webp_size = 671_054;
+    full.webp_outcome = .ok;
     const after = try buildTree(arena, &full);
     // Precondition: the two trees really do differ structurally, or this
     // test would pass without proving anything.
@@ -182,8 +326,8 @@ test "widget ids survive the conditional rows appearing" {
         try testing.expectEqual(empty_widget.id, full_widget.id);
     }
     for (Model.formats) |format| {
-        const empty_chip = try expectByText(before.root, .toggle_button, @tagName(format));
-        const full_chip = try expectByText(after.root, .toggle_button, @tagName(format));
+        const empty_chip = try expectByText(before.root, .toggle_button, format.label);
+        const full_chip = try expectByText(after.root, .toggle_button, format.label);
         try testing.expectEqual(empty_chip.id, full_chip.id);
     }
 }
@@ -195,7 +339,14 @@ test "every control dispatches the message it claims" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var model: Model = .{};
+    // A model with a file AND a landed output, because M9 disables Smoosh
+    // and Save As when there is nothing to act on — and `msgForPointer`
+    // yields null for a disabled control, so an empty model would prove
+    // nothing about their wiring.
+    var model = readyModel();
+    model.status = .done;
+    model.avif_outcome = .ok;
+    model.avif_size = 717_003;
     const tree = try buildTree(arena, &model);
 
     const choose = try expectByText(tree.root, .button, "Choose Image…");
@@ -222,16 +373,16 @@ test "each format chip coerces its own tag into the set_format payload" {
     // The one piece of real wiring M2 landed: `on-toggle="set_format:{f}"`
     // must carry the loop variable through as a typed Format payload, not
     // just fire a bare tag. M6 relies on this exact coercion.
-    for (Model.formats) |format| {
-        const chip = try expectByText(tree.root, .toggle_button, @tagName(format));
+    for (Model.formats) |chip_source| {
+        const chip = try expectByText(tree.root, .toggle_button, chip_source.label);
         const msg = tree.msgFor(chip.id, .toggle) orelse {
-            std.debug.print("chip \"{t}\" dispatched nothing on toggle\n", .{format});
+            std.debug.print("chip \"{s}\" dispatched nothing on toggle\n", .{chip_source.label});
             return error.NoMessageDispatched;
         };
         switch (msg) {
-            .set_format => |payload| try testing.expectEqual(format, payload),
+            .set_format => |payload| try testing.expectEqual(chip_source.value, payload),
             else => {
-                std.debug.print("chip \"{t}\" dispatched {t}, not set_format\n", .{ format, msg });
+                std.debug.print("chip \"{s}\" dispatched {t}, not set_format\n", .{ chip_source.label, msg });
                 return error.UnexpectedMessage;
             },
         }
@@ -246,12 +397,12 @@ test "the chip matching Model.format is the selected one" {
     // `selected="{f == format}"` is what makes the chip row model-driven
     // rather than uncontrolled. It reads correctly for every Format even
     // though `update` cannot move `format` yet (M6 wires that).
-    for (Model.formats) |selected_format| {
-        var model: Model = .{ .format = selected_format };
+    for (Model.formats) |selected| {
+        var model: Model = .{ .format = selected.value };
         const tree = try buildTree(arena, &model);
-        for (Model.formats) |format| {
-            const chip = try expectByText(tree.root, .toggle_button, @tagName(format));
-            try testing.expectEqual(format == selected_format, chip.state.selected);
+        for (Model.formats) |chip_source| {
+            const chip = try expectByText(tree.root, .toggle_button, chip_source.label);
+            try testing.expectEqual(chip_source.value == selected.value, chip.state.selected);
         }
     }
 }
@@ -663,7 +814,7 @@ test "cancelling a re-pick keeps the image already loaded" {
     try testing.expect(h.model().hasPreview());
 }
 
-test "an unreadable file fails, naming the file" {
+test "an unreadable file fails, and the card is what names it" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -673,7 +824,12 @@ test "an unreadable file fails, naming the file" {
     try h.drain();
 
     try testing.expectEqual(Status.failed, h.model().status);
-    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "locked.jpg") != null);
+    // M9 moved the filename out of the message and into the file card,
+    // which stands in every failed state — the status bar is one elided
+    // line and the quoted name crowded out the explanation. What the
+    // message still has to do is explain.
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "read") != null);
+    try testing.expectEqualStrings("locked.jpg", h.model().fileName());
     // PLAN.md's "Status → error mapping": `.failed` always surfaces the
     // error buffer through the status line, never a canned string.
     try testing.expectEqualStrings(h.model().errorMessage(), h.model().statusLine());
@@ -695,10 +851,39 @@ test "a non-image input fails with the supported-formats message" {
 
     try testing.expectEqual(Status.failed, h.model().status);
     const message = h.model().errorMessage();
-    try testing.expect(std.mem.indexOf(u8, message, "not-an-image.jpg") != null);
+    // The message does not name the file — the card above it does (M9:
+    // the status bar is one elided line, and the quoted name crowded out
+    // the part that says what to do).
     try testing.expect(std.mem.indexOf(u8, message, "JPEG") != null);
     // No preview may survive a failed decode.
     try testing.expect(!h.model().hasPreview());
+}
+
+test "a new pick drops the previous file's preview before it can load" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // The test above starts from an empty model, so it could never catch
+    // this: the preview is only stale on a SECOND pick. M9's file card is
+    // what made it visible — running live, picking not-an-image.jpg after
+    // tiny.png rendered tiny.png's thumbnail beside the new file's name.
+    try h.load("/Users/someone/Pictures/tiny.png", "312");
+    try testing.expect(h.model().hasPreview());
+
+    try h.pick("/Users/someone/Pictures/not-an-image.jpg");
+    // Gone at the PICK, not at the failure: the whole load chain (stat,
+    // dimensions, thumbnail) runs with the card already showing the new
+    // file's name, and any of those hops can fail or simply take time.
+    try testing.expect(!h.model().hasPreview());
+    try testing.expectEqual(@as(u32, 0), h.model().previewWidth());
+
+    const tree = try buildTree(arena, h.model());
+    _ = try expectByText(tree.root, .text, "not-an-image.jpg");
+    try testing.expect(findByKind(tree.root, .image) == null);
 }
 
 test "a preview that will not decode fails instead of silently showing nothing" {
@@ -712,7 +897,7 @@ test "a preview that will not decode fails instead of silently showing nothing" 
     try h.preview(.decode_failed, 0, 0);
 
     try testing.expectEqual(Status.failed, h.model().status);
-    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "photo.jpg") != null);
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "preview") != null);
     try testing.expect(!h.model().hasPreview());
 }
 
@@ -834,7 +1019,6 @@ test "a file over the byte limit fails before any dimension query" {
 
     try testing.expectEqual(Status.failed, h.model().status);
     const message = h.model().errorMessage();
-    try testing.expect(std.mem.indexOf(u8, message, "huge.jpg") != null);
     try testing.expect(std.mem.indexOf(u8, message, "132.0 MB") != null);
     try testing.expect(std.mem.indexOf(u8, message, "100 MB") != null);
     // The byte check must short-circuit before spawning anything else —
@@ -867,7 +1051,6 @@ test "a file under the byte limit but over the megapixel limit fails, naming the
 
     try testing.expectEqual(Status.failed, h.model().status);
     const message = h.model().errorMessage();
-    try testing.expect(std.mem.indexOf(u8, message, "oversized.jpg") != null);
     try testing.expect(std.mem.indexOf(u8, message, "51") != null);
     try testing.expect(std.mem.indexOf(u8, message, "50 MP") != null);
     // No thumbnail may be spawned for a file that already failed the limit.
@@ -1035,9 +1218,9 @@ test "set_format moves Model.format, one send per option" {
     defer h.destroy();
 
     try testing.expectEqual(Format.avif, h.model().format);
-    for (Model.formats) |format| {
-        try h.send(.{ .set_format = format });
-        try testing.expectEqual(format, h.model().format);
+    for (Model.formats) |chip| {
+        try h.send(.{ .set_format = chip.value });
+        try testing.expectEqual(chip.value, h.model().format);
     }
 }
 
@@ -1306,7 +1489,7 @@ test "an encoder that exits clean without leaving a file is a write failure" {
 
     try testing.expectEqual(Status.failed, h.model().status);
     const message = h.model().errorMessage();
-    try testing.expect(std.mem.indexOf(u8, message, "large.jpg") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "AVIF") != null);
     try testing.expect(std.mem.indexOf(u8, message, "permissions") != null);
     try testing.expect(!h.model().hasAvifResult());
 }
@@ -1888,19 +2071,63 @@ test "formatBytes scales across the units the UI shows" {
     try testing.expectEqualStrings("2.4 MB", main.formatBytes(arena, 2_516_582));
 }
 
-test "fileSummary is empty with no file and names the file with one" {
+test "originalSize is empty with no file and formats the size with one" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var model: Model = .{};
-    try testing.expectEqualStrings("", model.fileSummary(arena));
+    try testing.expectEqualStrings("", model.originalSize(arena));
 
-    const path = "/Users/someone/Pictures/photo.jpg";
-    @memcpy(model.path_buffer[0..path.len], path);
-    model.path_len = path.len;
+    setPath(&model, "/Users/someone/Pictures/photo.jpg");
     model.original_size = 2_516_582;
-    try testing.expectEqualStrings("photo.jpg (2.4 MB)", model.fileSummary(arena));
+    try testing.expectEqualStrings("2.4 MB", model.originalSize(arena));
+}
+
+test "the file card names the file and its original size" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The sketch's "Original: 2.4 MB", split from the name so the name can
+    // carry the visual weight. Both are derived per rebuild.
+    var model = readyModel();
+    const tree = try buildTree(arena, &model);
+    _ = try expectByText(tree.root, .text, "photo.jpg");
+    _ = try expectByText(tree.root, .text, "Original 5.6 MB");
+}
+
+test "the preview clamps to the source, so sips' upscaling never shows" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `sips -Z 160` UPSCALES anything smaller than 160px — `tiny.png` came
+    // back a 160x160 blur (PLAN.md M3's deferred note). The registered
+    // pixels are whatever sips produced; the drawn size is the source's.
+    var model = readyModel();
+    model.preview_width = 160;
+    model.preview_height = 160;
+    model.source_width = 12;
+    model.source_height = 12;
+    try testing.expectEqual(@as(u32, 12), model.previewWidth());
+    try testing.expectEqual(@as(u32, 12), model.previewHeight());
+    const tiny = try buildTree(arena, &model);
+    const drawn = findByKind(tiny.root, .image) orelse return error.WidgetNotFound;
+    try testing.expectEqual(@as(f32, 12), drawn.layout.max_size.width);
+
+    // A source larger than the thumbnail is left alone — the clamp is a
+    // floor on upscaling, not a resize.
+    model.source_width = 4000;
+    model.source_height = 3000;
+    try testing.expectEqual(@as(u32, 160), model.previewWidth());
+
+    // And an unparsed `sips -g` (dimensions still 0) falls back to the
+    // registered size rather than collapsing the preview to nothing.
+    model.source_width = 0;
+    model.source_height = 0;
+    try testing.expectEqual(@as(u32, 160), model.previewWidth());
+    try testing.expectEqual(@as(u32, 160), model.previewHeight());
 }
 
 test "the preview renders only once an image is registered" {
@@ -1908,13 +2135,12 @@ test "the preview renders only once an image is registered" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var model: Model = .{};
+    var model = readyModel();
+    model.image_id = 0;
     const empty = try buildTree(arena, &model);
     try testing.expect(findByKind(empty.root, .image) == null);
 
     model.image_id = 4;
-    model.preview_width = 160;
-    model.preview_height = 120;
     const loaded = try buildTree(arena, &model);
     const image = findByKind(loaded.root, .image) orelse return error.WidgetNotFound;
     // The leaf draws the model's ImageId — the id is model data, never a

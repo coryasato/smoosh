@@ -6,7 +6,8 @@
 A beautiful, instant native macOS app that lets you drop an image and get back high-quality modern web formats (AVIF and/or WebP) without leaving your desktop.
 
 ## Success criteria for v0.1 (MVP)
-- [x] App launches to a clean drop-zone UI *(functionally — M2's scaffold markup still stands; M9 replaces it with the real "UI sketch")*
+- [x] App launches to a clean drop-zone UI *(M9: the real view — a pressable drop zone that becomes a
+  file card. The zone says "click", not "drop": drops are M11's open question and do not work yet.)*
 - [x] User can pick an image via "Choose Image…" (native open dialog via `runtime.showOpenDialog`, wired through a custom `HostCallBinding` — pattern proven, see "File acquisition, honestly" in CLAUDE.md); drag-and-drop is stretch, not required for v0.1
 - [x] Image appears as preview with original size
 - [x] User can choose output: AVIF (default), WebP, or Both
@@ -359,13 +360,15 @@ Settled/found here:
   `HostBridge` answers them synchronously inside `hostRequest`, and cancelling a host request delivers
   no Msg at all. Both facts are pinned by tests (each guard was mutation-checked).
 - **Reset keeps `Model.format`** and clears everything else — format is a user preference, not per-file state.
-- Two Model fns beyond the sketch: `fileName()` (basename, what every error message names) and
-  `fileSummary(arena)` ("large.jpg (5.6 MB)"), plus `hasPreview()` gating the `<image>`. All derived,
+- Two Model fns beyond the sketch: `fileName()` (basename, what every error message named until M9
+  moved that job to the file card) and `fileSummary(arena)` ("large.jpg (5.6 MB)", replaced in M9 by
+  `originalSize`), plus `hasPreview()` gating the `<image>`. All derived,
   none stored. `preview_width`/`preview_height` are stored, from `EffectImageResult` — they are source
   data (the decode's real output), and binding them keeps the preview's aspect ratio honest.
-- **Known, deferred to M9:** the window logs `zero_canvas_layout` — the M2 shell plus M3's two new rows
-  overflow 480x320 by 77.5px, clipping the Smoosh/Save As row. Real, and exactly what M9's UI pass exists for.
-- Minor: `sips -Z` *upscales* sources smaller than 160px (`tiny.png` renders as a blurry 160x160). Harmless; M9 can clamp.
+- ~~**Known, deferred to M9:** the window logs `zero_canvas_layout`~~ **Fixed in M9** (540x400 with a
+  declared minimum; see that entry).
+- ~~Minor: `sips -Z` *upscales* sources smaller than 160px (`tiny.png` renders as a blurry 160x160).~~
+  **Clamped in M9** via `previewWidth`/`previewHeight` against the source dimensions.
 *Verified:* `native test` 25/25 (nine new fake-executor tests covering the full chain, both cancel paths,
 every error state, and reset), `native check` clean with only the expected unbound-field warnings, `native build`
 clean. Live under `native dev` against a real `NSOpenPanel` driven to a real fixture: `large.jpg` rendered a
@@ -588,16 +591,66 @@ fresh by-hand encoder run at the exact expected sizes; a single-format (AVIF-onl
 cancelled at the panel, left the status bar reading exactly "Done." with `dispatch_errors=0` — matching
 the fake-executor coverage exactly.
 
-**M9 — UI/UX pass.** *(Opus, fresh session)* [✓ "launches to a clean drop-zone UI", ✓ works at small window sizes]
-Replace M2's ugly shell with the real markup per the "UI sketch", against the now-complete set of
-working messages. Lean on Native SDK design tokens (Core Principle 3). Walk every state:
-empty -> loading -> ready -> compressing -> done / failed.
-*Opus because:* "Beautiful by default" is a stated core principle and taste-sensitive work is where
-the model difference actually shows. Downgrade to Sonnet if the markup layer turns out to be more
-mechanical than expected.
-*Fresh session because:* this is a design task; six milestones of encoder debugging is the wrong context.
-*Verify:* resize the window small, run the full flow via `native automate`, confirm no layout breakage
-and that every state renders.
+**M9 — UI/UX pass.** *(Opus, fresh session)* [✓ "launches to a clean drop-zone UI", ✓ works at small window sizes] — **DONE**
+Replaced M2's scaffold with the real view: a header, one middle band that swaps between a pressable
+drop zone (empty) and a file card — preview left, name/size/results right (with a file), the format
+chips, the actions row, and the status line. The chrome around the middle band never moves, so every
+control keeps its widget id across the swap (verified live: the ids in the empty-state and
+ready-state snapshots are identical).
+Decisions worth keeping:
+- **The drop zone says "click", not "drop".** PLAN's sketch reads "Drop image here"; file drops are
+  M11's open question and do not work in v0.1, so the zone (and `statusLine`'s idle text, changed to
+  "Choose an image to get started.") promises only what the app does. A drop zone that lies about
+  accepting drops is the one thing a drop zone must not do.
+- **The window grew to 540x400, with `min_width`/`min_height` declared** (420 / 400 — all three
+  places, per CLAUDE.md's three-declarations gotcha). 480x320 was M2's guess made before any content
+  existed; the ready state overflowed it, which is the `zero_canvas_layout` diagnostic M3 deferred
+  here. `min_height` equals the default on purpose: every row is fixed-height and the preview frame
+  is a fixed box, so vertical shrink buys nothing and costs the layout its only slack. The extra 60px
+  of WIDTH is for the status line (below).
+- **Error messages stopped naming the file.** `<status-bar>` is one honest line — it takes no `wrap`
+  (a validation error: "put wrap on the text leaf itself") and `size="sm"` does not shrink its text,
+  both confirmed by trying them — so it elides at roughly 65 characters. A quoted filename cost ~18
+  of those, and the live failed state read `"not-an-image.jpg" isn't an image Smoosh can read. Try
+  JPEG,…` — the truncated half being the half that says what to do. The file card now names the file
+  in every state that can fail, so the five load/write messages explain what happened and nothing
+  else ("Not an image Smoosh can read. Try JPEG, PNG, HEIC or WebP."). PLAN's "Status → error
+  mapping" invariant is untouched: `.failed` still always surfaces the error buffer through
+  `statusLine`. The alternative — a wrapping error inside the card — would have duplicated the same
+  string in two places in one small window.
+- **Smoosh and Save As disable on exactly the predicates `update`'s own arms enforce**
+  (`canSmoosh`/`canSave`, each a Model fn mirroring its arm's guards) — a press that would be a
+  silent no-op now says so. `isBusy` (loading OR compressing) drives a spinner beside the status
+  line, `isFailed` an alert icon: every message lands in the same line of text, so a failure needs a
+  mark. The icon rides BESIDE the bar rather than recolouring it — two `<status-bar>`s behind an
+  if/else would give the status line two different widget ids, and automation addresses it as one.
+- **The chip iterable became `[]FormatChip{ value, label }`**, so the chips read "AVIF"/"WebP"/"Both"
+  instead of the lowercase Zig tag names. A `pub fn label` on `Format` was tried first and rejected
+  by the checker — bindings resolve FIELDS on a loop item, and an enum has none ("binding does not
+  name a field on the loop item"). `{c.value}` still coerces into the `set_format` payload.
+- **`sips -Z`'s upscaling is clamped** (M3's deferred minor note): `previewWidth`/`previewHeight`
+  cap the thumbnail at the SOURCE's real dimensions, now kept from M4's `sips -g` hop. The preview
+  sits in a fixed 168x168 frame so an 8x8 icon draws 8x8 centred rather than a blurry 160x160 —
+  clamping alone made the card look broken, which is why the frame is fixed and the image is not.
+- **A bug the new card exposed:** a new pick never cleared the previous file's preview. It was
+  invisible under M2's scaffold and obvious the moment name and thumbnail sat side by side — live,
+  picking `not-an-image.jpg` after `tiny.png` drew tiny.png's thumbnail beside the new name. Fixed
+  with `clearPreview()` at the successful `dialog_result`, i.e. at the PICK, not at the failure: the
+  whole load chain runs with the card already naming the new file.
+*Verified:* `native test` 85/85 (11 new: the drop zone's pressable panel and its disappearance, the
+disabled matrix across idle/ready/compressing/done, the spinner tracking `isBusy` across every
+Status, the alert icon appearing for `.failed` but NOT for a partial-success `.done`, the preview
+clamp in all three directions — upscale, larger source, unparsed dimensions — the file card's
+name/size lines, and the stale-preview regression). Every new assertion was mutation-checked:
+dropping `disabled="{not canSmoosh}"`, defeating the clamp, swapping `isFailed` for `isBusy`, and
+removing `clearPreview()` each failed exactly the one test that should catch it. `native check`
+clean at zero warnings, `native build` clean. Live under `native dev`, with the open panel driven by
+hand (M7's standing rule): empty, ready, done (a "Both" run on `large.jpg` showing both result
+lines), the tiny-source clamp, and the failed state all render with `dispatch_errors=0` and no
+`zero_canvas_layout` in any state.
+*Note for M10:* the first pass coloured the result lines `success_text`, which is the on-success-fill
+foreground and rendered nearly invisible on the dark background — `success` is the token for tinted
+TEXT. Caught only by looking at a screenshot; the snapshot reports names, not contrast.
 
 **M10 — Packaging + v0.1 release.** *(Sonnet, fresh session)*
 `native package` the app, real icon in place of the scaffold's, confirm it launches from `/Applications`

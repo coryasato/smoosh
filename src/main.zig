@@ -38,8 +38,21 @@ const dev = builtin.mode == .Debug;
 
 pub const canvas_label = "main-canvas";
 const window_title = "Smoosh";
-pub const window_width: f32 = 480;
-pub const window_height: f32 = 320;
+// M9: 480x320 was M2's guess, made before any real content existed, and the
+// ready/done states overflowed it (the `zero_canvas_layout` diagnostic PLAN.md
+// deferred to this milestone). 480x400 is the honest floor for the tallest
+// state — header, a 160px preview card, the format row, the actions row and
+// the status line — and `min_*` below stops a resize from re-creating the
+// overflow. All three declarations of this geometry move together
+// (see the block comment above): these consts feed the `AppInfo` frame and
+// the `ShellWindow`, and `app.zon` states it a third time.
+pub const window_width: f32 = 540;
+pub const window_height: f32 = 400;
+pub const window_min_width: f32 = 420;
+// Equal to the default height on purpose: every row here is fixed-height and
+// the preview frame is a fixed box, so vertical shrink buys the user nothing
+// and costs the layout its only slack. The width still gives.
+pub const window_min_height: f32 = window_height;
 
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
@@ -67,6 +80,8 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
     .title = window_title,
     .width = window_width,
     .height = window_height,
+    .min_width = window_min_width,
+    .min_height = window_min_height,
     .restore_state = false,
     .views = &shell_views,
 }};
@@ -133,6 +148,15 @@ pub const Model = struct {
     image_id: u64 = 0,
     preview_width: u32 = 0,
     preview_height: u32 = 0,
+    /// The SOURCE's real pixel dimensions, from M4's `sips -g` hop (0 until
+    /// it answers, and 0 forever if its output did not parse — the same
+    /// tolerance the megapixel check already takes). M9 needs them because
+    /// `sips -Z 160` *upscales* a source smaller than 160px: `tiny.png`
+    /// (312 B) came back a blurry 160x160. The registered pixels are
+    /// whatever `sips` produced; the DRAWN size clamps to the source, so a
+    /// small image renders small and sharp instead of stretched.
+    source_width: u32 = 0,
+    source_height: u32 = 0,
     // result — per format, because the two encodes succeed or fail
     // independently (see `EncodeOutcome`). No `savings_percent` field:
     // the percentage is pure arithmetic over `original_size` and each
@@ -183,9 +207,23 @@ pub const Model = struct {
     save_message_buffer: [256]u8 = undefined,
     save_message_len: usize = 0,
 
-    /// The chip iterable for the format toggle-group (see "Chips" in the
+    /// One chip per format, for the toggle-group (see "Chips" in the
     /// native-ui skill) — must live inside Model for `for each` to see it.
-    pub const formats = [_]Format{ .avif, .webp, .both };
+    ///
+    /// A struct rather than a bare `[_]Format` so the chip can carry its
+    /// own label: the tag names are lowercase Zig identifiers ("avif",
+    /// "webp"), and the UI names FILE FORMATS, which spell themselves
+    /// "AVIF" and "WebP". A method on `Format` would have been tidier, but
+    /// bindings resolve fields on a loop ITEM and an enum has none — the
+    /// checker says so directly ("binding does not name a field on the
+    /// loop item"). `{c.value}` still coerces into the `set_format`
+    /// payload exactly as the bare tag did.
+    pub const FormatChip = struct { value: Format, label: []const u8 };
+    pub const formats = [_]FormatChip{
+        .{ .value = .avif, .label = "AVIF" },
+        .{ .value = .webp, .label = "WebP" },
+        .{ .value = .both, .label = "Both" },
+    };
 
     /// State `update` owns, which the markup reaches only through the
     /// derived fns below (`statusLine`, `fileSummary`, `avifResult`, ...).
@@ -198,6 +236,10 @@ pub const Model = struct {
         "path_buffer",
         "path_len",
         "original_size",
+        "preview_width",
+        "preview_height",
+        "source_width",
+        "source_height",
         "avif_path_buffer",
         "avif_path_len",
         "avif_size",
@@ -222,7 +264,6 @@ pub const Model = struct {
         "errorMessage",
         "warningMessage",
         "saveMessage",
-        "fileName",
     };
 
     pub fn path(model: *const Model) []const u8 {
@@ -253,14 +294,69 @@ pub const Model = struct {
         return model.image_id != 0;
     }
 
-    /// "photo.jpg (2.4 MB)" — derived per rebuild, never stored
-    /// (native-ui's "Derive, don't store"). Empty with no file picked.
-    pub fn fileSummary(model: *const Model, arena: std.mem.Allocator) []const u8 {
-        if (model.path_len == 0) return "";
-        return std.fmt.allocPrint(arena, "{s} ({s})", .{
-            model.fileName(),
-            formatBytes(arena, model.original_size),
-        }) catch "";
+    // ------------------------------------------------------- M9: view state
+    //
+    // The view swaps between two shapes — the empty drop zone and the
+    // file card — and disables the two actions that have nothing to act
+    // on. Every one of these is a PREDICATE, not a status comparison
+    // spelled in markup: the states the UI cares about ("is something
+    // running", "is there anything to save") are unions of `Status`
+    // values, and naming them here keeps that mapping in Zig where it is
+    // testable.
+
+    /// A file has been picked — true from the moment the dialog answers,
+    /// including while the preview is still loading and after a load that
+    /// failed. The drop zone is gone at that point either way: the status
+    /// bar is what explains what happened.
+    pub fn hasFile(model: *const Model) bool {
+        return model.path_len != 0;
+    }
+
+    /// An effect chain is running and the user should wait: the spinner
+    /// beside the status line, and the reason Smoosh/Save As go quiet.
+    pub fn isBusy(model: *const Model) bool {
+        return model.status == .loading or model.status == .compressing;
+    }
+
+    /// The status line carries every failure message, and a failure has to
+    /// look different from "Done." — this gates the alert icon beside it.
+    /// A `.done` run that lost one format is deliberately NOT included: it
+    /// succeeded, and its warning rides the same line (see `statusLine`).
+    pub fn isFailed(model: *const Model) bool {
+        return model.status == .failed;
+    }
+
+    /// Same gate `update`'s `.smoosh` arm enforces, so the button is
+    /// disabled exactly when pressing it would be a no-op.
+    pub fn canSmoosh(model: *const Model) bool {
+        return model.hasPreview() and model.status != .compressing;
+    }
+
+    /// Same gate the `.save_as` arm enforces: at least one landed output,
+    /// and no save round already in flight.
+    pub fn canSave(model: *const Model) bool {
+        return (model.hasAvifResult() or model.hasWebpResult()) and
+            model.save_queue_index >= model.save_queue_len;
+    }
+
+    /// "2.4 MB" — the picked file's size on its own line, the sketch's
+    /// "Original: 2.4 MB". Empty with no file.
+    pub fn originalSize(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (!model.hasFile()) return "";
+        return formatBytes(arena, model.original_size);
+    }
+
+    /// The preview's DRAWN size, clamped to the source's real dimensions
+    /// so `sips -Z`'s upscaling of a tiny source never renders as a blurry
+    /// 160x160 (PLAN.md M3's deferred note). Falls back to the registered
+    /// size when the source dimensions never parsed.
+    pub fn previewWidth(model: *const Model) u32 {
+        if (model.source_width == 0) return model.preview_width;
+        return @min(model.preview_width, model.source_width);
+    }
+    pub fn previewHeight(model: *const Model) u32 {
+        if (model.source_height == 0) return model.preview_height;
+        return @min(model.preview_height, model.source_height);
     }
 
     // ------------------------------------------------------ M7: results
@@ -312,6 +408,14 @@ pub const Model = struct {
     /// Every `.failed` transition goes through here, so PLAN.md's
     /// "Status → error mapping" holds by construction: `.failed` is
     /// never set without a message beside it.
+    ///
+    /// M9 note on wording: these messages do NOT name the file. The
+    /// `<status-bar>` is one honest line that elides what does not fit
+    /// (it takes no `wrap`, by design), and a quoted filename cost ~18 of
+    /// the ~65 characters that fit — enough to truncate the part that
+    /// says what to do about it. The file card directly above names the
+    /// file in every state that can fail, so the message explains what
+    /// happened and nothing else.
     fn fail(model: *Model, comptime fmt: []const u8, args: anytype) void {
         // A path long enough to overflow 256 bytes is a real input (the
         // path buffer is 4096), so the fallback has to be a message, not
@@ -335,6 +439,18 @@ pub const Model = struct {
             break :blk model.warning_message_buffer[0..fallback.len];
         };
         model.warning_message_len = written.len;
+    }
+
+    /// Drops the preview: the id the `<image>` draws and the dimensions
+    /// that size it. Separate from `clearResults` because they answer to
+    /// different events — outputs die when a RUN starts, the preview when
+    /// a new FILE does.
+    fn clearPreview(model: *Model) void {
+        model.image_id = 0;
+        model.preview_width = 0;
+        model.preview_height = 0;
+        model.source_width = 0;
+        model.source_height = 0;
     }
 
     /// Wipes the previous run's outputs. Called when a new run starts and
@@ -368,7 +484,9 @@ pub const Model = struct {
         // model.
         if (model.save_message_len > 0) return model.saveMessage();
         return switch (model.status) {
-            .idle => "Drop or choose an image to get started.",
+            // M9: "choose", not "drop". File drops are M11's open question,
+            // and the drop zone's own copy stopped promising them.
+            .idle => "Choose an image to get started.",
             .loading => "Loading…",
             .ready => "Ready to smoosh.",
             .compressing => "Smooshing…",
@@ -713,8 +831,8 @@ fn failureText(model: *const Model, output: Output, buffer: []u8) []const u8 {
         // source file, which is also where the output was headed.
         .write_failed => std.fmt.bufPrint(
             buffer,
-            "Couldn't save the {s} next to \"{s}\" — check the folder's permissions.",
-            .{ label, model.fileName() },
+            "Couldn't save the {s} — check the folder's permissions.",
+            .{label},
         ) catch "Couldn't save the compressed file.",
         // PLAN.md error state: encode failed. Deliberately short and
         // non-technical; the encoder's stderr is not surfaced in v0.1.
@@ -838,6 +956,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // A new file invalidates the previous file's outputs — without
             // this, the result lines would keep describing the old one.
             model.clearResults();
+            // ...and its PREVIEW, which the M2 scaffold left standing
+            // because nothing drew the two together. M9's file card does:
+            // picking a file that fails to load rendered the previous
+            // file's thumbnail beside the new file's name (seen live with
+            // tiny.png followed by not-an-image.jpg). The registry slot is
+            // reused by the next successful load, so dropping the id is
+            // the whole fix.
+            model.clearPreview();
             fx.hostRequest(.{
                 .key = stat_key,
                 .name = host_file_size,
@@ -853,13 +979,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 null;
             model.original_size = size orelse {
                 // PLAN.md error state: "write/read to path failed".
-                return model.fail("Can't read \"{s}\".", .{model.fileName()});
+                return model.fail("Can't read that file.", .{});
             };
             if (model.original_size > max_original_bytes) {
                 // PLAN.md error state: input exceeds the size/megapixel limit.
                 return model.fail(
-                    "\"{s}\" is {d:.1} MB — Smoosh handles files up to {d:.0} MB.",
-                    .{ model.fileName(), bytesToMb(model.original_size), bytesToMb(max_original_bytes) },
+                    "That file is {d:.1} MB — Smoosh handles files up to {d:.0} MB.",
+                    .{ bytesToMb(model.original_size), bytesToMb(max_original_bytes) },
                 );
             }
             // The megapixel check needs the SOURCE's real dimensions, and
@@ -884,13 +1010,17 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             over_limit: {
                 if (exit.reason != .exited or exit.code != 0) break :over_limit;
                 const dims = parseDimensions(exit.output) orelse break :over_limit;
+                // Kept for the preview's drawn size (see `previewWidth`),
+                // not just the limit check below.
+                model.source_width = dims.width;
+                model.source_height = dims.height;
                 const megapixels = @as(f64, @floatFromInt(dims.width)) *
                     @as(f64, @floatFromInt(dims.height)) / 1_000_000.0;
                 if (megapixels > max_source_megapixels) {
                     // PLAN.md error state: input exceeds the size/megapixel limit.
                     return model.fail(
-                        "\"{s}\" is {d:.0} megapixels — Smoosh handles images up to {d:.0} MP.",
-                        .{ model.fileName(), megapixels, max_source_megapixels },
+                        "That image is {d:.0} megapixels — the limit is {d:.0} MP.",
+                        .{ megapixels, max_source_megapixels },
                     );
                 }
             }
@@ -922,8 +1052,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (exit.reason != .exited or exit.code != 0) {
                 // PLAN.md error state: unsupported/undecodable input.
                 return model.fail(
-                    "\"{s}\" isn't an image Smoosh can read. Try JPEG, PNG, HEIC, WebP, TIFF, or GIF.",
-                    .{model.fileName()},
+                    "Not an image Smoosh can read. Try JPEG, PNG, HEIC or WebP.",
+                    .{},
                 );
             }
             fx.loadImage(.{
@@ -936,7 +1066,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .image_loaded => |result| {
             if (model.status != .loading) return;
             if (result.outcome != .loaded) {
-                return model.fail("Couldn't build a preview for \"{s}\".", .{model.fileName()});
+                return model.fail("Couldn't build a preview for that file.", .{});
             }
             model.image_id = result.id;
             model.preview_width = @intCast(result.width);
