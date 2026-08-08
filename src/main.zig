@@ -612,6 +612,42 @@ const which_path = "/usr/bin/which";
 /// point it somewhere harmless; `update` only ever reads it.
 pub var thumbnail_path: []const u8 = "";
 
+/// The environment every `fx.spawn` child inherits (bound once, at launch,
+/// into `Runtime.Options.environ`) — see `resolveSpawnEnviron` below for why
+/// this differs from the raw process environment on a packaged app.
+var spawn_environ: std.process.Environ = .empty;
+
+/// M10: launched from `/Applications`, `avifenc`/`cwebp` presence detection
+/// (M5) failed even with both installed via Homebrew. GUI-launched apps
+/// (Finder/Dock double-click — every packaged `.app`) inherit launchd's
+/// minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), not the interactive-shell
+/// PATH `brew shellenv` adds to `.zshrc`/`.zprofile` — that file only runs
+/// for a login/interactive shell, which `native dev`/`native build` (always
+/// launched from a Terminal) had until now. Every spawned child, `which`
+/// included, inherits this process's OWN environment (`Runtime.Options.environ`,
+/// threaded straight into each child — see effects.zig), so the fix is to
+/// widen THAT environment once at launch rather than touch the spawns
+/// themselves. Leaves PATH untouched if Homebrew's bin is already on it
+/// (the Terminal-launched case), so this changes nothing for `native dev`.
+pub fn resolveSpawnEnviron(gpa: std.mem.Allocator, base: std.process.Environ) !std.process.Environ {
+    const homebrew_paths = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin";
+
+    var map = try base.createMap(gpa);
+    defer map.deinit();
+
+    const current_path = map.get("PATH") orelse "";
+    if (std.mem.indexOf(u8, current_path, "/opt/homebrew/bin") != null) return base;
+
+    const augmented_path = if (current_path.len == 0)
+        homebrew_paths
+    else
+        try std.fmt.allocPrint(gpa, "{s}:{s}", .{ current_path, homebrew_paths });
+    defer if (current_path.len != 0) gpa.free(augmented_path);
+
+    try map.put("PATH", augmented_path);
+    return .{ .block = try map.createPosixBlock(gpa, .{}) };
+}
+
 /// Longest edge of the generated preview, in pixels. The registered-image
 /// budget is 1 MiB of DECODED RGBA (`max_registered_canvas_image_pixel_bytes`),
 /// i.e. 512x512 exactly — 160x160x4 = 100 KB leaves real headroom.
@@ -1441,6 +1477,8 @@ pub fn main(init: std.process.Init) !void {
     });
     defer app_state.destroy();
 
+    spawn_environ = try resolveSpawnEnviron(std.heap.page_allocator, init.minimal.environ);
+
     const runtime = try std.heap.page_allocator.create(native_sdk.Runtime);
     defer std.heap.page_allocator.destroy(runtime);
     defer runtime.deinit();
@@ -1455,10 +1493,10 @@ pub fn main(init: std.process.Init) !void {
             ".zig-cache/native-sdk-automation",
             window_title,
         ) else null,
-        .environ = init.minimal.environ,
+        .environ = spawn_environ,
     });
 
-    thumbnail_path = try resolveThumbnailPath(init.io, init.minimal.environ);
+    thumbnail_path = try resolveThumbnailPath(init.io, spawn_environ);
 
     var bridge = HostBridge{ .runtime = runtime, .app_state = app_state, .io = init.io };
     app_state.effects.bindHostCalls(.{

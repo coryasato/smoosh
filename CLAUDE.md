@@ -114,7 +114,7 @@ For a hand-authored root, window geometry is stated three times and all three mu
   about behavior.
 
 ## Current status
-**M1-M8 done.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
+**M1-M10 done — v0.1 ships.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
 an ugly-but-complete `src/app.native` every later milestone can drive via `native automate`;
 `test-images/` fixtures created. M2a: `src/tests.zig` — the tier-1 harness (markup builds, dispatch,
 chip payload coercion, model accessors) later milestones extend. M3: the real pick chain —
@@ -173,6 +173,17 @@ sources. `native build`/`check`/`test` all clean (85/85 tests, zero `check` warn
 assertion mutation-checked. Watch for the `success_text` trap: it is the on-success-fill foreground
 and renders nearly invisible as page text — `success` is the token for tinted text, and only a
 screenshot catches it (snapshots report names, not contrast).
+M10: `native package --target macos --signing adhoc` (ad-hoc — no paid Apple Developer identity exists
+on this machine, and it's a single-machine local tool; full rationale in PLAN.md). **A real bug only
+`/Applications` could surface**: `fx.spawn` children (M5's `which` check, M7's real encoders) inherit
+`Runtime.Options.environ`, which was wired to the raw process environment — fine from a Terminal
+(`native dev`/`native build`), but a Finder/Dock-launched packaged app gets launchd's minimal PATH with
+no `/opt/homebrew/bin`, so the "install avifenc/cwebp" error fired with both genuinely installed. Fixed
+once in `src/main.zig`'s `resolveSpawnEnviron`, which widens the bound environ's PATH before
+`Runtime.initAt` so every spawn downstream inherits the fix. **The app icon (`assets/icon.png`) is a
+placeholder**, built by hand-writing an SVG and rasterizing it with ImageMagick's MSVG delegate (the only
+renderer on this machine) — MSVG only reliably draws flat fills, not gradients or stroked lines, so it
+is visually rough. Full writeup, including exactly how to redo it properly, in PLAN.md's M10 entry.
 **`PLAN.md` is the source of truth** for milestones,
 locked decisions, per-milestone model/session guidance, and open questions. Do not restate its
 contents here — link to it.

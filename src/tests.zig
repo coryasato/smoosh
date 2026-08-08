@@ -465,6 +465,64 @@ test "statusLine names every Status, and .failed reports the error message" {
     try testing.expectEqualStrings(message, model.statusLine());
 }
 
+// ========================================================== M10: packaging
+//
+// M10 found this live: a packaged `.app` launched from `/Applications`
+// failed the M5 encoder check even with avifenc/cwebp installed, because
+// Finder/Dock-launched processes inherit launchd's minimal PATH, not the
+// interactive-shell PATH `brew shellenv` adds — the exact opposite of every
+// `native dev`/`native build` run, which is always launched from a Terminal.
+// `resolveSpawnEnviron` is pure enough to test directly: build a fake
+// `Environ` with a chosen PATH, no process or spawn involved.
+
+fn testEnviron(gpa: std.mem.Allocator, path: ?[]const u8) !std.process.Environ {
+    var map: std.process.Environ.Map = .init(gpa);
+    defer map.deinit();
+    if (path) |value| try map.put("PATH", value);
+    return .{ .block = try map.createPosixBlock(gpa, .{}) };
+}
+
+test "resolveSpawnEnviron appends Homebrew's bin dirs when PATH lacks them" {
+    const gpa = testing.allocator;
+    const base = try testEnviron(gpa, "/usr/bin:/bin");
+    defer base.block.deinit(gpa);
+
+    const resolved = try main.resolveSpawnEnviron(gpa, base);
+    defer resolved.block.deinit(gpa);
+
+    const path = std.process.Environ.getPosix(resolved, "PATH").?;
+    try testing.expect(std.mem.indexOf(u8, path, "/opt/homebrew/bin") != null);
+    try testing.expect(std.mem.indexOf(u8, path, "/usr/bin:/bin") != null);
+}
+
+test "resolveSpawnEnviron leaves PATH untouched when Homebrew's bin is already present" {
+    const gpa = testing.allocator;
+    const base = try testEnviron(gpa, "/opt/homebrew/bin:/usr/bin");
+    defer base.block.deinit(gpa);
+
+    const resolved = try main.resolveSpawnEnviron(gpa, base);
+
+    // No new block was built — `resolveSpawnEnviron` returned `base` itself,
+    // proven by pointer identity, not just equal content (a mutation that
+    // always reallocates would still pass a content-only check).
+    try testing.expectEqual(base.block.slice.ptr, resolved.block.slice.ptr);
+}
+
+test "resolveSpawnEnviron sets PATH from scratch when the base environ has none" {
+    const gpa = testing.allocator;
+    const base = try testEnviron(gpa, null);
+    defer base.block.deinit(gpa);
+
+    const resolved = try main.resolveSpawnEnviron(gpa, base);
+    defer resolved.block.deinit(gpa);
+
+    const path = std.process.Environ.getPosix(resolved, "PATH").?;
+    try testing.expectEqualStrings(
+        "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin",
+        path,
+    );
+}
+
 // ============================================================ M3: effects
 //
 // The dialog -> stat -> thumbnail -> preview chain, driven through the fake

@@ -9,7 +9,7 @@ something local and instant.
 
 ## Status
 
-**Feature-complete, not yet packaged.** Smoosh launches to a drop zone, you pick
+**v0.1 — feature-complete and packaged.** Smoosh launches to a drop zone, you pick
 an image, see a preview and its size, choose AVIF / WebP / Both, and press
 Smoosh — the compressed files land next to the original and the before/after size
 and savings percentage are shown per format. "Save As…" copies the produced
@@ -18,7 +18,10 @@ file(s) to a location you choose, without touching the auto-saved originals.
 The drop zone is click-to-choose: file drops are not wired up yet, so nothing in
 the UI claims they are.
 
-Not done yet: there is no packaged `.app`.
+Ships as a `.app` (`native package --target macos --signing adhoc`) — ad-hoc
+signed, not notarized (no Apple Developer account behind this build; fine for a
+single-machine local tool, see PLAN.md's M10 entry). The app icon is a rough
+placeholder pending a proper design pass, also noted there.
 
 See [PLAN.md](PLAN.md) for milestones, locked decisions, and open questions.
 See [CLAUDE.md](CLAUDE.md) for working context and toolchain notes.
@@ -59,6 +62,7 @@ native dev      # Debug build + run, with markup hot reload
 native build    # ReleaseFast binary into zig-out/bin/
 native check    # validate markup + app.zon
 native test     # test suite
+native package --target macos --signing adhoc   # zig-out/package/smoosh.app
 ```
 
 Driving the running app:
@@ -83,9 +87,8 @@ PLAN.md           milestones and decisions
 CLAUDE.md         working context for AI assistants
 ```
 
-`package.json` and `tsconfig.json` are leftovers from an abandoned TypeScript
-core and serve the editor only — the build never reads them. They come out in M1
-along with `src/core.ts`.
+`package.json`, `tsconfig.json`, and `src/core.ts` were an abandoned TypeScript
+core; deleted in M1, no npm/bun surface remains in this tree.
 
 ## Non-goals for v0.1
 

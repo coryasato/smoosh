@@ -16,7 +16,9 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 - [x] User can optionally re-save output to a different location via "Save As…"
 - [x] Works on macOS only
 - [x] Reasonable input size limits with clear feedback
-- [ ] Ships as a packaged `.app` that launches on a machine that never ran `native build`
+- [x] Ships as a packaged `.app` that launches on a machine that never ran `native build`
+  *(M10: `native package --target macos --signing adhoc`; installed to `/Applications` and confirmed
+  working, including a real bug found only by that install — see M10's entry.)*
 
 ## Non-goals (for now)
 - Linux or Windows support
@@ -652,12 +654,66 @@ lines), the tiny-source clamp, and the failed state all render with `dispatch_er
 foreground and rendered nearly invisible on the dark background — `success` is the token for tinted
 TEXT. Caught only by looking at a screenshot; the snapshot reports names, not contrast.
 
-**M10 — Packaging + v0.1 release.** *(Sonnet, fresh session)*
+**M10 — Packaging + v0.1 release.** *(Sonnet, fresh session)* — **DONE**
 `native package` the app, real icon in place of the scaffold's, confirm it launches from `/Applications`
 on a machine that never ran `native build`. Decide and record whether v0.1 ships signed/notarized or
 as an unsigned local build — this determines whether anyone but you can open it.
 *New milestone:* the old plan ended at feature-complete with no path to a runnable artifact.
+Settled/found here:
+- **Signed adhoc, not notarized, not unsigned.** `security find-identity -v -p codesigning` found zero
+  identities on this machine — no Apple Developer Program membership, so real Developer ID signing +
+  notarization is not available. Between the two options that ARE free, `--signing adhoc` over
+  `--signing none`: ad-hoc costs nothing, needs no account, and gives the bundle a valid local code
+  signature (`codesign -dv` confirms `flags=0x2(adhoc)`, verified). Its real limitation — it does
+  nothing for Gatekeeper's "unidentified developer" prompt on a QUARANTINED copy (AirDropped, emailed,
+  downloaded) — doesn't bite here: this app is for one person on one Mac, dragged locally into
+  `/Applications`, never quarantined. Revisit only if this ever needs sharing with someone else, which
+  would need a paid Developer ID + `notarytool`.
+- **A real bug, found only by actually launching from `/Applications`:** the packaged app opened to
+  M5's "install avifenc/cwebp" error — with both genuinely installed via Homebrew. Cause: every
+  `fx.spawn` child (M5's `which` check, M7's real encoder spawns) inherits `Runtime.Options.environ`,
+  which was wired straight to the RAW process environment. A GUI-launched process (Finder/Dock
+  double-click — what EVERY packaged `.app` is) inherits launchd's minimal PATH
+  (`/usr/bin:/bin:/usr/sbin:/sbin`); Homebrew's `/opt/homebrew/bin` only lands on PATH via
+  `brew shellenv` in `.zshrc`/`.zprofile`, which only an interactive/login shell sources — exactly what
+  `native dev`/`native build` always was, and a packaged app never is. M5's own comment ("Absolute so
+  the check does not depend on the inherited PATH") had already named the dependency without the
+  packaged case existing yet to expose it. Fixed once, at the source: `resolveSpawnEnviron` (`src/main.zig`)
+  widens the bound environ's PATH with Homebrew's four standard dirs before `Runtime.initAt`, so every
+  spawn downstream — presence check and real encodes alike — inherits the fix without touching either
+  call site. No-ops (returns the original `Environ` unchanged, provably by pointer identity, not just
+  content) when `/opt/homebrew/bin` is already on PATH, so `native dev` behavior is untouched — confirmed
+  by the three new tests, one of which is exactly that identity check.
+- **`native package` does not clean its output directory.** A stray `assets/icon.png.bak` (a backup
+  made while iterating on the icon) rode along into `Contents/Resources/assets/` on the first package
+  run and was still there on the SECOND, after the source file was deleted — `native package` only
+  overwrites files it knows about, it never removes ones that used to exist. `rm -rf zig-out/package`
+  before any packaging run that matters, not just the first.
+- **The icon is a placeholder, not a real design pass — flagged as ugly and kept anyway.** Built by
+  hand-writing an SVG (dark squircle background, a gray rounded-square "original" shrinking via a green
+  arrow into a smaller white rounded-square "result") and rasterizing it with
+  `magick icon.svg -background none icon.png` at 1024x1024 — the only rasterizer available on this
+  machine (`rsvg-convert`/`inkscape` are not installed). ImageMagick's built-in SVG delegate (MSVG) is
+  primitive: `<linearGradient>` fills silently rendered solid black, and `<line>`/`<path>` elements with
+  `stroke`/`stroke-width` did not render AT ALL (confirmed with an isolated test SVG) — the arrow had to
+  be built as two filled `<polygon>`s (a quadrilateral shaft + a triangle head) by hand-computing their
+  corners, because MSVG only reliably draws flat-filled shapes. Source SVG was scratchpad-only and does
+  not persist in the repo; **a future session redoing this should use a real vector tool (Inkscape,
+  Figma export, or an installed `rsvg-convert`) instead of fighting MSVG's fill-only subset**, and should
+  treat the current `assets/icon.png` purely as a placeholder to replace, not a baseline to iterate on.
 *Verify:* copy the packaged `.app` to a clean location, launch, run one full smoosh.
+*Verified:* `native test` 88/88 (3 new, covering `resolveSpawnEnviron`'s append/no-op/from-scratch
+cases; the no-op case is a pointer-identity check, and mutation-tested by disabling the early return —
+which broke exactly that one test, with a leak, confirming a fresh allocation had happened where the
+function should have returned its input untouched). `native check`/`native build` clean. Packaged with
+`native package --target macos --signing adhoc`; `codesign -dv` confirms a verified ad-hoc signature.
+Copied to `/tmp` (no quarantine attribute, confirmed via `xattr -l`) and separately installed to
+`/Applications/Smoosh.app` — both launched clean with zero `.zig-cache`/build tooling nearby, proving no
+hardcoded repo paths (confirmed by grepping `src/main.zig` for `assets/`/`test-images`/`zig-out` — none
+outside a comment). First `/Applications` launch reproduced the PATH bug live; after the
+`resolveSpawnEnviron` fix, rebuilt/repackaged/reinstalled and the same launch showed the normal idle
+status line. User then ran one full smoosh from the installed `/Applications` copy by hand (open dialog
+driven manually, per the standing dialog-automation rule) and confirmed it completed correctly.
 
 **M11 — Stretch: file-drop hook.** *(Opus, fresh session)*
 Only after M1-M10 are solid. Investigate whether `.native` markup exposes an app-facing `on-file-drop`
@@ -671,7 +727,10 @@ the same shape as the spike work that produced the Zig-core decision.
   **Resolved in M7: success-with-warning**, with an all-failed floor that stays `.failed`. The
   encoders write their own output files, so a failed whole-operation would contradict a good file
   already on disk. Full rationale in the M7 entry above.
-- Signed/notarized vs unsigned for v0.1 (decide in M10)
+- ~~Signed/notarized vs unsigned for v0.1~~ **Resolved in M10: ad-hoc signed, not notarized.** No paid
+  Apple Developer identity exists on this machine; ad-hoc is free and strictly better than unsigned for
+  a single-machine local tool. Notarization is a future concern only if this ever needs sharing with
+  someone else. Full rationale in the M10 entry above.
 - ~~Whether `native check` is meaningful for a zig-core tree~~ **Resolved in M1: yes.** It validates
   markup + app.zon, and once `native test` has emitted `zig-out/model-contract.zon` it also
   type-checks every binding path, message tag, and payload against the real `Model`/`Msg`. Without
