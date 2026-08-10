@@ -255,7 +255,7 @@ disjoint from what came before, and carrying over stale detail hurts more than i
 | M8 | Save As | Sonnet | share M7 |
 | M9 | UI/UX pass | Opus | fresh |
 | M10 | Packaging + v0.1 release | Sonnet | fresh |
-| M11 | Stretch: file-drop hook | Opus | fresh |
+| M11 | File drops (`on_drop`, new in SDK 0.8.2) | Sonnet | fresh |
 
 ---
 
@@ -715,12 +715,103 @@ outside a comment). First `/Applications` launch reproduced the PATH bug live; a
 status line. User then ran one full smoosh from the installed `/Applications` copy by hand (open dialog
 driven manually, per the standing dialog-automation rule) and confirmed it completed correctly.
 
-**M11 — Stretch: file-drop hook.** *(Opus, fresh session)*
-Only after M1-M10 are solid. Investigate whether `.native` markup exposes an app-facing `on-file-drop`
-seam (CLAUDE.md's "still open" note). Not required for v0.1 — the open dialog already satisfies file
-acquisition. If the seam does not exist, record that finding in CLAUDE.md and close the question.
-*Opus because:* it is an open-ended source-reading investigation against undocumented internals,
-the same shape as the spike work that produced the Zig-core decision.
+**M11 — File drops.** *(Sonnet, fresh session)* — **INVESTIGATED 2026-08-10, GREEN. Build it.**
+The open question CLAUDE.md left ("whether a drop-zone `on-file-drop` markup hook exists") has an
+answer, and it changed with the toolchain: **`@native-sdk/cli` was upgraded 0.8.0 -> 0.8.4, and 0.8.2
+added the app-facing seam.** Everything below is read out of the installed CLI's source
+(`~/.npm-global/lib/node_modules/@native-sdk/cli`), with the version claim verified by unpacking the
+0.8.0/0.8.1/0.8.2/0.8.3 tarballs. No code was written; this entry IS the spec.
+
+*The seam.* Not markup — a `UiApp.Options` field:
+```zig
+on_drop: ?*const fn (drop: platform.FileDropEvent) ?MsgT = null,   // src/runtime/ui_app.zig:635
+```
+Dispatched from `handleRuntimeEvent`'s `.files_dropped` arm (ui_app.zig:4025) against `drop.window_id`.
+`platform.FileDropEvent` (src/platform/types.zig:1608) is `{ window_id, view_label, point, paths:
+[]const []const u8 }`. `on_drop` occurrences in `ui_app.zig` by version: 0.8.0 → 0, 0.8.1 → 0,
+0.8.2 → 2, 0.8.3 → 2, 0.8.4 → 2. The platform already emitted `files_dropped` in 0.8.0 and `flow.zig`
+already routed it; what 0.8.2 added is the app-facing hook. **The TypeScript `dropMsg` the release
+notes advertise is literally this field** — the ts-core adapter wires `on_drop` from an exported
+`dropMsg` (skill-data/ts-core/SKILL.md:492). Zig sits one layer *below* the advertised feature, so
+this is a direct call, not a port of anything.
+
+*Four constraints that shape the UI, all verified in source:*
+1. **The drop is WINDOW-wide, not drop-zone-shaped.** On a real drag the macOS host builds the event
+   from `window_id` + paths only — no `view_label`, no `point` (src/platform/macos/root.zig:962).
+   Anywhere in the Smoosh window accepts. Fine for a one-window single-purpose app; the copy must not
+   promise a targeted zone.
+2. **The widget-level channel is a double dead end — do not chase it.** A `canvas_widget_file_drop`
+   event and a `routeCanvasWidgetFileDrop` router do exist, but (a) `UiApp.handleRuntimeEvent` has no
+   case for it and silently drops it into `else => {}` (its only mention in `ui_app.zig` is the
+   hover-drain switch at 3951), and (b) the router bails immediately when `view_label.len == 0` or
+   `point == null`, which per (1) is every physical drag. There is also no `on-file-drop` /
+   `accepts-drop` markup attribute at all (grepped `src/primitives/canvas/ui_markup.zig`).
+3. **A drag-over highlight is impossible.** The AppKit host's event enum has exactly one drag kind,
+   `NATIVE_SDK_APPKIT_EVENT_FILES_DROPPED` (appkit_host.h:24); `draggingEntered:` returns
+   `NSDragOperationCopy` unconditionally and emits nothing (appkit_host.m:1199). The zone stays
+   visually static — no hover state to design.
+4. **Nothing needs enabling.** The NSWindow registers `NSPasteboardTypeFileURL` unconditionally at
+   creation (appkit_host.m:7775 — the comment explains it: the main WebView is lazy now, so the window
+   took over the registration; a canvas-only app never creates that WebView and
+   `NativeSdkMetalSurfaceView` does not register, so the window delegate receives every drop). No
+   `RunOptions.bridge` gate, no permission, no runtime capability check anywhere on the path.
+
+*app.zon.* `"file_drops"` IS a real capability string (`app_manifest.CapabilityKind.file_drops`) — so is
+`"dialog"`. **CLAUDE.md's "no evidence either exists, do not add them speculatively" line is wrong and
+must be corrected when this lands.** Both carry a `void` payload and nothing in the runtime reads them,
+so adding `"file_drops"` to `.capabilities` is honest metadata, not a switch.
+
+*Wiring — one Options field, one Msg arm.* Add `.on_drop = onDrop` to the `App.create` options beside
+`.update_fx`/`.init_fx`. Recommended shape: `onDrop` returns the **existing** `.dialog_result` arm,
+synthesizing `native_sdk.EffectHostResult{ .key = dialog_key, .ok = true, .bytes = drop.paths[0] }`,
+so a drop re-enters M3/M4's already-validated chain (`setPath` → `clearResults`/`clearPreview` →
+`file.stat` → 100 MB check → `sips -g` → 50 MP check → thumbnail → `fx.loadImage` → `.ready`) with
+zero new pipeline. A dedicated `dropped_file: []const u8` arm that does the same work reads more
+honestly in a transcript — pick one in the session; either way it goes in `Msg.view_unbound`.
+Things the session must decide or handle:
+- `drop.paths` is **drain scratch**, borrowed for the callback and the dispatch. `Model.setPath`
+  already copies into a fixed buffer, which is the rule — do not stash the slice.
+- **`on_drop` has no model access** (it is `fn(event) ?Msg`, not `fn(*Model, event) ?Msg`). It cannot
+  ignore a drop that arrives mid-`.encoding`; that gating belongs in `update`'s arm.
+- Multi-file drop: `paths` may hold up to `max_drop_paths` entries. Take `paths[0]` and ignore the
+  rest for v0.1, or refuse a multi-drop loudly — a real decision, make it explicitly. Empty `paths` →
+  return `null`.
+- Folders and non-images arrive on the same channel and land in M4's existing `dimensions_result`
+  failure path (`sips -g` errors on them), so they fail correctly but with a generic message.
+
+*Testing.* `onDrop` is a pure function — tier-1 testable with no runtime at all (feed a synthetic
+`FileDropEvent`, assert the Msg; then push that Msg through the existing fake-executor `Harness` to
+prove the whole chain). **The live half cannot be automated, at all.** `native automate` has no bare
+drop verb; `widget-action <view> <id> drop-files <paths>` does exist
+(automation_commands.zig:374) but requires the target widget to declare
+`semantics.actions.drop_files`, which markup cannot express — and it drives the widget channel that
+constraint (2) says a real drag never reaches, so it would prove the wrong thing. **The user must drag
+a real file onto the window by hand.** Note this is a *different* constraint from the standing
+dialog rule (dialogs are dangerous to automate; drops are simply not automatable) — the practical
+instruction is the same: ask. Optional follow-up if a regression test is ever wanted: `native automate
+record --out session.journal` around one hand-drag captures `files_dropped` (journal tag 17) and
+`native automate replay` re-runs it headlessly.
+
+*UI copy M9 deliberately deferred.* With drops real, the zone can finally say so — suggested "Drop an
+image here — or click to choose", with `statusLine`'s idle text following. No new widgets, no id churn.
+
+*The 0.8.4 upgrade is otherwise a no-op for this app.* Verified before touching anything: `native test`
+**88/88 pass** and `native check` clean with **zero** warnings on 0.8.4. (The first `check` warned only
+that `zig-out/model-contract.zon` was stale from the 0.8.0 build; rerunning `native test` regenerated it
+and `check` went quiet — the M1 note about running `test` before `check` applies after every upgrade.)
+There is no pinned SDK version in the tree to bump: no `build.zig.zon` exists, so `native build` links
+whatever the globally installed CLI carries.
+
+*Before writing code, refresh the skills.* `~/.claude/skills/native-ui/SKILL.md` was installed
+2026-08-03 (0.8.0) and differs from 0.8.4's `skill-data/native-ui/SKILL.md`; `native skills get`
+re-emits them. Be aware that **even 0.8.4's `native-ui` and `zig` skills do not document `on_drop`** —
+only ts-core's does, and only as a one-line adapter aside — so this entry is the authoritative
+reference for the Zig signature.
+*Verify:* `native test` + `native check` clean; the user drags a real image onto the running window and
+it lands in the same `.ready` state a picked file does; then one full smoosh from a dropped file.
+*Sonnet because:* the open-ended source investigation that justified Opus is now DONE and written down
+above. What remains is a small, fully specified change against a pipeline this repo already owns —
+M8-shaped. Escalate to Opus only if the hand-drag misbehaves in a way this entry does not predict.
 
 ## Open decisions
 - ~~Partial failure in "Both" mode: report success-with-warning, or fail the whole operation?~~
