@@ -884,3 +884,31 @@ investigation predicted; no escalation was needed.
   type-checks every binding path, message tag, and payload against the real `Model`/`Msg`. Without
   that artifact it degrades to grammar-only with a loud note — so run `native test` before `check`
   if you want the typed pass.
+
+## Known limitations
+
+- **HEIC input cannot be encoded to AVIF or WebP.** `avifenc`/`cwebp` (Phase A's system tools) reject
+  `.heic`/`.heif` outright as an INPUT format — confirmed by running both directly against
+  `test-images/photo.heic`: `avifenc` says "Unrecognized file format for input file", `cwebp` says
+  "Cannot read input picture file". A HEIC picks, drops, and previews correctly (`sips` decodes it fine
+  for the thumbnail — see M3), and the file card names and sizes it correctly, so nothing looks wrong
+  until Smoosh is pressed, where it fails every time with "AVIF encoding failed." / "WebP encoding
+  failed.", regardless of whether the file arrived via the open dialog or a window drop (confirmed live
+  for both paths in M11's entry above).
+  - **This makes existing copy inaccurate, not just the encode itself.** PLAN's own "Accept common
+    raster formats" line names HEIC as accepted, the open-dialog's file filter offers `.heic`/`.heif`,
+    `test-images/photo.heic` exists specifically to exercise it (M2), and M9's failed-decode message
+    ("Try JPEG, PNG, HEIC or WebP.") implies HEIC round-trips end to end — none of that is true today
+    for the encode side, only for decode/preview.
+  - **Two directions for a follow-up session, not yet decided between:**
+    1. *Narrow the promise.* Drop HEIC from the accepted-formats copy, the open-dialog filter, and the
+       error message until it genuinely works — fail a picked/dropped HEIC earlier and honestly (at
+       pick time) instead of letting it ride the full chain into a confusing encode failure.
+    2. *Fix it in Phase A.* `sips` already decodes HEIC correctly — it is what builds the preview
+       thumbnail — so convert HEIC to PNG first (`sips -s format png <input> --out <tmp>.png`, the same
+       shape as M3's thumbnail spawn) and feed `avifenc`/`cwebp` that PNG instead of the original file,
+       one more `sips` hop ahead of each encode.
+    - Either way, this is exactly the kind of gap Phase B (native decode via Apple ImageIO/CoreGraphics
+      into Zig, see "Technical approach" above) makes moot outright — decoding to RGBA ourselves removes
+      the "can avifenc's own file reader open this container" question entirely. Worth keeping in mind so
+      a Phase A patch here isn't over-engineered against a problem Phase B deletes for free.

@@ -197,7 +197,9 @@ helper. `app.zon` gained the real `"file_drops"` capability. `native build`/`che
 (93/93 tests, zero warnings); live, a hand-dragged `photo.heic` landed in `.ready` correctly (drops
 cannot be automated at all, unlike dialogs — a different constraint, same "ask the user" answer), and a
 hand-dragged `large.jpg` smooshed end to end to the exact numbers M7's own check recorded. Full writeup
-in PLAN.md's M11 entry.
+in PLAN.md's M11 entry. **Known limitation found along the way, not yet fixed:** HEIC input cannot
+actually be encoded (`avifenc`/`cwebp` reject it as an input format outright, though `sips` decodes it
+fine for the preview) — see PLAN.md's new "Known limitations" section for the two candidate fixes.
 **`PLAN.md` is the source of truth** for milestones,
 locked decisions, per-milestone model/session guidance, and open questions. Do not restate its
 contents here — link to it.
