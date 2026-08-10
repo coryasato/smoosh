@@ -176,7 +176,7 @@ test "the empty state offers a drop zone that picks a file" {
     // unbound panel would swallow the click into dead space.
     var model: Model = .{};
     const empty = try buildTree(arena, &model);
-    _ = try expectByText(empty.root, .text, "Click to choose an image");
+    _ = try expectByText(empty.root, .text, "Drop an image here — or click to choose");
     // The copy itself is not pressable: the press falls through to the
     // nearest pressable ancestor, which is the panel.
     const zone = findPanelDispatching(empty, empty.root, .pick_file) orelse {
@@ -188,7 +188,7 @@ test "the empty state offers a drop zone that picks a file" {
     // ...and it is gone the moment a file lands, replaced by the file card.
     var ready = readyModel();
     const card = try buildTree(arena, &ready);
-    try testing.expect(findByText(card.root, .text, "Click to choose an image") == null);
+    try testing.expect(findByText(card.root, .text, "Drop an image here — or click to choose") == null);
     _ = try expectByText(card.root, .text, "photo.jpg");
 }
 
@@ -644,6 +644,14 @@ const Harness = struct {
         const request = self.fx().pendingHostAt(0) orelse return error.NoHostRequest;
         try testing.expectEqualStrings("dialog.openFile", request.name);
         try self.fx().feedHostResult(request.key, true, path);
+        try self.drain();
+    }
+
+    /// M11: `pick`'s counterpart for a real window drop — dispatches the
+    /// `.dropped_file` Msg `onDrop` would have produced directly (there is
+    /// no dialog round trip to answer), and starts the same load chain.
+    fn drop(self: *Harness, path: []const u8) !void {
+        try self.send(.{ .dropped_file = path });
         try self.drain();
     }
 
@@ -2210,4 +2218,78 @@ test "the preview renders only once an image is registered" {
     // The declared definite size is what the markup actually states.)
     try testing.expectEqual(@as(f32, 160), image.layout.max_size.width);
     try testing.expectEqual(@as(f32, 120), image.layout.max_size.height);
+}
+
+// -------------------------------------------------------------- M11: drops
+//
+// `onDrop` is pure (`fn(platform.FileDropEvent) ?Msg`, no `*Model`), so it
+// is tested directly with a synthetic event — no runtime, no Harness. What
+// it produces is then pushed through the Harness like any other Msg, to
+// prove the load chain does not care whether a path arrived via the open
+// panel or a real drag.
+
+test "onDrop turns a dropped path into a dropped_file Msg" {
+    const paths = [_][]const u8{"/Users/someone/Pictures/photo.jpg"};
+    const msg = main.onDrop(.{ .paths = &paths }) orelse return error.NoMsg;
+    switch (msg) {
+        .dropped_file => |path| try testing.expectEqualStrings("/Users/someone/Pictures/photo.jpg", path),
+        else => return error.WrongMsgTag,
+    }
+}
+
+test "onDrop takes the first of several dropped paths and ignores the rest" {
+    // Multi-file drop: `paths` may hold more than one entry. v0.1 takes
+    // the first and ignores the rest — the same single-select behaviour
+    // `showOpenDialog` already has (`allow_multiple` defaults false), so a
+    // drop and a pick behave alike.
+    const paths = [_][]const u8{ "/a/first.jpg", "/a/second.png" };
+    const msg = main.onDrop(.{ .paths = &paths }) orelse return error.NoMsg;
+    switch (msg) {
+        .dropped_file => |path| try testing.expectEqualStrings("/a/first.jpg", path),
+        else => return error.WrongMsgTag,
+    }
+}
+
+test "onDrop with no paths dispatches nothing" {
+    // A drag of something with no file (e.g. dragged text) still reaches
+    // this channel with an empty path list — `null` means no Msg, no
+    // dispatch, per `handleRuntimeEvent`'s `.files_dropped` arm.
+    try testing.expect(main.onDrop(.{ .paths = &.{} }) == null);
+}
+
+test "a real drop lands the real path, its size, and a preview" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const path = "/Users/someone/Pictures/dropped.png";
+    try h.drop(path);
+
+    // Same shape `pick`'s own first assertions check — a drop is
+    // indistinguishable from a pick past `onDrop`.
+    try testing.expectEqualStrings(path, h.model().path());
+    try testing.expectEqual(Status.loading, h.model().status);
+
+    try h.stat("1024");
+    try h.dimensions(800, 600);
+    try h.thumbnail(0);
+    try h.preview(.loaded, 160, 120);
+
+    try testing.expectEqual(Status.ready, h.model().status);
+    try testing.expect(h.model().hasPreview());
+}
+
+test "a drop clears the previous file's results and preview, like a pick does" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load("/Users/someone/Pictures/large.jpg", "5846465");
+    try h.send(.smoosh);
+    try h.encodeOk("avifenc", ".avif", "717003");
+    try testing.expect(h.model().hasAvifResult());
+    try testing.expect(h.model().hasPreview());
+
+    try h.drop("/Users/someone/Pictures/tiny.png");
+    try testing.expectEqualStrings("/Users/someone/Pictures/tiny.png", h.model().path());
+    try testing.expect(!h.model().hasAvifResult());
+    try testing.expect(!h.model().hasPreview());
 }

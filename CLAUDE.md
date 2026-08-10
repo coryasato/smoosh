@@ -25,7 +25,10 @@ Two non-obvious things the spike surfaced:
 1. `runner.runWithOptions`'s per-platform bring-up (`runMacos` and its helpers in the CLI's `app_runner/root.zig`) is all non-`pub` — a hand-authored `main.zig` can't call into it, only replicate the relevant parts with public APIs (`platform.macos.MacPlatform.createWithOptions` + `native_sdk.Runtime.initAt`). In practice this is fine: only the platform handle and the Runtime are actually needed; `runWithOptions` extras (trace-sink fanout, session recording, window-state persistence) can be skipped or added back deliberately later.
 2. The `build_options` module (the `-Dautomation` comptime flag) is wired into the CLI's internal `runner` module only, not into a hand-authored root module — a hand-rolled `main.zig` can't gate `RuntimeOptions.automation` on `build_options.automation` the way the scaffold does. Gate on something else instead (e.g. `builtin.mode == .Debug`) once automation matters for the real app; the spike always builds it since it's a throwaway.
 
-Still open, now that the seam is proven: whether a drop-zone `on-file-drop` markup hook exists as a documented app-facing seam (see "Stretch" in PLAN.md's File acquisition section) — the open-dialog path above is sufficient for v0.1 either way, so this isn't a blocker.
+**Resolved in M11:** the app-facing seam is not markup — it's `UiApp.Options.on_drop`, a
+`fn(platform.FileDropEvent) ?Msg` field beside `update_fx`/`init_fx` in `App.create`'s options, added
+in SDK 0.8.2 and dispatched from `handleRuntimeEvent`'s `.files_dropped` arm. Full spec and the wiring
+that landed from it are in PLAN.md's M11 entry.
 
 ## Core Principles for this project
 1. **Extremely simple UX** — drop zone is the entire product. Minimal chrome.
@@ -97,10 +100,14 @@ For a hand-authored root, window geometry is stated three times and all three mu
 - `fx.spawn` (for system tools in Phase A)
 - `fx.readFile` / `fx.writeFile`
 - Hot-reload on `.native` files (Debug builds, via `.markup.watch_path`)
-- Manifest: `capabilities = .{ "native_views", "gpu_surfaces" }` — markup renders onto a
-  gpu_surface, so `gpu_surfaces` stays. Permissions are just `command` + `view`; the dialog spike
-  needed nothing more. (An earlier draft of this file claimed `dialog` and `file_drops`
-  *capabilities* — no evidence either exists. Do not add them speculatively.)
+- `on_drop` (`UiApp.Options`, SDK 0.8.2+) for real window-wide file drops — see PLAN.md's M11 entry.
+- Manifest: `capabilities = .{ "native_views", "gpu_surfaces", "file_drops" }` — markup renders onto a
+  gpu_surface, so `gpu_surfaces` stays; `file_drops` was added in M11 once `on_drop` landed.
+  Permissions are just `command` + `view`; the dialog spike needed nothing more. (An earlier draft
+  of this file claimed *no evidence* `dialog`/`file_drops` capabilities exist — wrong. Both are real
+  `app_manifest.CapabilityKind` strings; M11 confirmed `file_drops` by reading the SDK source. Still
+  no `dialog` capability added here, since nothing in the runtime reads it and the open-dialog seam
+  keeps working without it — see PLAN.md M11 if that ever needs re-litigating.)
 
 ## Conventions
 - Zig core (`src/main.zig`) — no TypeScript in this tree.
@@ -114,7 +121,7 @@ For a hand-authored root, window geometry is stated three times and all three mu
   about behavior.
 
 ## Current status
-**M1-M10 done — v0.1 ships.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
+**M1-M11 done — v0.1 ships, with real file drops on top.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
 an ugly-but-complete `src/app.native` every later milestone can drive via `native automate`;
 `test-images/` fixtures created. M2a: `src/tests.zig` — the tier-1 harness (markup builds, dispatch,
 chip payload coercion, model accessors) later milestones extend. M3: the real pick chain —
@@ -184,6 +191,13 @@ once in `src/main.zig`'s `resolveSpawnEnviron`, which widens the bound environ's
 placeholder**, built by hand-writing an SVG and rasterizing it with ImageMagick's MSVG delegate (the only
 renderer on this machine) — MSVG only reliably draws flat fills, not gradients or stroked lines, so it
 is visually rough. Full writeup, including exactly how to redo it properly, in PLAN.md's M10 entry.
+M11: real file drops via `UiApp.Options.on_drop` (SDK 0.8.2+, added after the 0.8.0 -> 0.8.4 upgrade) —
+a dropped path re-enters the exact same load chain a picked one does through a shared `beginLoad`
+helper. `app.zon` gained the real `"file_drops"` capability. `native build`/`check`/`test` all clean
+(93/93 tests, zero warnings); live, a hand-dragged `photo.heic` landed in `.ready` correctly (drops
+cannot be automated at all, unlike dialogs — a different constraint, same "ask the user" answer), and a
+hand-dragged `large.jpg` smooshed end to end to the exact numbers M7's own check recorded. Full writeup
+in PLAN.md's M11 entry.
 **`PLAN.md` is the source of truth** for milestones,
 locked decisions, per-milestone model/session guidance, and open questions. Do not restate its
 contents here — link to it.

@@ -484,9 +484,9 @@ pub const Model = struct {
         // model.
         if (model.save_message_len > 0) return model.saveMessage();
         return switch (model.status) {
-            // M9: "choose", not "drop". File drops are M11's open question,
-            // and the drop zone's own copy stopped promising them.
-            .idle => "Choose an image to get started.",
+            // M11: "drop" is back — `on_drop` makes it real again, after
+            // M9 dropped the word because drops didn't work yet.
+            .idle => "Drop or choose an image to get started.",
             .loading => "Loading…",
             .ready => "Ready to smoosh.",
             .compressing => "Smooshing…",
@@ -502,6 +502,7 @@ pub const Model = struct {
 pub const Msg = union(enum) {
     pick_file, // "Choose Image…" clicked
     dialog_result: native_sdk.EffectHostResult, // host open-dialog callback
+    dropped_file: []const u8, // on_drop callback — a file dragged onto the window (M11)
     stat_result: native_sdk.EffectHostResult, // host file-size callback -> original_size
     dimensions_result: native_sdk.EffectExit, // `sips -g` source pixel dimensions -> megapixel limit check
     thumbnail_result: native_sdk.EffectExit, // `sips` downscale for the preview
@@ -526,6 +527,7 @@ pub const Msg = union(enum) {
     // same idiom the spike uses for its `dialog_result` Msg.
     pub const view_unbound = .{
         "dialog_result",
+        "dropped_file",
         "stat_result",
         "dimensions_result",
         "thumbnail_result",
@@ -970,6 +972,52 @@ fn advanceSaveQueue(model: *Model, fx: *Effects) void {
     if (model.save_queue_index < model.save_queue_len) beginSaveRound(model, fx);
 }
 
+// ------------------------------------------------------------ M11: drops
+//
+// `UiApp.Options.on_drop` (SDK 0.8.2+, `src/runtime/ui_app.zig:635`),
+// dispatched from `handleRuntimeEvent`'s `.files_dropped` arm against
+// `platform.FileDropEvent{ window_id, view_label, point, paths }`. A real
+// drag never carries `view_label`/`point` (the macOS host builds the event
+// from window + paths alone), so this is a WINDOW-wide drop, not a
+// drop-zone-shaped one — anywhere in the Smoosh window accepts.
+
+/// `on_drop`'s callback. Pure: `fn(event) ?Msg`, no `*Model` — it can turn
+/// a drop into a Msg or refuse it, but it cannot gate on run state (e.g.
+/// ignore a drop mid-`.compressing`); that gating, if ever wanted, belongs
+/// in `update`'s arm, not here.
+///
+/// `drop.paths` is drain scratch, valid only for this call and the
+/// dispatch that follows — never stashed. Takes the first path and ignores
+/// the rest: the same single-select behaviour `showOpenDialog` already has
+/// (`allow_multiple` defaults false), so a drop and a pick behave alike.
+/// Empty `paths` (e.g. a drag of something with no file) returns null, so
+/// `handleRuntimeEvent` dispatches nothing.
+pub fn onDrop(drop: platform.FileDropEvent) ?Msg {
+    if (drop.paths.len == 0) return null;
+    return .{ .dropped_file = drop.paths[0] };
+}
+
+/// Starts the load chain for a path that just arrived — from the open
+/// panel (`.dialog_result`'s ok branch) or a real window drop
+/// (`.dropped_file`, M11). Both land here because the chain itself doesn't
+/// care where the path came from: `stat_result` -> `dimensions_result` ->
+/// `thumbnail_result` -> `image_loaded` -> `.ready` is the same either way.
+fn beginLoad(model: *Model, fx: *Effects, path: []const u8) void {
+    model.status = .loading;
+    model.setPath(path);
+    // A new file invalidates the previous file's outputs and preview —
+    // see `clearResults`/`clearPreview`'s own doc comments for why each
+    // exists (M7/M9 respectively).
+    model.clearResults();
+    model.clearPreview();
+    fx.hostRequest(.{
+        .key = stat_key,
+        .name = host_file_size,
+        .payload = model.path(),
+        .on_result = Effects.hostMsg(.stat_result),
+    });
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .pick_file => {
@@ -988,25 +1036,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.status = if (model.hasPreview()) .ready else .idle;
                 return;
             }
-            model.setPath(result.bytes);
-            // A new file invalidates the previous file's outputs — without
-            // this, the result lines would keep describing the old one.
-            model.clearResults();
-            // ...and its PREVIEW, which the M2 scaffold left standing
-            // because nothing drew the two together. M9's file card does:
-            // picking a file that fails to load rendered the previous
-            // file's thumbnail beside the new file's name (seen live with
-            // tiny.png followed by not-an-image.jpg). The registry slot is
-            // reused by the next successful load, so dropping the id is
-            // the whole fix.
-            model.clearPreview();
-            fx.hostRequest(.{
-                .key = stat_key,
-                .name = host_file_size,
-                .payload = model.path(),
-                .on_result = Effects.hostMsg(.stat_result),
-            });
+            beginLoad(model, fx, result.bytes);
         },
+
+        // M11: a real drag onto the window. `onDrop` (pure, no model
+        // access) already reduced the drop to one path; from here it is
+        // the exact same chain a dialog pick starts — a picked-file and a
+        // dropped-file are indistinguishable to `update` past this point.
+        .dropped_file => |dropped_path| beginLoad(model, fx, dropped_path),
 
         .stat_result => |result| {
             const size = if (result.ok)
@@ -1469,6 +1506,7 @@ pub fn main(init: std.process.Init) !void {
         .canvas_label = canvas_label,
         .update_fx = update,
         .init_fx = initFx,
+        .on_drop = onDrop,
         .markup = .{
             .source = app_markup,
             .watch_path = if (dev) "src/app.native" else null,

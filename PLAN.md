@@ -7,8 +7,8 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 
 ## Success criteria for v0.1 (MVP)
 - [x] App launches to a clean drop-zone UI *(M9: the real view — a pressable drop zone that becomes a
-  file card. The zone says "click", not "drop": drops are M11's open question and do not work yet.)*
-- [x] User can pick an image via "Choose Image…" (native open dialog via `runtime.showOpenDialog`, wired through a custom `HostCallBinding` — pattern proven, see "File acquisition, honestly" in CLAUDE.md); drag-and-drop is stretch, not required for v0.1
+  file card. M11 made the drop real; the zone's copy says so.)*
+- [x] User can pick an image via "Choose Image…" (native open dialog via `runtime.showOpenDialog`, wired through a custom `HostCallBinding` — pattern proven, see "File acquisition, honestly" in CLAUDE.md); drag-and-drop was stretch for v0.1 and landed anyway in M11 (`UiApp.Options.on_drop`, SDK 0.8.2+)
 - [x] Image appears as preview with original size
 - [x] User can choose output: AVIF (default), WebP, or Both
 - [x] "Smoosh" produces the selected format(s) via system tools and auto-saves next to the source file
@@ -715,7 +715,7 @@ outside a comment). First `/Applications` launch reproduced the PATH bug live; a
 status line. User then ran one full smoosh from the installed `/Applications` copy by hand (open dialog
 driven manually, per the standing dialog-automation rule) and confirmed it completed correctly.
 
-**M11 — File drops.** *(Sonnet, fresh session)* — **INVESTIGATED 2026-08-10, GREEN. Build it.**
+**M11 — File drops.** *(Sonnet, fresh session)* — **DONE**
 The open question CLAUDE.md left ("whether a drop-zone `on-file-drop` markup hook exists") has an
 answer, and it changed with the toolchain: **`@native-sdk/cli` was upgraded 0.8.0 -> 0.8.4, and 0.8.2
 added the app-facing seam.** Everything below is read out of the installed CLI's source
@@ -807,11 +807,68 @@ whatever the globally installed CLI carries.
 re-emits them. Be aware that **even 0.8.4's `native-ui` and `zig` skills do not document `on_drop`** —
 only ts-core's does, and only as a one-line adapter aside — so this entry is the authoritative
 reference for the Zig signature.
-*Verify:* `native test` + `native check` clean; the user drags a real image onto the running window and
-it lands in the same `.ready` state a picked file does; then one full smoosh from a dropped file.
-*Sonnet because:* the open-ended source investigation that justified Opus is now DONE and written down
-above. What remains is a small, fully specified change against a pipeline this repo already owns —
-M8-shaped. Escalate to Opus only if the hand-drag misbehaves in a way this entry does not predict.
+Built exactly the spec above: one `Msg` field, one pure callback, one shared helper, one options
+wire-up.
+Settled/found here:
+- **`Msg` gained `dropped_file: []const u8`, a dedicated arm — not a synthesized `.dialog_result`.**
+  Both shapes were offered as options above; the dedicated arm won because a transcript (or a test
+  name) that reads "`dropped_file`" says what happened, where a synthesized `EffectHostResult{ .key =
+  dialog_key, ... }` would read as a dialog answer that never happened.
+- **The two entry points share one helper, `beginLoad(model, fx, path)`**, factored out of what used
+  to be `.dialog_result`'s ok-branch body: set `.loading`, `setPath`, `clearResults`, `clearPreview`,
+  issue the `file.stat` request. `.dialog_result`'s ok branch now just calls it; `.dropped_file` calls
+  it directly, since there is no dialog round trip to answer first. This is the concrete form of the
+  PLAN's own claim that "a drop re-enters the already-validated chain with zero new pipeline" — after
+  this refactor that is true by construction, not just by intent, and mutation-testing `clearResults`/
+  `clearPreview` out of `beginLoad` fails BOTH the pre-existing pick-based regression test and the new
+  drop-based one, confirming the sharing is real.
+- **`onDrop` takes `paths[0]` and ignores the rest**, matching `showOpenDialog`'s existing single-select
+  behaviour (`allow_multiple` defaults false) — a drop and a pick now behave alike for a multi-file
+  case rather than one silently accepting more than the other. Empty `paths` returns `null`, so
+  `handleRuntimeEvent` dispatches nothing (a drag of something with no file, e.g. dragged text).
+- **`onDrop` is `pub`, matching `formatBytes`/`formatSavings`/`resolveSpawnEnviron`'s precedent** for a
+  pure helper worth testing directly rather than only through the dispatch path — PLAN's own testing
+  note ("`onDrop` is a pure function — tier-1 testable with no runtime at all") needed this to be
+  callable as `main.onDrop(...)` from `tests.zig`.
+- **`app.zon` gained `"file_drops"` in `.capabilities`.** Confirmed real (`app_manifest.CapabilityKind
+  .file_drops`) by the investigation above; nothing in the runtime reads it (same as `native_views`/
+  `gpu_surfaces`'s existing honesty-not-a-switch status), so this is metadata, not wiring. **CLAUDE.md's
+  "no evidence either exists, do not add them speculatively" line was corrected** — it was wrong about
+  `file_drops` (real) though right that nothing reads it as a gate.
+- **The drop zone's copy changed from "Click to choose an image" to "Drop an image here — or click to
+  choose"**, and `statusLine`'s idle text reverted from M9's "Choose an image to get started." back to
+  the original M5-era "Drop or choose an image to get started." — M9 had removed "drop" specifically
+  because it didn't work yet (PLAN's own M9 entry: "a drop zone that lies about accepting drops is the
+  one thing a drop zone must not do"); M11 is what makes the word true again. A pre-existing test
+  (`"the empty state offers a drop zone that picks a file"`) pinned the old copy literally and needed
+  updating — expected, not a regression.
+*Verified:* `native test` 93/93 (5 new: `onDrop` returns the right `dropped_file` payload, takes the
+first of several paths, returns `null` on an empty list; a dropped path reaches `.ready` through the
+unmodified `stat_result` -> `dimensions_result` -> `thumbnail_result` -> `image_loaded` chain; a drop
+clears a previous run's results and preview the same way a pick does). Each new assertion was
+mutation-checked: swapping `paths[0]` for the last path failed exactly the "takes the first" test;
+deleting `clearResults`/`clearPreview` from `beginLoad` failed 4 tests (both the new drop-based
+regression test and the pre-existing pick-based one it now shares code with) rather than 0, which is
+what proves the sharing is load-bearing and not just parallel code that happens to agree. `native
+check` clean at zero warnings, `native build` clean.
+**Live, by the user's own hand (drops cannot be automated at all — see the investigation above; this
+is a different constraint from the standing "don't automate dialogs" rule, but the same practical
+answer):** dragging `test-images/photo.heic` onto the running `native dev` window landed it in `.ready`
+with the real name ("photo.heic") and size ("Original 2.2 MB") shown, `dispatch_errors=0` — a drop is
+provably indistinguishable from a pick past `onDrop`, live and not just in the fake-executor tests.
+Pressing Smoosh on that file failed with "AVIF encoding failed."; independently confirmed by running
+`avifenc`/`cwebp` against the same file from a shell that this is `avifenc`/`cwebp` themselves
+rejecting HEIC as an INPUT format ("Unrecognized file format for input file") — a pre-existing Phase A
+system-tool gap a picked HEIC would hit identically, unrelated to drops, and out of M11's scope.
+Dragging `test-images/large.jpg` instead and pressing Smoosh (via `native automate widget-click`, which
+*is* fair game once a file has loaded) produced `AVIF  700.2 KB  −88%` and status "Done." with
+`dispatch_errors=0` — the exact numbers M7's own live check recorded — and `test-images/large.avif`'s
+mtime confirmed a fresh write at the moment of the click, not a stale file from M7's original run
+sitting untouched. This is PLAN's "one full smoosh from a dropped file," done.
+*Sonnet because:* the open-ended source investigation that justified Opus was already DONE and written
+down above before this session started. What remained was the small, fully specified change against a
+pipeline this repo already owned — M8-shaped, as predicted. The hand-drag behaved exactly as the
+investigation predicted; no escalation was needed.
 
 ## Open decisions
 - ~~Partial failure in "Both" mode: report success-with-warning, or fail the whole operation?~~

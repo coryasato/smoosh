@@ -7,9 +7,11 @@
      chrome around them (header, format chips, actions, status) never
      moves, so the window never reflows out from under a press.
 
-     The copy says "click", not "drop": file drops are M11's open
-     question, not v0.1 behaviour, and a zone that promises a drop it
-     cannot accept is the one dishonest thing a drop zone can do.
+     M11: the copy says "drop", not just "click" — `on_drop` (SDK 0.8.2+)
+     makes a real window-wide drag-and-drop land in the same load chain a
+     picked file does (see `main.zig`'s `onDrop`/`beginLoad`). The zone
+     itself stays a click target too: dropping anywhere in the window
+     works, but the zone is still the one thing worth pointing at.
 
      Every direct child of the root column carries a `key`. Without one,
      unkeyed same-kind siblings take POSITIONAL identity, so each `<if>`
@@ -66,10 +68,10 @@
   </if>
   <else>
     <panel key="dropzone" grow="1" padding="16" background="surface_subtle" radius="lg"
-           on-press="pick_file" label="Choose an image to compress">
+           on-press="pick_file" label="Drop an image, or click to choose one to compress">
       <column gap="6" grow="1" main="center" cross="center">
         <icon name="folder-open" width="28" height="28" foreground="text_muted" />
-        <text text-alignment="center">Click to choose an image</text>
+        <text text-alignment="center">Drop an image here — or click to choose</text>
         <text foreground="text_muted" text-alignment="center">JPEG, PNG, HEIC, WebP, TIFF or GIF, up to 100 MB</text>
       </column>
     </panel>
