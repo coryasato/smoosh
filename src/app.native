@@ -1,26 +1,23 @@
-<!-- M9: the real view. Replaces M2's scaffold, which existed only so
-     M3-M8 had something to drive via `native automate`.
-
-     Two shapes, one column: with no file the middle is a pressable drop
+<!-- Two shapes, one column: with no file the middle is a pressable drop
      zone that fills the window; with one it is a card — preview on the
      left, the file's name/size and per-format results on the right. The
      chrome around them (header, format chips, actions, status) never
      moves, so the window never reflows out from under a press.
 
-     M11: the copy says "drop", not just "click" — `on_drop` (SDK 0.8.2+)
-     makes a real window-wide drag-and-drop land in the same load chain a
-     picked file does (see `main.zig`'s `onDrop`/`beginLoad`). The zone
-     itself stays a click target too: dropping anywhere in the window
-     works, but the zone is still the one thing worth pointing at.
+     The copy says "drop", not just "click" — `on_drop` (SDK 0.8.2+) makes
+     a real window-wide drag-and-drop land in the same load chain a picked
+     file does (see `main.zig`'s `onDrop`/`beginLoad`). The zone itself
+     stays a click target too: dropping anywhere in the window works, but
+     the zone is still the one thing worth pointing at.
 
      Every direct child of the root column carries a `key`. Without one,
      unkeyed same-kind siblings take POSITIONAL identity, so each `<if>`
      below that starts rendering re-disambiguates everything after it and
-     the widget ids all move — confirmed live in M7, where the Smoosh
-     button took three different ids across idle -> ready -> done. Keys
-     pin identity regardless of which conditionals are currently in the
-     tree, which is what `native automate` scripts (and engine-owned
-     widget state) rely on. Validate with: native check -->
+     the widget ids all move — confirmed live, where the Smoosh button
+     took three different ids across idle -> ready -> done. Keys pin
+     identity regardless of which conditionals are currently in the tree,
+     which is what `native automate` scripts (and engine-owned widget
+     state) rely on. Validate with: native check -->
 <column gap="12" padding="16">
   <row key="header" gap="8" cross="center">
     <text grow="1" size="heading">Smoosh</text>
@@ -31,7 +28,7 @@
        height lands here rather than stretching the control rows. -->
   <if test="{hasFile}">
     <row key="file" gap="12" cross="center" grow="1">
-      <!-- M3: the preview is a `sips`-generated thumbnail, not the source
+      <!-- The preview is a `sips`-generated thumbnail, not the source
            image — registered images are capped at 512x512 decoded. Drawn
            at `previewWidth`/`previewHeight`, which clamp the thumbnail to
            the SOURCE's real dimensions: `sips -Z` upscales anything
@@ -53,7 +50,7 @@
       <column key="details" grow="1" gap="4">
         <text key="name"><span weight="medium">{fileName}</span></text>
         <text key="original" foreground="text_muted">Original {originalSize}</text>
-        <!-- M7: one line per format that actually landed. Per-format rather
+        <!-- One line per format that actually landed. Per-format rather
              than a summed "combined savings" — no client ever downloads both
              files, so each line reports what would really be served. A format
              that failed shows no line; the status bar names it. -->

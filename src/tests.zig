@@ -1,17 +1,16 @@
 //! Smoosh unit tests — the markup/model seam, exercised through the real
 //! dispatch path with no GUI.
 //!
-//! Scope, deliberately: this file tests facts that EXIST after M2 and that
-//! later milestones would regress silently — that `app.native` builds against
-//! the real `Model`, that every control dispatches the `Msg` it claims (chip
-//! payload coercion included), and that `Model`'s derived accessors hold. It
-//! does NOT test `update`'s arms: they are empty by design until M3-M8 fill
-//! them in one at a time, and "asserts nothing happened" tests would just be
-//! deleted milestone by milestone. Msg-tag exhaustiveness is already a compile
-//! error via `update`'s switch, so it needs no test either.
+//! Scope, deliberately: this file tests facts that would regress silently —
+//! that `app.native` builds against the real `Model`, that every control
+//! dispatches the `Msg` it claims (chip payload coercion included), that
+//! `Model`'s derived accessors hold, and every `update` arm's behavior.
+//! Msg-tag exhaustiveness is already a compile error via `update`'s switch,
+//! so it needs no test.
 //!
-//! Effects-bearing milestones (M3 dialog, M5 encoder detection, M7 encode)
-//! test through the fake executor — see PLAN.md's "Testing strategy".
+//! Effects-bearing paths (the dialog chain, encoder detection, encoding)
+//! test through a fake executor (`fx.executor = .fake`, driven by the
+//! `Harness` below), never a real process or a real dialog.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -94,7 +93,7 @@ fn expectByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8
     };
 }
 
-/// The M9 view splits on `hasFile`, so a test about the file card (or about
+/// The view splits on `hasFile`, so a test about the file card (or about
 /// a control that only enables once there is something to act on) has to
 /// give the model a path — the same thing `dialog_result` does live.
 fn setPath(model: *Model, path: []const u8) void {
@@ -145,7 +144,7 @@ test "app.native builds against the real Model in every Status" {
     }
 }
 
-test "the view exposes every control M3-M8 drive" {
+test "the view exposes every control update drives" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -157,9 +156,9 @@ test "the view exposes every control M3-M8 drive" {
     _ = try expectByText(tree.root, .button, "Smoosh");
     _ = try expectByText(tree.root, .button, "Save As…");
     _ = try expectByText(tree.root, .button, "Reset");
-    // One chip per Format, labelled by `Format.label` — the item-method
-    // binding M9 introduced, so the chips read "AVIF"/"WebP"/"Both"
-    // instead of the lowercase Zig tag names.
+    // One chip per Format, labelled by `Format.label` — an item-method
+    // binding, so the chips read "AVIF"/"WebP"/"Both" instead of the
+    // lowercase Zig tag names.
     for (Model.formats) |chip| {
         _ = try expectByText(tree.root, .toggle_button, chip.label);
     }
@@ -170,8 +169,8 @@ test "the empty state offers a drop zone that picks a file" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // M9's headline: with no file the middle of the window is one big
-    // pressable target, not just a button in a row. It is a `panel` with a
+    // With no file the middle of the window is one big pressable target,
+    // not just a button in a row. It is a `panel` with a
     // bound `on-press`, which is what makes it a hit target at all — an
     // unbound panel would swallow the click into dead space.
     var model: Model = .{};
@@ -300,11 +299,11 @@ test "widget ids survive the conditional rows appearing" {
     // column, so they come and go. Unkeyed same-kind siblings take
     // POSITIONAL identity, which means a conditional that starts rendering
     // re-disambiguates every sibling after it and all their ids move. That
-    // really happened: driving M7 live, the Smoosh button took three
-    // different ids across idle -> ready -> done, breaking automation
-    // scripts mid-run. The `key` on each root child is what pins this, and
-    // the test above cannot catch it — it only changes `status`, which
-    // alters no structure.
+    // really happened live: the Smoosh button took three different ids
+    // across idle -> ready -> done, breaking automation scripts mid-run.
+    // The `key` on each root child is what pins this, and the test above
+    // cannot catch it — it only changes `status`, which alters no
+    // structure.
     var empty: Model = .{};
     const before = try buildTree(arena, &empty);
 
@@ -339,8 +338,8 @@ test "every control dispatches the message it claims" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A model with a file AND a landed output, because M9 disables Smoosh
-    // and Save As when there is nothing to act on — and `msgForPointer`
+    // A model with a file AND a landed output, because the view disables
+    // Smoosh and Save As when there is nothing to act on — and `msgForPointer`
     // yields null for a disabled control, so an empty model would prove
     // nothing about their wiring.
     var model = readyModel();
@@ -370,9 +369,9 @@ test "each format chip coerces its own tag into the set_format payload" {
     var model: Model = .{};
     const tree = try buildTree(arena, &model);
 
-    // The one piece of real wiring M2 landed: `on-toggle="set_format:{f}"`
-    // must carry the loop variable through as a typed Format payload, not
-    // just fire a bare tag. M6 relies on this exact coercion.
+    // `on-toggle="set_format:{f}"` must carry the loop variable through as
+    // a typed Format payload, not just fire a bare tag — `update`'s
+    // `.set_format` arm relies on this exact coercion.
     for (Model.formats) |chip_source| {
         const chip = try expectByText(tree.root, .toggle_button, chip_source.label);
         const msg = tree.msgFor(chip.id, .toggle) orelse {
@@ -395,8 +394,7 @@ test "the chip matching Model.format is the selected one" {
     const arena = arena_state.allocator();
 
     // `selected="{f == format}"` is what makes the chip row model-driven
-    // rather than uncontrolled. It reads correctly for every Format even
-    // though `update` cannot move `format` yet (M6 wires that).
+    // rather than uncontrolled. It reads correctly for every Format.
     for (Model.formats) |selected| {
         var model: Model = .{ .format = selected.value };
         const tree = try buildTree(arena, &model);
@@ -426,8 +424,8 @@ test "path and errorMessage slice at zero and populated lengths" {
 }
 
 test "path buffers hold a maximum-length dialog path" {
-    // PLAN.md's sketch said 1024; M2 sized these at platform.max_dialog_path_bytes
-    // so M3 can land whatever showOpenDialog returns without a resize. Pin that.
+    // Sized at platform.max_dialog_path_bytes so a pick can land whatever
+    // showOpenDialog returns without a resize. Pin that.
     var model: Model = .{};
     const max = model.path_buffer.len;
     try testing.expectEqual(native_sdk.platform.max_dialog_path_bytes, max);
@@ -456,8 +454,8 @@ test "statusLine names every Status, and .failed reports the error message" {
         count += 1;
     }
 
-    // PLAN.md's "Status → error mapping": `.failed` always surfaces the
-    // error buffer, never a canned string of its own.
+    // `.failed` always surfaces the error buffer, never a canned string
+    // of its own.
     const message = "That file is 132 MB — the limit is 100 MB.";
     @memcpy(model.error_message_buffer[0..message.len], message);
     model.error_message_len = message.len;
@@ -465,11 +463,11 @@ test "statusLine names every Status, and .failed reports the error message" {
     try testing.expectEqualStrings(message, model.statusLine());
 }
 
-// ========================================================== M10: packaging
+// ================================================================ packaging
 //
-// M10 found this live: a packaged `.app` launched from `/Applications`
-// failed the M5 encoder check even with avifenc/cwebp installed, because
-// Finder/Dock-launched processes inherit launchd's minimal PATH, not the
+// A packaged `.app` launched from `/Applications` fails the encoder
+// presence check even with avifenc/cwebp installed, because Finder/Dock-
+// launched processes inherit launchd's minimal PATH, not the
 // interactive-shell PATH `brew shellenv` adds — the exact opposite of every
 // `native dev`/`native build` run, which is always launched from a Terminal.
 // `resolveSpawnEnviron` is pure enough to test directly: build a fake
@@ -523,12 +521,12 @@ test "resolveSpawnEnviron sets PATH from scratch when the base environ has none"
     );
 }
 
-// ============================================================ M3: effects
+// ==================================================================== effects
 //
 // The dialog -> stat -> thumbnail -> preview chain, driven through the fake
-// executor (PLAN.md's "Testing strategy", tier 1): assert the REQUEST each
-// arm made, feed the answer, drain through the same `.wake` path live
-// platforms use, then assert the model. No GUI, no NSOpenPanel, no `sips`.
+// executor: assert the REQUEST each arm made, feed the answer, drain
+// through the same `.wake` path live platforms use, then assert the
+// model. No GUI, no NSOpenPanel, no `sips`.
 
 const App = native_sdk.UiApp(Model, Msg);
 
@@ -538,7 +536,7 @@ const App = native_sdk.UiApp(Model, Msg);
 /// outright and the rejection would mask what the test is checking.
 const test_thumbnail_path = "/tmp/smoosh-tests/preview.png";
 
-/// M12's counterpart to `test_thumbnail_path` — where `main.converted_path`
+/// `test_thumbnail_path`'s counterpart — where `main.converted_path`
 /// points during tests. Same reasoning: the staging spawn is faked, but the
 /// path still flows into a real encode spawn's argv, which tests assert on.
 const test_converted_path = "/tmp/smoosh-tests/converted.png";
@@ -548,20 +546,20 @@ const Harness = struct {
     app_state: *App,
     app: native_sdk.App,
 
-    /// Every non-M5 test's entry point: boots the app AND resolves the
-    /// M5 launch-time encoder check to "both present" — the happy path —
-    /// so `avifenc`/`cwebp` presence never shows up as a stray pending
-    /// spawn in a test that has nothing to do with M5.
+    /// Most tests' entry point: boots the app AND resolves the launch-time
+    /// encoder check to "both present" — the happy path — so
+    /// `avifenc`/`cwebp` presence never shows up as a stray pending spawn
+    /// in a test that has nothing to do with encoder detection.
     fn create() !Harness {
         var h = try Harness.createBare();
         try h.resolveEncoders(true, true);
         return h;
     }
 
-    /// Boots the app and stops right after install, before the M5 launch
-    /// check is resolved — `avifenc`'s and `cwebp`'s presence spawns are
-    /// still pending. Only M5's own tests call this directly; everything
-    /// else goes through `create`.
+    /// Boots the app and stops right after install, before the launch-time
+    /// encoder check is resolved — `avifenc`'s and `cwebp`'s presence
+    /// spawns are still pending. Only the encoder-detection tests call
+    /// this directly; everything else goes through `create`.
     fn createBare() !Harness {
         main.thumbnail_path = test_thumbnail_path;
         main.converted_path = test_converted_path;
@@ -583,7 +581,7 @@ const Harness = struct {
         });
         errdefer app_state.destroy();
 
-        // Fake BEFORE the installing frame: `init_fx`'s boot spawns (M5's
+        // Fake BEFORE the installing frame: `init_fx`'s boot spawns (the
         // encoder presence check) must be RECORDED, not actually executed
         // — the same ordering `native_sdk`'s own init_fx test uses.
         app_state.effects.executor = .fake;
@@ -603,7 +601,7 @@ const Harness = struct {
         return .{ .harness = harness, .app_state = app_state, .app = app };
     }
 
-    /// Feeds M5's two boot-time presence spawns, in the order `init_fx`
+    /// Feeds the two boot-time presence spawns, in the order `init_fx`
     /// issued them (`avifenc` then `cwebp`), and drains once.
     fn resolveEncoders(self: *Harness, avifenc_present: bool, cwebp_present: bool) !void {
         const avifenc_req = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
@@ -653,7 +651,7 @@ const Harness = struct {
         try self.drain();
     }
 
-    /// M11: `pick`'s counterpart for a real window drop — dispatches the
+    /// `pick`'s counterpart for a real window drop — dispatches the
     /// `.dropped_file` Msg `onDrop` would have produced directly (there is
     /// no dialog round trip to answer), and starts the same load chain.
     fn drop(self: *Harness, path: []const u8) !void {
@@ -668,9 +666,8 @@ const Harness = struct {
         try self.drain();
     }
 
-    /// M4's dimension query, fed as the standard happy-path result:
-    /// well under the 50 MP limit, so the chain proceeds to the thumbnail
-    /// spawn exactly as it did before M4 existed.
+    /// The dimension query, fed as the standard happy-path result: well
+    /// under the 50 MP limit, so the chain proceeds to the thumbnail spawn.
     fn dimensions(self: *Harness, width: u64, height: u64) !void {
         var buf: [64]u8 = undefined;
         const output = std.fmt.bufPrint(&buf, "pixelWidth: {d}|pixelHeight: {d}|", .{ width, height }) catch unreachable;
@@ -699,12 +696,12 @@ const Harness = struct {
         try self.drain();
     }
 
-    // ------------------------------------------------------ M7: encoding
+    // ------------------------------------------------------------ encoding
     //
     // These find their request by CONTENT (argv[0], the stat payload's
-    // extension) rather than by slot index, because the whole point of M7
-    // is that the two encodes are independent: a test must be able to
-    // answer them in EITHER order without the helper caring.
+    // extension) rather than by slot index, because the two encodes are
+    // independent: a test must be able to answer them in EITHER order
+    // without the helper caring.
 
     /// The full pick chain, landing in `.ready` with a preview — the state
     /// `smoosh` requires. Dimensions and thumbnail take their happy path.
@@ -750,7 +747,7 @@ const Harness = struct {
         try self.encodeSize(extension, true, size);
     }
 
-    /// M12's HEIC->PNG staging spawn — ONE per run regardless of how many
+    /// The HEIC->PNG staging spawn — ONE per run regardless of how many
     /// formats were requested, unlike the per-format encode spawns above.
     fn convertExit(self: *Harness, code: i32) !void {
         const request = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
@@ -758,11 +755,11 @@ const Harness = struct {
         try self.drain();
     }
 
-    // -------------------------------------------------------- M8: Save As
+    // ------------------------------------------------------------ Save As
     //
     // Two host requests per round, in order: `dialog.saveFile`, then, only
     // if the dialog wasn't cancelled, `file.copy`. Found by NAME rather
-    // than slot position — same discipline as the M7 encode helpers above,
+    // than slot position — same discipline as the encode helpers above,
     // for the same reason: only one of these is ever pending at a time
     // (the copy is not issued until the dialog answers), but a test
     // should never rely on that as a slot-index assumption either.
@@ -820,7 +817,7 @@ test "picking a file lands the real path, its size, and a preview" {
     try h.stat("2516582");
     try testing.expectEqual(@as(u64, 2516582), h.model().original_size);
 
-    // M4: the dimension query is a SEPARATE `sips` call (can't combine `-g`
+    // The dimension query is a SEPARATE `sips` call (can't combine `-g`
     // with `-s`/`-Z` in one invocation) that runs before the thumbnail spawn.
     const dims_spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
     const expected_dims_argv = [_][]const u8{
@@ -904,14 +901,14 @@ test "an unreadable file fails, and the card is what names it" {
     try h.drain();
 
     try testing.expectEqual(Status.failed, h.model().status);
-    // M9 moved the filename out of the message and into the file card,
-    // which stands in every failed state — the status bar is one elided
-    // line and the quoted name crowded out the explanation. What the
-    // message still has to do is explain.
+    // The filename lives in the file card, which stands in every failed
+    // state — the status bar is one elided line and the quoted name
+    // would crowd out the explanation. What the message still has to do
+    // is explain.
     try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "read") != null);
     try testing.expectEqualStrings("locked.jpg", h.model().fileName());
-    // PLAN.md's "Status → error mapping": `.failed` always surfaces the
-    // error buffer through the status line, never a canned string.
+    // `.failed` always surfaces the error buffer through the status
+    // line, never a canned string.
     try testing.expectEqualStrings(h.model().errorMessage(), h.model().statusLine());
 }
 
@@ -931,9 +928,9 @@ test "a non-image input fails with the supported-formats message" {
 
     try testing.expectEqual(Status.failed, h.model().status);
     const message = h.model().errorMessage();
-    // The message does not name the file — the card above it does (M9:
-    // the status bar is one elided line, and the quoted name crowded out
-    // the part that says what to do).
+    // The message does not name the file — the card above it does: the
+    // status bar is one elided line, and a quoted name would crowd out
+    // the part that says what to do.
     try testing.expect(std.mem.indexOf(u8, message, "JPEG") != null);
     // No preview may survive a failed decode.
     try testing.expect(!h.model().hasPreview());
@@ -948,7 +945,7 @@ test "a new pick drops the previous file's preview before it can load" {
     defer h.destroy();
 
     // The test above starts from an empty model, so it could never catch
-    // this: the preview is only stale on a SECOND pick. M9's file card is
+    // this: the preview is only stale on a SECOND pick. The file card is
     // what made it visible — running live, picking not-an-image.jpg after
     // tiny.png rendered tiny.png's thumbnail beside the new file's name.
     try h.load("/Users/someone/Pictures/tiny.png", "312");
@@ -992,7 +989,7 @@ test "a stat result that is not a number fails rather than reporting 0 bytes" {
 
     try testing.expectEqual(Status.failed, h.model().status);
     try testing.expectEqual(@as(u64, 0), h.model().original_size);
-    // A "0 B" original would make M7's savings % nonsense, so this must
+    // A "0 B" original would make the savings % nonsense, so this must
     // never reach the encode path.
     try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
 }
@@ -1082,12 +1079,11 @@ test "reset frees the effect keys so the next pick is not rejected" {
     try testing.expectEqual(@as(u64, 200), h.model().original_size);
 }
 
-// ============================================================ M4: limits
+// ================================================================== limits
 //
-// PLAN.md's "Input size limits": 80-100MB / 40-50 megapixels, whichever
-// comes first. `oversized.jpg` is the fixture that separates the two
-// branches — 51.2 MP but only ~5.7 MB — so both need their own test, over
-// numbers rather than a real 51 MP decode (per the testing strategy).
+// 100 MB / 50 megapixels, whichever comes first. `oversized.jpg` is the
+// fixture that separates the two branches — 51.2 MP but only ~5.7 MB — so
+// both need their own test, over numbers rather than a real 51 MP decode.
 
 test "a file over the byte limit fails before any dimension query" {
     var h = try Harness.create();
@@ -1186,7 +1182,7 @@ test "a dimension query cancelled by reset is not reported as a broken image" {
     try testing.expect(!h.model().hasPreview());
 }
 
-// ================================================== M5: encoder detection
+// ============================================================== encoder detection
 //
 // `init_fx` fires both presence checks on the installing frame, before
 // `create` resolves them via `resolveEncoders` — these tests go through
@@ -1285,11 +1281,11 @@ test "the missing-encoder failure is decided only once both checks land, in eith
     try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "avifenc") != null);
 }
 
-// ==================================================== M6: format selection
+// ========================================================== format selection
 //
 // The chip -> `set_format:{f}` payload coercion and the `selected="{f ==
-// format}"` binding are already proven at the markup level (M2a, above) —
-// what M6 actually adds is `update` moving `Model.format`. `.avif` is the
+// format}"` binding are already proven at the markup level (above) — what's
+// left is confirming `update` actually moves `Model.format`. `.avif` is the
 // model default, so the AVIF case here also stands in as "sending your own
 // current selection is a no-op."
 
@@ -1320,12 +1316,12 @@ test "format survives picking a file, unlike the rest of the model" {
     try testing.expectEqual(Format.webp, h.model().format);
 }
 
-// ==================================================== M7: encode pipeline
+// =============================================================== encode pipeline
 //
-// The sizes below are REAL: PLAN.md's "Encoder invocations" recorded them
-// by running the pinned argv against `test-images/` in M5. `large.jpg`
-// (5,846,465 B) -> AVIF 717,003 / WebP 671,054; `tiny.png` (312 B) -> AVIF
-// 315 (LARGER than the source) / WebP 68.
+// The sizes below are REAL: recorded by running the pinned argv against
+// `test-images/`. `large.jpg` (5,846,465 B) -> AVIF 717,003 / WebP
+// 671,054; `tiny.png` (312 B) -> AVIF 315 (LARGER than the source) / WebP
+// 68.
 
 const large_jpg = "/Users/someone/Pictures/large.jpg";
 const large_jpg_bytes = "5846465";
@@ -1445,9 +1441,9 @@ test "AVIF succeeding while WebP fails is a done run that names WebP" {
     try h.encodeOk("avifenc", ".avif", "717003");
     try h.encodeExit("cwebp", 1);
 
-    // THE decision (PLAN.md's "Open decisions", settled in M7): `.done`,
-    // not `.failed`. avifenc already wrote large.avif to disk — claiming
-    // the run failed would contradict the file sitting next to the source.
+    // THE decision: `.done`, not `.failed`. avifenc already wrote
+    // large.avif to disk — claiming the run failed would contradict the
+    // file sitting next to the source.
     try testing.expectEqual(Status.done, h.model().status);
     try testing.expect(h.model().hasAvifResult());
     try testing.expect(!h.model().hasWebpResult());
@@ -1490,8 +1486,8 @@ test "Both formats failing is a failed run, not a done one" {
     try h.encodeExit("cwebp", 1);
 
     // The floor under the partial-success rule: nothing landed, so nothing
-    // may claim success. This also keeps PLAN.md's "`.failed` is always
-    // paired with an error message" true.
+    // may claim success. This also keeps "`.failed` is always paired with
+    // an error message" true.
     try testing.expectEqual(Status.failed, h.model().status);
     const message = h.model().errorMessage();
     try testing.expect(std.mem.indexOf(u8, message, "AVIF") != null);
@@ -1523,8 +1519,8 @@ test "a missing encoder fails only its own format" {
     var h = try Harness.createBare();
     defer h.destroy();
 
-    // avifenc present, cwebp absent — the machine M5 would have failed
-    // outright at launch. In Both mode the AVIF half must still work.
+    // avifenc present, cwebp absent — the launch-time check would have
+    // failed outright. In Both mode the AVIF half must still work.
     try h.resolveEncoders(true, false);
     try h.send(.{ .set_format = .both });
     try h.load(large_jpg, large_jpg_bytes);
@@ -1562,7 +1558,7 @@ test "an encoder that exits clean without leaving a file is a write failure" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
     try h.encodeExit("avifenc", 0);
-    // The output stat is what proves the file landed — PLAN.md's "write to
+    // The output stat is what proves the file landed — the "write to
     // output path failed" state has no other signal, since the encoder
     // writes its own destination.
     try h.encodeSize(".avif", false, "AccessDenied");
@@ -1583,8 +1579,8 @@ test "smooshing a WebP source to WebP is skipped rather than overwriting the sou
     try h.send(.smoosh);
 
     // cwebp would have been handed the same path to read AND write.
-    // "Overwrite silently" (PLAN.md's Output handling) is about a previous
-    // OUTPUT, never the user's source file.
+    // "Overwrite silently" is about a previous OUTPUT, never the user's
+    // source file.
     try testing.expect(h.encodeSpawn("cwebp") == null);
     try testing.expect(h.encodeSpawn("avifenc") != null);
 
@@ -1611,13 +1607,13 @@ test "the output path replaces the source extension, not a dot in a parent direc
     );
 }
 
-// -------------------------------------------------------- M12: HEIC input
+// -------------------------------------------------------------- HEIC input
 //
-// `avifenc`/`cwebp` reject HEIC as an INPUT format outright (confirmed live
-// in M11 — see PLAN.md's "Known limitations"), even though `sips` decodes
-// it fine for the preview. `smoosh` routes a HEIC/HEIF source through ONE
-// shared `sips`-to-PNG staging spawn first; both encoders then read the
-// staged PNG instead of the original file.
+// `avifenc`/`cwebp` reject HEIC as an INPUT format outright (confirmed
+// live), even though `sips` decodes it fine for the preview. `smoosh`
+// routes a HEIC/HEIF source through ONE shared `sips`-to-PNG staging spawn
+// first; both encoders then read the staged PNG instead of the original
+// file.
 
 const photo_heic = "/Users/someone/Pictures/photo.heic";
 const photo_heic_bytes = "2202009";
@@ -1729,7 +1725,7 @@ test "a failed HEIC conversion in Both mode fails once, not with a doubled messa
 
     try testing.expectEqual(Status.failed, h.model().status);
     // The staging failure is ONE shared cause, not two independent encoder
-    // failures — the message must not repeat itself the way M7's per-format
+    // failures — the message must not repeat itself the way the per-format
     // join would for two genuinely different failures.
     try testing.expectEqualStrings(
         "Couldn't prepare that HEIC file for encoding.",
@@ -1752,9 +1748,10 @@ test "a HEIC conversion result that lands after reset is ignored" {
     // The real hazard: a stale terminal for the CANCELLED staging spawn
     // arriving anyway (a race the effects channel itself does not fully
     // close — same reasoning as the pre-existing `.encode_result` guard).
-    // Dispatched directly, bypassing `fx` entirely, the same technique M8's
-    // dead-code guards used, since this is the only way to actually reach
-    // the arm with the model already reset out of `.compressing`.
+    // Dispatched directly, bypassing `fx` entirely, the same technique the
+    // Save As dead-code guards used, since this is the only way to
+    // actually reach the arm with the model already reset out of
+    // `.compressing`.
     try h.send(.{ .convert_result = .{ .key = staging_key, .code = 1, .reason = .exited } });
 
     try testing.expectEqual(Status.idle, h.model().status);
@@ -1772,8 +1769,8 @@ test "an output larger than the source reads as larger, not a broken percentage"
     var h = try Harness.create();
     defer h.destroy();
 
-    // tiny.png really does grow as AVIF (312 B -> 315 B), measured in M5.
-    // PLAN.md asks that this display sanely rather than as a failure.
+    // tiny.png really does grow as AVIF (312 B -> 315 B) — this must
+    // display sanely rather than as a failure.
     try h.send(.{ .set_format = .both });
     try h.load("/Users/someone/Pictures/tiny.png", "312");
     try h.send(.smoosh);
@@ -1849,9 +1846,9 @@ test "re-smooshing clears the previous run's results" {
     try h.encodeExit("cwebp", 1);
     try testing.expect(h.model().warning_message_len > 0);
 
-    // "Re-running Smoosh on the same source is treated as redo this"
-    // (PLAN.md's Output handling) — including redoing the format that
-    // failed, and dropping the warning it left behind.
+    // Re-running Smoosh on the same source is treated as "redo this" —
+    // including redoing the format that failed, and dropping the warning
+    // it left behind.
     try h.send(.smoosh);
     try testing.expectEqual(Status.compressing, h.model().status);
     try testing.expect(!h.model().hasAvifResult());
@@ -1942,7 +1939,7 @@ test "changing the format mid-encode does not change what the run produces" {
     try testing.expect(h.model().hasWebpResult());
 }
 
-// ============================================================ M8: Save As
+// ================================================================== Save As
 //
 // `showSaveDialog` only ever answers ONE path, so a "Both" run — two
 // produced files — cannot go through one save panel. The design decided
@@ -1993,7 +1990,7 @@ test "saving a copy does not touch the encode results" {
     try h.send(.save_as);
     try h.saveRoundOk("/Users/someone/Desktop/large.avif");
 
-    // "Does not replace auto-save" (PLAN.md) — the original next to the
+    // Save As does not replace auto-save — the original next to the
     // source is untouched, and its size/outcome are exactly what they were.
     try testing.expect(h.model().hasAvifResult());
     try testing.expectEqual(@as(u64, 717003), h.model().avif_size);
@@ -2256,8 +2253,8 @@ test "reset cancels the pending save dialog, so a stray answer cannot land" {
 
     // `.reset`'s `fx.cancel(save_dialog_key)` really took effect: the
     // channel refuses a late answer to the now-cancelled request outright
-    // (`error.EffectNotFound`), the same guarantee M3's own cancel tests
-    // rely on for the pick chain's keys — Save As gets it for free from
+    // (`error.EffectNotFound`), the same guarantee the pick chain's own
+    // cancel tests rely on for its keys — Save As gets it for free from
     // being wired the same way, not from a bespoke guard.
     try testing.expectError(error.EffectNotFound, h.fx().feedHostResult(request.key, true, "/Users/someone/Desktop/large.avif"));
     try testing.expectEqual(Status.idle, h.model().status);
@@ -2279,7 +2276,7 @@ test "the destination extension names the format, not the source's" {
     try testing.expectEqualStrings("photo.avif", request.payload);
 }
 
-// -------------------------------------------------------- M3: derived text
+// -------------------------------------------------------------- derived text
 
 test "fileName is the last path component" {
     var model: Model = .{};
@@ -2334,8 +2331,8 @@ test "the preview clamps to the source, so sips' upscaling never shows" {
     const arena = arena_state.allocator();
 
     // `sips -Z 160` UPSCALES anything smaller than 160px — `tiny.png` came
-    // back a 160x160 blur (PLAN.md M3's deferred note). The registered
-    // pixels are whatever sips produced; the drawn size is the source's.
+    // back a 160x160 blur. The registered pixels are whatever sips
+    // produced; the drawn size is the source's.
     var model = readyModel();
     model.preview_width = 160;
     model.preview_height = 160;
@@ -2385,7 +2382,7 @@ test "the preview renders only once an image is registered" {
     try testing.expectEqual(@as(f32, 120), image.layout.max_size.height);
 }
 
-// -------------------------------------------------------------- M11: drops
+// ------------------------------------------------------------------ drops
 //
 // `onDrop` is pure (`fn(platform.FileDropEvent) ?Msg`, no `*Model`), so it
 // is tested directly with a synthetic event — no runtime, no Harness. What

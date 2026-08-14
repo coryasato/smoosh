@@ -1,10 +1,10 @@
 //! Smoosh — image compression for the desktop.
 //!
-//! M1 skeleton: platform + Runtime are stood up BY HAND (not through the
-//! CLI's `runner.runWithOptions`, whose per-platform bring-up is non-`pub`)
-//! so that M3 can bind a `HostCallBinding` closing over the `*Runtime` and
-//! reach `showOpenDialog`. See CLAUDE.md, "File acquisition, honestly", and
-//! the validated reference at `docs/spikes/dialog-open-file-spike.zig`.
+//! `main.zig` is hand-authored: platform + Runtime are stood up BY HAND (not
+//! through the CLI's `runner.runWithOptions`, whose per-platform bring-up is
+//! non-`pub`) so a `HostCallBinding` can close over the `*Runtime` and reach
+//! `showOpenDialog`. See CLAUDE.md, "File acquisition, honestly", and the
+//! validated reference at `docs/spikes/dialog-open-file-spike.zig`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -38,14 +38,13 @@ const dev = builtin.mode == .Debug;
 
 pub const canvas_label = "main-canvas";
 const window_title = "Smoosh";
-// M9: 480x320 was M2's guess, made before any real content existed, and the
-// ready/done states overflowed it (the `zero_canvas_layout` diagnostic PLAN.md
-// deferred to this milestone). 480x400 is the honest floor for the tallest
-// state — header, a 160px preview card, the format row, the actions row and
-// the status line — and `min_*` below stops a resize from re-creating the
-// overflow. All three declarations of this geometry move together
-// (see the block comment above): these consts feed the `AppInfo` frame and
-// the `ShellWindow`, and `app.zon` states it a third time.
+// 540x400 is the floor for the tallest state — header, a 160px preview
+// card, the format row, the actions row and the status line — a smaller
+// window overflows it (`zero_canvas_layout`). `min_*` below stops a
+// resize from re-creating that overflow. All three declarations of this
+// geometry move together (see the block comment above): these consts
+// feed the `AppInfo` frame and the `ShellWindow`, and `app.zon` states
+// it a third time.
 pub const window_width: f32 = 540;
 pub const window_height: f32 = 400;
 pub const window_min_width: f32 = 420;
@@ -90,23 +89,19 @@ pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 // ------------------------------------------------------------------ model
 //
-// Per PLAN.md's Model/Msg sketch. Buffers use `platform.max_dialog_path_bytes`
-// (4096), not the sketch's literal 1024 — the spike's own dialog wiring
-// (docs/spikes/dialog-open-file-spike.zig) sizes `path_buf` this way to hold
-// whatever `showOpenDialog` hands back, and M3 transplants that pattern
-// directly. `update` stays a no-op switch this milestone: M3-M8 fill in one
-// arm each; `set_format` is M6's job specifically, so it stays empty here
-// too even though it would be a one-line wire-up.
+// Buffers use `platform.max_dialog_path_bytes` (4096) to hold whatever
+// `showOpenDialog` hands back — see the spike's own dialog wiring at
+// docs/spikes/dialog-open-file-spike.zig.
 
 pub const Format = enum { avif, webp, both };
 pub const Status = enum { idle, loading, ready, compressing, done, failed };
 // NOTE: `failed`, not `error` — `error` is a Zig keyword and won't parse as
 // a bare enum field.
 
-/// Where ONE output format got to in the current smoosh run. M7's
-/// partial-failure decision (PLAN.md "Open decisions") lives in this type:
-/// the two formats carry their own outcome, so "Both" is two independent
-/// encodes joined at the end rather than one all-or-nothing operation.
+/// Where ONE output format got to in the current smoosh run. The
+/// partial-failure decision lives in this type: the two formats carry
+/// their own outcome, so "Both" is two independent encodes joined at the
+/// end rather than one all-or-nothing operation.
 ///
 /// `.none` means "not part of this run" and `.pending` means "spawned,
 /// still waiting" — which is what makes the join immune to the user
@@ -114,13 +109,13 @@ pub const Status = enum { idle, loading, ready, compressing, done, failed };
 /// `.pending`", never a re-read of the current selection.
 ///
 /// The failure tags are separate rather than one `.failed` because each
-/// one is a different sentence to the user, and PLAN.md's "Error states"
-/// names them individually.
+/// one is a different sentence to the user.
 pub const EncodeOutcome = enum {
     none,
     pending,
     ok,
-    /// The encoder binary is not installed (M5's launch check said so).
+    /// The encoder binary is not installed (the launch-time presence
+    /// check said so).
     missing_encoder,
     /// The output path would BE the source path — encoding a `.webp` to
     /// WebP would have the encoder read and overwrite the same file.
@@ -128,9 +123,9 @@ pub const EncodeOutcome = enum {
     /// The encoder ran and exited nonzero (or was killed).
     encode_failed,
     /// The encoder claimed success but the output could not be stat'd —
-    /// PLAN.md's "write to output path failed" state.
+    /// the "write to output path failed" state.
     write_failed,
-    /// M12: the shared HEIC->PNG staging step (`sips`) failed or the source
+    /// The shared HEIC->PNG staging step (`sips`) failed or the source
     /// vanished between pick and encode, so the encoder for this format
     /// never even ran. Distinct from `encode_failed` because the encoder
     /// itself is not what failed.
@@ -153,10 +148,10 @@ pub const Model = struct {
     image_id: u64 = 0,
     preview_width: u32 = 0,
     preview_height: u32 = 0,
-    /// The SOURCE's real pixel dimensions, from M4's `sips -g` hop (0 until
-    /// it answers, and 0 forever if its output did not parse — the same
-    /// tolerance the megapixel check already takes). M9 needs them because
-    /// `sips -Z 160` *upscales* a source smaller than 160px: `tiny.png`
+    /// The SOURCE's real pixel dimensions, from the `sips -g` dimensions
+    /// hop (0 until it answers, and 0 forever if its output did not parse
+    /// — the same tolerance the megapixel check already takes). Needed
+    /// because `sips -Z 160` *upscales* a source smaller than 160px: `tiny.png`
     /// (312 B) came back a blurry 160x160. The registered pixels are
     /// whatever `sips` produced; the DRAWN size clamps to the source, so a
     /// small image renders small and sharp instead of stretched.
@@ -176,7 +171,7 @@ pub const Model = struct {
     webp_outcome: EncodeOutcome = .none,
     // options
     format: Format = .avif,
-    // encoders — M5's launch-time `which avifenc`/`which cwebp` presence
+    // encoders — the launch-time `which avifenc`/`which cwebp` presence
     // check. `null` until that hop answers; both land before any user
     // input is possible, so `update`'s arms below never need to guard on
     // this being unresolved.
@@ -188,19 +183,19 @@ pub const Model = struct {
     error_message_len: usize = 0,
     /// A `.done` run that still lost a format. Distinct from
     /// `error_message_buffer` because the two coexist in exactly the case
-    /// M7's partial-failure decision creates: AVIF landed, WebP did not,
-    /// and the run is a success WITH something to say. PLAN.md's
+    /// the partial-failure decision creates: AVIF landed, WebP did not,
+    /// and the run is a success WITH something to say. The invariant
     /// "`.failed` is always paired with an error message, and no other
     /// path sets `.failed`" survives precisely because this is its own
     /// buffer rather than a second meaning for that one.
     warning_message_buffer: [256]u8 = undefined,
     warning_message_len: usize = 0,
 
-    // M8: Save As. `showSaveDialog` only ever returns ONE path, so "Both"
-    // mode runs two dialog+copy rounds back to back rather than inventing a
-    // folder-picker PLAN never mentions — `save_queue` is that round-robin.
-    // `index == len` (true at rest, including 0 == 0) means "no save in
-    // flight"; `save_as` rebuilds the queue fresh on every press.
+    // Save As. `showSaveDialog` only ever returns ONE path, so "Both"
+    // mode runs two dialog+copy rounds back to back rather than a
+    // folder picker — `save_queue` is that round-robin. `index == len`
+    // (true at rest, including 0 == 0) means "no save in flight";
+    // `save_as` rebuilds the queue fresh on every press.
     save_queue: [2]Output = undefined,
     save_queue_len: usize = 0,
     save_queue_index: usize = 0,
@@ -232,11 +227,8 @@ pub const Model = struct {
 
     /// State `update` owns, which the markup reaches only through the
     /// derived fns below (`statusLine`, `fileSummary`, `avifResult`, ...).
-    /// Declared now rather than in M2 because until M7 most of these were
-    /// "not bound YET" (M2's recorded reason for leaving the warnings
-    /// alone); what is left over after M7 is permanently update-side, so
-    /// naming it here makes a future `native check` warning mean something
-    /// again instead of arriving into a standing list of 17.
+    /// Naming these here keeps `native check`'s warnings meaningful — an
+    /// unlisted field with no binding is a real bug, not expected noise.
     pub const view_unbound = .{
         "path_buffer",
         "path_len",
@@ -299,7 +291,7 @@ pub const Model = struct {
         return model.image_id != 0;
     }
 
-    // ------------------------------------------------------- M9: view state
+    // -------------------------------------------------------- view state
     //
     // The view swaps between two shapes — the empty drop zone and the
     // file card — and disables the two actions that have nothing to act
@@ -353,8 +345,8 @@ pub const Model = struct {
 
     /// The preview's DRAWN size, clamped to the source's real dimensions
     /// so `sips -Z`'s upscaling of a tiny source never renders as a blurry
-    /// 160x160 (PLAN.md M3's deferred note). Falls back to the registered
-    /// size when the source dimensions never parsed.
+    /// 160x160. Falls back to the registered size when the source
+    /// dimensions never parsed.
     pub fn previewWidth(model: *const Model) u32 {
         if (model.source_width == 0) return model.preview_width;
         return @min(model.preview_width, model.source_width);
@@ -364,13 +356,13 @@ pub const Model = struct {
         return @min(model.preview_height, model.source_height);
     }
 
-    // ------------------------------------------------------ M7: results
+    // ---------------------------------------------------------- results
     //
-    // One line per format, shown only for a format that actually landed
-    // — the "per-format, side by side" reading of PLAN.md's "combined
-    // savings" for Both mode. A summed total would describe a download
-    // that never happens (no client fetches both files), so each line
-    // reports what would really be served if that format were chosen.
+    // One line per format, shown only for a format that actually landed —
+    // "combined savings" for Both mode reads per-format, side by side, not
+    // as one sum. A summed total would describe a download that never
+    // happens (no client fetches both files), so each line reports what
+    // would really be served if that format were chosen.
 
     pub fn hasAvifResult(model: *const Model) bool {
         return model.avif_outcome == .ok;
@@ -410,17 +402,16 @@ pub const Model = struct {
         model.path_len = len;
     }
 
-    /// Every `.failed` transition goes through here, so PLAN.md's
-    /// "Status → error mapping" holds by construction: `.failed` is
+    /// Every `.failed` transition goes through here, so "`.failed` is
+    /// always paired with an error message" holds by construction: it is
     /// never set without a message beside it.
     ///
-    /// M9 note on wording: these messages do NOT name the file. The
-    /// `<status-bar>` is one honest line that elides what does not fit
-    /// (it takes no `wrap`, by design), and a quoted filename cost ~18 of
-    /// the ~65 characters that fit — enough to truncate the part that
-    /// says what to do about it. The file card directly above names the
-    /// file in every state that can fail, so the message explains what
-    /// happened and nothing else.
+    /// These messages do NOT name the file. The `<status-bar>` is one
+    /// honest line that elides what does not fit (it takes no `wrap`, by
+    /// design), and a quoted filename cost ~18 of the ~65 characters that
+    /// fit — enough to truncate the part that says what to do about it.
+    /// The file card directly above names the file in every state that
+    /// can fail, so the message explains what happened and nothing else.
     fn fail(model: *Model, comptime fmt: []const u8, args: anytype) void {
         // A path long enough to overflow 256 bytes is a real input (the
         // path buffer is 4096), so the fallback has to be a message, not
@@ -460,8 +451,8 @@ pub const Model = struct {
 
     /// Wipes the previous run's outputs. Called when a new run starts and
     /// when a new file lands — without it, a fresh pick would keep
-    /// rendering the last file's result lines. Also wipes any Save As note
-    /// (M8): it names a file this call is about to invalidate, and a save
+    /// rendering the last file's result lines. Also wipes any Save As
+    /// note: it names a file this call is about to invalidate, and a save
     /// can never be in flight here — dialogs block the loop, so `smoosh`/a
     /// new pick can only run between rounds, never mid-save.
     fn clearResults(model: *Model) void {
@@ -477,9 +468,8 @@ pub const Model = struct {
         model.save_message_len = 0;
     }
 
-    /// M2 scaffold status line — just enough for the placeholder
-    /// `<status-bar>` to bind to. Later milestones will likely replace this
-    /// with something that also reports sizes/savings once those are real.
+    /// The single line of text `<status-bar>` renders — a Save As note
+    /// takes priority (see below), otherwise one line per `Status`.
     pub fn statusLine(model: *const Model) []const u8 {
         // A Save As note is the freshest thing the user did, so it wins
         // over whatever `status` says — including a stale `.done` warning
@@ -489,8 +479,6 @@ pub const Model = struct {
         // model.
         if (model.save_message_len > 0) return model.saveMessage();
         return switch (model.status) {
-            // M11: "drop" is back — `on_drop` makes it real again, after
-            // M9 dropped the word because drops didn't work yet.
             .idle => "Drop or choose an image to get started.",
             .loading => "Loading…",
             .ready => "Ready to smoosh.",
@@ -507,24 +495,24 @@ pub const Model = struct {
 pub const Msg = union(enum) {
     pick_file, // "Choose Image…" clicked
     dialog_result: native_sdk.EffectHostResult, // host open-dialog callback
-    dropped_file: []const u8, // on_drop callback — a file dragged onto the window (M11)
+    dropped_file: []const u8, // on_drop callback — a file dragged onto the window
     stat_result: native_sdk.EffectHostResult, // host file-size callback -> original_size
     dimensions_result: native_sdk.EffectExit, // `sips -g` source pixel dimensions -> megapixel limit check
     thumbnail_result: native_sdk.EffectExit, // `sips` downscale for the preview
     image_loaded: native_sdk.EffectImageResult, // fx.loadImage callback (registers the preview pixels)
     set_format: Format, // format chip pressed
     smoosh, // "Smoosh" clicked
-    convert_result: native_sdk.EffectExit, // M12: `sips` HEIC->PNG staging callback, shared by both formats
+    convert_result: native_sdk.EffectExit, // `sips` HEIC->PNG staging callback, shared by both formats
     encode_result: native_sdk.EffectExit, // fx.spawn callback, one per format encoded
     encode_size_result: native_sdk.EffectHostResult, // host file-size callback -> avif_size/webp_size
     save_as, // "Save As…" clicked
     save_as_dialog_result: native_sdk.EffectHostResult, // host save-dialog callback
-    // A THIRD host command we bind ourselves, `file.copy` — not
-    // `fx.writeFile`. `fx.writeFile`/`fx.readFile` cap at 1 MiB
-    // (`max_effect_file_bytes`), and a real encoder output can exceed
-    // that (M3 hit the identical bound with the preview, for the same
-    // reason: a bundled-effect ceiling sized for small payloads, not an
-    // arbitrary file). `std.Io.Dir.copyFileAbsolute` has no such cap.
+    // A host command we bind ourselves, `file.copy` — not `fx.writeFile`.
+    // `fx.writeFile`/`fx.readFile` cap at 1 MiB (`max_effect_file_bytes`),
+    // and a real encoder output can exceed that (the same bound the
+    // preview thumbnail load hits, for the same reason: a bundled-effect
+    // ceiling sized for small payloads, not an arbitrary file).
+    // `std.Io.Dir.copyFileAbsolute` has no such cap.
     save_as_result: native_sdk.EffectHostResult, // host copy-file callback
     encoder_check_result: native_sdk.EffectExit, // launch-time `which avifenc`/`which cwebp`
     reset, // clear current image, return to idle
@@ -565,11 +553,11 @@ pub fn formatBytes(arena: std.mem.Allocator, bytes: u64) []const u8 {
 
 /// "−88%" when the output is smaller than the source, "+1% larger" when it
 /// is not. The negative case is REAL, not an error: `test-images/tiny.png`
-/// (312 B) encodes to a 315-byte AVIF, confirmed by running the pinned argv
-/// in M5. PLAN.md asks that this "display sanely rather than as a broken
-/// percentage" — so the sign flips and the word changes, rather than
-/// printing "−-1%". Differences under half a percent round to nothing
-/// meaningful in either direction, so they say so outright.
+/// (312 B) encodes to a 315-byte AVIF with the pinned encoder argv — this
+/// displays sanely rather than as a broken percentage, so the sign flips
+/// and the word changes, rather than printing "−-1%". Differences under
+/// half a percent round to nothing meaningful in either direction, so
+/// they say so outright.
 pub fn formatSavings(arena: std.mem.Allocator, original: u64, output: u64) []const u8 {
     if (original == 0) return "";
     const ratio = @as(f64, @floatFromInt(output)) / @as(f64, @floatFromInt(original));
@@ -613,8 +601,8 @@ const host_file_copy = "file.copy";
 
 /// Absolute so the check does not depend on the inherited PATH — but
 /// `which`'s OWN job is to search that PATH for `avifenc`/`cwebp`, which is
-/// exactly what a real encode spawn (M7) would do resolving argv[0] the
-/// same way, so the check is honest about what it is proving.
+/// exactly what a real encode spawn would do resolving argv[0] the same
+/// way, so the check is honest about what it is proving.
 const which_path = "/usr/bin/which";
 
 /// Where `sips` writes the downscaled preview, resolved once in `main`
@@ -622,7 +610,7 @@ const which_path = "/usr/bin/which";
 /// point it somewhere harmless; `update` only ever reads it.
 pub var thumbnail_path: []const u8 = "";
 
-/// M12: where `sips` stages a HEIC/HEIF source as a PNG before encoding —
+/// Where `sips` stages a HEIC/HEIF source as a PNG before encoding —
 /// `avifenc`/`cwebp` reject HEIC as an INPUT format outright (see
 /// `isHeicSource`), even though `sips` decodes it fine for the preview
 /// above. Resolved once in `main`, same as `thumbnail_path`; `pub var` for
@@ -634,14 +622,15 @@ pub var converted_path: []const u8 = "";
 /// this differs from the raw process environment on a packaged app.
 var spawn_environ: std.process.Environ = .empty;
 
-/// M10: launched from `/Applications`, `avifenc`/`cwebp` presence detection
-/// (M5) failed even with both installed via Homebrew. GUI-launched apps
-/// (Finder/Dock double-click — every packaged `.app`) inherit launchd's
-/// minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), not the interactive-shell
-/// PATH `brew shellenv` adds to `.zshrc`/`.zprofile` — that file only runs
-/// for a login/interactive shell, which `native dev`/`native build` (always
-/// launched from a Terminal) had until now. Every spawned child, `which`
-/// included, inherits this process's OWN environment (`Runtime.Options.environ`,
+/// A GUI-launched app (Finder/Dock double-click — every packaged `.app`,
+/// launched from `/Applications`) inherits launchd's minimal PATH
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`), not the interactive-shell PATH
+/// `brew shellenv` adds to `.zshrc`/`.zprofile` — that file only runs for
+/// a login/interactive shell, which `native dev`/`native build` (always
+/// launched from a Terminal) get but a packaged app never does. Without
+/// this, `avifenc`/`cwebp` presence detection fails even with both
+/// installed via Homebrew. Every spawned child, `which` included, inherits
+/// this process's OWN environment (`Runtime.Options.environ`,
 /// threaded straight into each child — see effects.zig), so the fix is to
 /// widen THAT environment once at launch rather than touch the spawns
 /// themselves. Leaves PATH untouched if Homebrew's bin is already on it
@@ -670,11 +659,11 @@ pub fn resolveSpawnEnviron(gpa: std.mem.Allocator, base: std.process.Environ) !s
 /// i.e. 512x512 exactly — 160x160x4 = 100 KB leaves real headroom.
 const thumbnail_max_edge = "160";
 
-// -------------------------------------------------------- M4: input limits
+// ----------------------------------------------------------- input limits
 //
-// PLAN.md's "Input size limits": 80-100MB / 40-50 megapixels, whichever
-// comes first. Picked the top of both ranges — a local tool should be more
-// permissive than a web upload limit, and the failure mode we are guarding
+// 100 MB / 50 megapixels, whichever comes first — the top of the
+// considered 80-100MB/40-50MP range. A local tool should be more
+// permissive than a web upload limit, and the failure mode being guarded
 // against (exhausting memory on decode) only bites well past either number.
 
 const max_original_bytes: u64 = 100 * 1024 * 1024; // 100 MB
@@ -691,7 +680,7 @@ const Dimensions = struct { width: u32, height: u32 };
 /// that doesn't parse — in particular `sips` prints literal `<nil>` (and
 /// still exits 0) for a non-image or a missing file, which is fine: an
 /// unparseable result just means "dimensions unknown," and the thumbnail
-/// spawn right after is the real format gate (M3).
+/// spawn right after is the real format gate.
 fn parseDimensions(output: []const u8) ?Dimensions {
     var width: ?u32 = null;
     var height: ?u32 = null;
@@ -708,11 +697,11 @@ fn parseDimensions(output: []const u8) ?Dimensions {
     return .{ .width = width.?, .height = height.? };
 }
 
-// ------------------------------------------------------- M5: encoder check
+// ---------------------------------------------------------- encoder check
 //
-// PLAN.md: "Detect presence of avifenc/cwebp at launch. If missing, show
-// which tool is absent and the exact brew install command." `init_fx` is
-// the SDK's boot-command hook — it runs exactly once, on the installing
+// Detects presence of avifenc/cwebp at launch; if either is missing,
+// names which tool and the exact brew install command. `init_fx` is the
+// SDK's boot-command hook — it runs exactly once, on the installing
 // frame, before the first view builds, so a launch that starts missing an
 // encoder shows the error on the very first paint rather than a flash of
 // the normal drop-zone.
@@ -735,13 +724,13 @@ pub fn initFx(model: *Model, fx: *Effects) void {
     });
 }
 
-// ------------------------------------------------------ M7: encode pipeline
+// ---------------------------------------------------------- encode pipeline
 //
-// THE PARTIAL-FAILURE DECISION (PLAN.md's "Open decisions", settled here):
-// in "Both" mode the two encodes are INDEPENDENT. If one succeeds and the
-// other fails, the run is `.done` — the successful format's numbers are
-// shown and the failed one is named in the status bar. Only when NO
-// requested format landed is the run `.failed`.
+// THE PARTIAL-FAILURE DECISION: in "Both" mode the two encodes are
+// INDEPENDENT. If one succeeds and the other fails, the run is `.done` —
+// the successful format's numbers are shown and the failed one is named
+// in the status bar. Only when NO requested format landed is the run
+// `.failed`.
 //
 // The deciding fact is that `avifenc`/`cwebp` write their own output files:
 // by the time WebP's nonzero exit arrives, `photo.avif` is already on disk
@@ -750,29 +739,29 @@ pub fn initFx(model: *Model, fx: *Effects) void {
 // can see. It also makes a missing encoder degrade instead of blocking — a
 // machine with only `avifenc` still gets its AVIF out of a "Both" run.
 //
-// The floor keeps PLAN.md's "Status → error mapping" intact: a run where
-// everything failed is `.failed` with a message, which in single-format mode
-// is just the ordinary failure path — no special case.
+// The floor keeps the "Status → error mapping" invariant intact: a run
+// where everything failed is `.failed` with a message, which in
+// single-format mode is just the ordinary failure path — no special case.
 
 /// ONE encodable output format. `Format.both` is a REQUEST for two of
 /// these; every per-format path below works on this type, never on `Format`,
 /// which is exactly what keeps the two encodes independent.
 const Output = enum { avif, webp };
 
-/// Pinned in M5 by running both against real fixtures (PLAN.md's "Encoder
-/// invocations"). argv[0] is a bare name, not an absolute path: M5's
-/// `which` check proved the PATH resolution these spawns depend on.
+/// Pinned by running both encoders against real fixtures. argv[0] is a
+/// bare name, not an absolute path: the launch-time `which` check proves
+/// the PATH resolution these spawns depend on.
 const avif_quality = "58";
 const avif_speed = "6";
 const webp_quality = "80";
 
-/// M12: true for a `.heic`/`.heif` source (case-insensitive). `avifenc`/
-/// `cwebp` reject HEIC as an INPUT format outright — confirmed in M11 by
-/// running both directly against a real HEIC fixture (PLAN.md's "Known
-/// limitations") — even though `sips` decodes it fine, which is what M3's
-/// preview thumbnail already relies on. `smoosh` uses this to route through
-/// a `sips`-to-PNG staging step first instead of handing the encoders a
-/// container they cannot read. `pub`, matching `formatBytes`/`formatSavings`/
+/// True for a `.heic`/`.heif` source (case-insensitive). `avifenc`/`cwebp`
+/// reject HEIC as an INPUT format outright — confirmed by running both
+/// directly against a real HEIC fixture — even though `sips` decodes it
+/// fine, which is what the preview thumbnail already relies on. `smoosh`
+/// uses this to route through a `sips`-to-PNG staging step first instead
+/// of handing the encoders a container they cannot read. `pub`, matching
+/// `formatBytes`/`formatSavings`/
 /// `resolveSpawnEnviron`'s precedent for a pure helper worth testing
 /// directly rather than only through the full dispatch path.
 pub fn isHeicSource(source_path: []const u8) bool {
@@ -810,10 +799,10 @@ fn outputPathOf(model: *const Model, output: Output) []const u8 {
     };
 }
 
-/// `/a/b/photo.jpg` + `.avif` -> `/a/b/photo.avif` (PLAN.md's "Output
-/// handling": next to the source). The extension search is scoped to the
-/// last path component so a dot in a PARENT directory can never be mistaken
-/// for one; a name with no dot of its own just gets the extension appended.
+/// `/a/b/photo.jpg` + `.avif` -> `/a/b/photo.avif` — the output lands next
+/// to the source. The extension search is scoped to the last path
+/// component so a dot in a PARENT directory can never be mistaken for
+/// one; a name with no dot of its own just gets the extension appended.
 /// Returns null only when the result would not fit the buffer.
 fn outputPath(buffer: []u8, source: []const u8, extension: []const u8) ?[]const u8 {
     const name_start = if (std.mem.lastIndexOfScalar(u8, source, '/')) |slash| slash + 1 else 0;
@@ -834,14 +823,14 @@ fn outputPath(buffer: []u8, source: []const u8, extension: []const u8) ?[]const 
 /// terminates.
 ///
 /// `input_path` is what the encoder actually reads — `model.path()` for an
-/// ordinary source, or M12's `converted_path` when the source is HEIC/HEIF.
-/// The DESTINATION is still always derived from `model.path()` (the real
+/// ordinary source, or `converted_path` when the source is HEIC/HEIF. The
+/// DESTINATION is still always derived from `model.path()` (the real
 /// source name), never from `input_path` — a HEIC `photo.heic` must become
 /// `photo.avif`, not something named after the staging file.
 fn beginEncode(model: *Model, fx: *Effects, output: Output, input_path: []const u8) void {
-    // M5 resolves both checks before any user input is possible; `null`
-    // would mean the boot check never answered, and attempting the spawn
-    // is more useful than refusing on a guess.
+    // The boot-time presence check resolves both before any user input is
+    // possible; `null` would mean it never answered, and attempting the
+    // spawn is more useful than refusing on a guess.
     const encoder_present = switch (output) {
         .avif => model.avifenc_present orelse true,
         .webp => model.cwebp_present orelse true,
@@ -892,8 +881,8 @@ fn beginEncode(model: *Model, fx: *Effects, output: Output, input_path: []const 
 fn failureText(model: *const Model, output: Output, buffer: []u8) []const u8 {
     const label = outputLabel(output);
     return switch (outcomeOf(model, output)) {
-        // PLAN.md error state: encoder binary missing. Same wording as
-        // M5's launch-time check, scoped to the one format that needs it.
+        // Same wording as the launch-time presence check, scoped to the
+        // one format that needs it.
         .missing_encoder => switch (output) {
             .avif => "AVIF needs avifenc. Install with: brew install libavif",
             .webp => "WebP needs cwebp. Install with: brew install webp",
@@ -902,15 +891,15 @@ fn failureText(model: *const Model, output: Output, buffer: []u8) []const u8 {
             .avif => "Skipped AVIF — the source is already an AVIF file.",
             .webp => "Skipped WebP — the source is already a WebP file.",
         },
-        // PLAN.md error state: write to output path failed. Names the
-        // source file, which is also where the output was headed.
+        // Names the source file, which is also where the output was
+        // headed.
         .write_failed => std.fmt.bufPrint(
             buffer,
             "Couldn't save the {s} — check the folder's permissions.",
             .{label},
         ) catch "Couldn't save the compressed file.",
-        // PLAN.md error state: encode failed. Deliberately short and
-        // non-technical; the encoder's stderr is not surfaced in v0.1.
+        // Deliberately short and non-technical; the encoder's stderr is
+        // not surfaced.
         else => std.fmt.bufPrint(buffer, "{s} encoding failed.", .{label}) catch "Encoding failed.",
     };
 }
@@ -946,17 +935,16 @@ fn finishIfComplete(model: *Model) void {
     if (webp_failed) return model.warn("{s}", .{failureText(model, .webp, &webp_buffer)});
 }
 
-// --------------------------------------------------------- M8: Save As
+// -------------------------------------------------------------- Save As
 //
-// PLAN.md: "Wire save_as -> showSaveDialog -> copy the already-produced
-// output(s) to the chosen location. Does not replace auto-save from M7."
+// `save_as` -> `showSaveDialog` -> copy the already-produced output(s) to
+// the chosen location, without touching the auto-saved originals.
 // `showSaveDialog` only ever returns ONE path, and Smoosh can produce two
-// files ("Both"), so this is SEQUENTIAL rather than a folder-picker PLAN
-// never mentions: one save-dialog-then-copy round per landed format, one
-// after another. A user who cancels one round still gets offered the
-// other; only a copy failure is reported as a problem — a cancel is an
-// ordinary "not now", same as `dialog_result`'s cancel-is-not-an-error
-// precedent above.
+// files ("Both"), so this is SEQUENTIAL rather than a folder picker: one
+// save-dialog-then-copy round per landed format, one after another. A
+// user who cancels one round still gets offered the other; only a copy
+// failure is reported as a problem — a cancel is an ordinary "not now",
+// same as `dialog_result`'s cancel-is-not-an-error precedent above.
 
 /// `/a/b/large.avif` -> `large.avif` — the default filename `HostBridge`
 /// hands the save panel. Truncates (silently, via `@min`) rather than
@@ -987,7 +975,7 @@ fn appendSaveNote(model: *Model, comptime fmt: []const u8, args: anytype) void {
 /// Starts the save-dialog round for whatever `save_queue_index` currently
 /// points at. Called by `.save_as` for the first round and by the two
 /// result arms below for every subsequent one — the same "dialogs block
-/// the loop" fact that lets M3's pick chain issue one host request per arm
+/// the loop" fact that lets the pick chain issue one host request per arm
 /// with no staleness guard applies here too, so this needs none either.
 fn beginSaveRound(model: *Model, fx: *Effects) void {
     var name_buf: [128]u8 = undefined;
@@ -1009,7 +997,7 @@ fn advanceSaveQueue(model: *Model, fx: *Effects) void {
     if (model.save_queue_index < model.save_queue_len) beginSaveRound(model, fx);
 }
 
-// ------------------------------------------------------------ M11: drops
+// ------------------------------------------------------------------ drops
 //
 // `UiApp.Options.on_drop` (SDK 0.8.2+, `src/runtime/ui_app.zig:635`),
 // dispatched from `handleRuntimeEvent`'s `.files_dropped` arm against
@@ -1036,7 +1024,7 @@ pub fn onDrop(drop: platform.FileDropEvent) ?Msg {
 
 /// Starts the load chain for a path that just arrived — from the open
 /// panel (`.dialog_result`'s ok branch) or a real window drop
-/// (`.dropped_file`, M11). Both land here because the chain itself doesn't
+/// (`.dropped_file`). Both land here because the chain itself doesn't
 /// care where the path came from: `stat_result` -> `dimensions_result` ->
 /// `thumbnail_result` -> `image_loaded` -> `.ready` is the same either way.
 fn beginLoad(model: *Model, fx: *Effects, path: []const u8) void {
@@ -1044,7 +1032,7 @@ fn beginLoad(model: *Model, fx: *Effects, path: []const u8) void {
     model.setPath(path);
     // A new file invalidates the previous file's outputs and preview —
     // see `clearResults`/`clearPreview`'s own doc comments for why each
-    // exists (M7/M9 respectively).
+    // exists.
     model.clearResults();
     model.clearPreview();
     fx.hostRequest(.{
@@ -1076,9 +1064,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             beginLoad(model, fx, result.bytes);
         },
 
-        // M11: a real drag onto the window. `onDrop` (pure, no model
-        // access) already reduced the drop to one path; from here it is
-        // the exact same chain a dialog pick starts — a picked-file and a
+        // A real drag onto the window. `onDrop` (pure, no model access)
+        // already reduced the drop to one path; from here it is the exact
+        // same chain a dialog pick starts — a picked-file and a
         // dropped-file are indistinguishable to `update` past this point.
         .dropped_file => |dropped_path| beginLoad(model, fx, dropped_path),
 
@@ -1088,11 +1076,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             else
                 null;
             model.original_size = size orelse {
-                // PLAN.md error state: "write/read to path failed".
+                // The file could not be read.
                 return model.fail("Can't read that file.", .{});
             };
             if (model.original_size > max_original_bytes) {
-                // PLAN.md error state: input exceeds the size/megapixel limit.
+                // Input exceeds the byte-size limit.
                 return model.fail(
                     "That file is {d:.1} MB — Smoosh handles files up to {d:.0} MB.",
                     .{ bytesToMb(model.original_size), bytesToMb(max_original_bytes) },
@@ -1127,7 +1115,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 const megapixels = @as(f64, @floatFromInt(dims.width)) *
                     @as(f64, @floatFromInt(dims.height)) / 1_000_000.0;
                 if (megapixels > max_source_megapixels) {
-                    // PLAN.md error state: input exceeds the size/megapixel limit.
+                    // Input exceeds the megapixel limit.
                     return model.fail(
                         "That image is {d:.0} megapixels — the limit is {d:.0} MP.",
                         .{ megapixels, max_source_megapixels },
@@ -1160,7 +1148,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // terminal, indistinguishable from a genuine failure.
             if (model.status != .loading) return;
             if (exit.reason != .exited or exit.code != 0) {
-                // PLAN.md error state: unsupported/undecodable input.
+                // Unsupported or undecodable input.
                 return model.fail(
                     "Not an image Smoosh can read. Try JPEG, PNG, HEIC or WebP.",
                     .{},
@@ -1219,7 +1207,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 
             model.clearResults();
             model.status = .compressing;
-            // M12: HEIC/HEIF cannot go to the encoders directly (see
+            // HEIC/HEIF cannot go to the encoders directly (see
             // `isHeicSource`) — stage it as a PNG first, ONE shared spawn
             // for whichever format(s) were requested, rather than one per
             // format. `.pending` on each requested outcome is the same
@@ -1256,7 +1244,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // concatenate the identical message twice in "Both" mode.
                 // Nothing landed either way, so `.failed` is correct here
                 // regardless of how many formats were requested (the same
-                // "all-failed floor" M7 already established).
+                // all-failed floor the single-encoder path already uses).
                 if (model.avif_outcome == .pending) setOutcome(model, .avif, .convert_failed);
                 if (model.webp_outcome == .pending) setOutcome(model, .webp, .convert_failed);
                 return model.fail("Couldn't prepare that HEIC file for encoding.", .{});
@@ -1282,9 +1270,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return finishIfComplete(model);
             }
             // A zero exit is not yet a result: the output's SIZE is half of
-            // what M7 has to show. `file.stat` (M3's own host command, kept
-            // separate for exactly this reuse — PLAN.md M3) answers it, and
-            // its failure is also how a file that never landed is caught.
+            // what the UI has to show. `file.stat` (a host command kept
+            // separate for exactly this reuse) answers it, and its failure
+            // is also how a file that never landed is caught.
             fx.hostRequest(.{
                 .key = switch (output) {
                     .avif => avif_stat_key,
@@ -1368,9 +1356,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (result.ok) {
                 appendSaveNote(model, "Saved {s}.", .{outputLabel(output)});
             } else {
-                // PLAN.md error state: write to output path failed — the
-                // same family of failure as M7's own write step, just at a
-                // user-chosen destination instead of next to the source.
+                // The same family of failure as the auto-save write step,
+                // just at a user-chosen destination instead of next to
+                // the source.
                 appendSaveNote(model, "Couldn't save {s} — check the folder's permissions.", .{outputLabel(output)});
             }
             advanceSaveQueue(model, fx);
@@ -1388,10 +1376,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const avifenc_present = model.avifenc_present orelse return;
             const cwebp_present = model.cwebp_present orelse return;
             if (avifenc_present and cwebp_present) return;
-            // PLAN.md error state: encoder binary missing. Three distinct
-            // messages (not one templated over a joined tool list) so each
-            // names the exact `brew install` command for what is actually
-            // missing.
+            // Three distinct messages (not one templated over a joined
+            // tool list) so each names the exact `brew install` command
+            // for what is actually missing.
             if (!avifenc_present and !cwebp_present) {
                 return model.fail(
                     "Smoosh needs avifenc and cwebp to compress images. Install with: brew install libavif webp",
@@ -1468,8 +1455,9 @@ const HostBridge = struct {
     }
 
     /// The source file's byte size as decimal text. `update` needs it for
-    /// `original_size` (and M7 for the before/after delta), and a stat is
-    /// far too cheap to deserve a worker thread or a `stat(1)` spawn.
+    /// `original_size` (and the before/after delta after an encode), and
+    /// a stat is far too cheap to deserve a worker thread or a `stat(1)`
+    /// spawn.
     fn fileSize(self: *HostBridge, key: u64, path: []const u8) void {
         const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch |err| {
             return self.reply(key, false, @errorName(err));
@@ -1478,7 +1466,7 @@ const HostBridge = struct {
         self.reply(key, true, text);
     }
 
-    /// M8's save panel. `payload` is a bare default filename (e.g.
+    /// The save panel. `payload` is a bare default filename (e.g.
     /// "large.avif") — no filter list, unlike the open panel: the
     /// destination already carries the right extension via `default_name`,
     /// and the user is free to rename, so there is nothing worth
@@ -1498,8 +1486,8 @@ const HostBridge = struct {
     /// `payload` is `"<source>\n<destination>"` — the same newline-joined
     /// shape the SDK's own multi-path open-dialog results use. Unbounded,
     /// unlike `fx.writeFile`/`fx.readFile` (capped at `max_effect_file_bytes`,
-    /// 1 MiB): a real encoder output can exceed that, the same bound M3 hit
-    /// with the source image itself.
+    /// 1 MiB): a real encoder output can exceed that, the same bound the
+    /// source image itself hits going through those effects.
     fn copyFile(self: *HostBridge, key: u64, payload: []const u8) void {
         const sep = std.mem.indexOfScalar(u8, payload, '\n') orelse {
             return self.reply(key, false, "malformed copy request");
@@ -1528,9 +1516,9 @@ const HostBridge = struct {
 /// DECODED RGBA (`max_registered_canvas_image_pixel_bytes`, i.e. 512x512)
 /// and `fx.loadImage` refuses encoded sources past 1.25 MiB, so no real
 /// photo can ever be registered directly. `sips -Z 160` downscales into
-/// this path first; `fx.loadImage` then reads THAT. See PLAN.md M3.
+/// this path first; `fx.loadImage` then reads THAT.
 ///
-/// Shared by `thumbnail_path` and M12's `converted_path` — same app-temp-dir
+/// Shared by `thumbnail_path` and `converted_path` — same app-temp-dir
 /// resolution, different filename. `dir_buf`/`path_buf` are caller-owned
 /// (not function-local statics) on purpose: this runs twice at startup, and
 /// both resolved paths must stay valid simultaneously, so they cannot share
