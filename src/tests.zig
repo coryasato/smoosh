@@ -538,6 +538,11 @@ const App = native_sdk.UiApp(Model, Msg);
 /// outright and the rejection would mask what the test is checking.
 const test_thumbnail_path = "/tmp/smoosh-tests/preview.png";
 
+/// M12's counterpart to `test_thumbnail_path` — where `main.converted_path`
+/// points during tests. Same reasoning: the staging spawn is faked, but the
+/// path still flows into a real encode spawn's argv, which tests assert on.
+const test_converted_path = "/tmp/smoosh-tests/converted.png";
+
 const Harness = struct {
     harness: *native_sdk.TestHarness(),
     app_state: *App,
@@ -559,6 +564,7 @@ const Harness = struct {
     /// else goes through `create`.
     fn createBare() !Harness {
         main.thumbnail_path = test_thumbnail_path;
+        main.converted_path = test_converted_path;
 
         const size = geometry.SizeF.init(main.window_width, main.window_height);
         const harness = try native_sdk.TestHarness().create(testing.allocator, .{ .size = size });
@@ -742,6 +748,14 @@ const Harness = struct {
     fn encodeOk(self: *Harness, program: []const u8, extension: []const u8, size: []const u8) !void {
         try self.encodeExit(program, 0);
         try self.encodeSize(extension, true, size);
+    }
+
+    /// M12's HEIC->PNG staging spawn — ONE per run regardless of how many
+    /// formats were requested, unlike the per-format encode spawns above.
+    fn convertExit(self: *Harness, code: i32) !void {
+        const request = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+        try self.fx().feedExit(request.key, code);
+        try self.drain();
     }
 
     // -------------------------------------------------------- M8: Save As
@@ -1595,6 +1609,157 @@ test "the output path replaces the source extension, not a dot in a parent direc
         "/Users/someone/my.photos/holiday.avif",
         spawn.argv[spawn.argv.len - 1],
     );
+}
+
+// -------------------------------------------------------- M12: HEIC input
+//
+// `avifenc`/`cwebp` reject HEIC as an INPUT format outright (confirmed live
+// in M11 — see PLAN.md's "Known limitations"), even though `sips` decodes
+// it fine for the preview. `smoosh` routes a HEIC/HEIF source through ONE
+// shared `sips`-to-PNG staging spawn first; both encoders then read the
+// staged PNG instead of the original file.
+
+const photo_heic = "/Users/someone/Pictures/photo.heic";
+const photo_heic_bytes = "2202009";
+
+test "isHeicSource matches .heic/.heif case-insensitively and nothing else" {
+    try testing.expect(main.isHeicSource("photo.heic"));
+    try testing.expect(main.isHeicSource("/a/b/PHOTO.HEIC"));
+    try testing.expect(main.isHeicSource("photo.heif"));
+    try testing.expect(main.isHeicSource("photo.HEIF"));
+    try testing.expect(!main.isHeicSource("photo.jpg"));
+    try testing.expect(!main.isHeicSource("photo"));
+    try testing.expect(!main.isHeicSource(""));
+    // A dot in a parent directory, no extension of its own — the same
+    // hazard `outputPath` guards against, checked here too.
+    try testing.expect(!main.isHeicSource("/a/my.photos/holiday"));
+}
+
+test "a HEIC source stages a sips conversion before either encoder runs" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(photo_heic, photo_heic_bytes);
+    try h.send(.smoosh);
+
+    try testing.expectEqual(Status.compressing, h.model().status);
+    // The staging spawn only — the encoder has not started yet.
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+    const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
+    const expected_argv = [_][]const u8{
+        "/usr/bin/sips", "-s", "format", "png", photo_heic, "--out", test_converted_path,
+    };
+    try testing.expectEqual(expected_argv.len, spawn.argv.len);
+    for (expected_argv, spawn.argv) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+
+    try h.convertExit(0);
+
+    // Now the real encode is pending, reading the STAGED path but writing
+    // next to the ORIGINAL source — never a file named after the staging
+    // file.
+    const encode = h.encodeSpawn("avifenc") orelse return error.NoSpawn;
+    const expected_encode_argv = [_][]const u8{
+        "avifenc",          "-q",     "58", "--speed",
+        "6",                 test_converted_path,
+        "/Users/someone/Pictures/photo.avif",
+    };
+    try testing.expectEqual(expected_encode_argv.len, encode.argv.len);
+    for (expected_encode_argv, encode.argv) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+
+    try h.encodeOk("avifenc", ".avif", "204800");
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().hasAvifResult());
+}
+
+test "Both formats share one HEIC conversion spawn, not one each" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(photo_heic, photo_heic_bytes);
+    try h.send(.smoosh);
+
+    // ONE staging spawn for the whole run, not one per requested format.
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+    try h.convertExit(0);
+
+    // Both encodes now pending, both reading the staged path.
+    try testing.expectEqual(@as(usize, 2), h.fx().pendingSpawnCount());
+    const avif = h.encodeSpawn("avifenc") orelse return error.NoSpawn;
+    const webp = h.encodeSpawn("cwebp") orelse return error.NoSpawn;
+    try testing.expectEqualStrings(test_converted_path, avif.argv[avif.argv.len - 2]);
+    try testing.expectEqualStrings(test_converted_path, webp.argv[webp.argv.len - 3]);
+
+    try h.encodeOk("avifenc", ".avif", "204800");
+    try h.encodeOk("cwebp", ".webp", "184320");
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().hasAvifResult());
+    try testing.expect(h.model().hasWebpResult());
+}
+
+test "a failed HEIC conversion fails the run without ever spawning the encoder" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(photo_heic, photo_heic_bytes);
+    try h.send(.smoosh);
+    try h.convertExit(1);
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expectEqualStrings(
+        "Couldn't prepare that HEIC file for encoding.",
+        h.model().errorMessage(),
+    );
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
+    try testing.expect(!h.model().hasAvifResult());
+}
+
+test "a failed HEIC conversion in Both mode fails once, not with a doubled message" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(photo_heic, photo_heic_bytes);
+    try h.send(.smoosh);
+    try h.convertExit(1);
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    // The staging failure is ONE shared cause, not two independent encoder
+    // failures — the message must not repeat itself the way M7's per-format
+    // join would for two genuinely different failures.
+    try testing.expectEqualStrings(
+        "Couldn't prepare that HEIC file for encoding.",
+        h.model().errorMessage(),
+    );
+}
+
+test "a HEIC conversion result that lands after reset is ignored" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(photo_heic, photo_heic_bytes);
+    try h.send(.smoosh);
+    const staging_key = (h.fx().pendingSpawnAt(0) orelse return error.NoSpawn).key;
+
+    try h.send(.reset);
+    try h.drain();
+    try testing.expectEqual(Status.idle, h.model().status);
+
+    // The real hazard: a stale terminal for the CANCELLED staging spawn
+    // arriving anyway (a race the effects channel itself does not fully
+    // close — same reasoning as the pre-existing `.encode_result` guard).
+    // Dispatched directly, bypassing `fx` entirely, the same technique M8's
+    // dead-code guards used, since this is the only way to actually reach
+    // the arm with the model already reset out of `.compressing`.
+    try h.send(.{ .convert_result = .{ .key = staging_key, .code = 1, .reason = .exited } });
+
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqualStrings("", h.model().errorMessage());
+    try testing.expect(!h.model().hasAvifResult());
 }
 
 // ------------------------------------------------------------- reporting

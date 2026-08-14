@@ -130,11 +130,16 @@ pub const EncodeOutcome = enum {
     /// The encoder claimed success but the output could not be stat'd —
     /// PLAN.md's "write to output path failed" state.
     write_failed,
+    /// M12: the shared HEIC->PNG staging step (`sips`) failed or the source
+    /// vanished between pick and encode, so the encoder for this format
+    /// never even ran. Distinct from `encode_failed` because the encoder
+    /// itself is not what failed.
+    convert_failed,
 
     fn isFailure(outcome: EncodeOutcome) bool {
         return switch (outcome) {
             .none, .pending, .ok => false,
-            .missing_encoder, .same_path, .encode_failed, .write_failed => true,
+            .missing_encoder, .same_path, .encode_failed, .write_failed, .convert_failed => true,
         };
     }
 };
@@ -509,6 +514,7 @@ pub const Msg = union(enum) {
     image_loaded: native_sdk.EffectImageResult, // fx.loadImage callback (registers the preview pixels)
     set_format: Format, // format chip pressed
     smoosh, // "Smoosh" clicked
+    convert_result: native_sdk.EffectExit, // M12: `sips` HEIC->PNG staging callback, shared by both formats
     encode_result: native_sdk.EffectExit, // fx.spawn callback, one per format encoded
     encode_size_result: native_sdk.EffectHostResult, // host file-size callback -> avif_size/webp_size
     save_as, // "Save As…" clicked
@@ -532,6 +538,7 @@ pub const Msg = union(enum) {
         "dimensions_result",
         "thumbnail_result",
         "image_loaded",
+        "convert_result",
         "encode_result",
         "encode_size_result",
         "save_as_dialog_result",
@@ -595,6 +602,7 @@ const avif_stat_key: u64 = 10;
 const webp_stat_key: u64 = 11;
 const save_dialog_key: u64 = 12;
 const save_copy_key: u64 = 13;
+const heic_convert_key: u64 = 14;
 
 /// Host-call names our own `HostBridge` answers (see `main`). Not SDK
 /// vocabulary — we bind the seam, so we name it.
@@ -613,6 +621,13 @@ const which_path = "/usr/bin/which";
 /// (see the "Preview is a thumbnail" note there). `pub var` so tests can
 /// point it somewhere harmless; `update` only ever reads it.
 pub var thumbnail_path: []const u8 = "";
+
+/// M12: where `sips` stages a HEIC/HEIF source as a PNG before encoding —
+/// `avifenc`/`cwebp` reject HEIC as an INPUT format outright (see
+/// `isHeicSource`), even though `sips` decodes it fine for the preview
+/// above. Resolved once in `main`, same as `thumbnail_path`; `pub var` for
+/// the same test reason.
+pub var converted_path: []const u8 = "";
 
 /// The environment every `fx.spawn` child inherits (bound once, at launch,
 /// into `Runtime.Options.environ`) — see `resolveSpawnEnviron` below for why
@@ -751,6 +766,22 @@ const avif_quality = "58";
 const avif_speed = "6";
 const webp_quality = "80";
 
+/// M12: true for a `.heic`/`.heif` source (case-insensitive). `avifenc`/
+/// `cwebp` reject HEIC as an INPUT format outright — confirmed in M11 by
+/// running both directly against a real HEIC fixture (PLAN.md's "Known
+/// limitations") — even though `sips` decodes it fine, which is what M3's
+/// preview thumbnail already relies on. `smoosh` uses this to route through
+/// a `sips`-to-PNG staging step first instead of handing the encoders a
+/// container they cannot read. `pub`, matching `formatBytes`/`formatSavings`/
+/// `resolveSpawnEnviron`'s precedent for a pure helper worth testing
+/// directly rather than only through the full dispatch path.
+pub fn isHeicSource(source_path: []const u8) bool {
+    const name_start = if (std.mem.lastIndexOfScalar(u8, source_path, '/')) |slash| slash + 1 else 0;
+    const dot = std.mem.lastIndexOfScalar(u8, source_path[name_start..], '.') orelse return false;
+    const ext = source_path[name_start + dot + 1 ..];
+    return std.ascii.eqlIgnoreCase(ext, "heic") or std.ascii.eqlIgnoreCase(ext, "heif");
+}
+
 fn outputLabel(output: Output) []const u8 {
     return switch (output) {
         .avif => "AVIF",
@@ -801,7 +832,13 @@ fn outputPath(buffer: []u8, source: []const u8, extension: []const u8) ?[]const 
 /// Starts one format, or records why it could not start. Every path out of
 /// here leaves the format's outcome non-`.none`, so the join below always
 /// terminates.
-fn beginEncode(model: *Model, fx: *Effects, output: Output) void {
+///
+/// `input_path` is what the encoder actually reads — `model.path()` for an
+/// ordinary source, or M12's `converted_path` when the source is HEIC/HEIF.
+/// The DESTINATION is still always derived from `model.path()` (the real
+/// source name), never from `input_path` — a HEIC `photo.heic` must become
+/// `photo.avif`, not something named after the staging file.
+fn beginEncode(model: *Model, fx: *Effects, output: Output, input_path: []const u8) void {
     // M5 resolves both checks before any user input is possible; `null`
     // would mean the boot check never answered, and attempting the spawn
     // is more useful than refusing on a guess.
@@ -839,8 +876,8 @@ fn beginEncode(model: *Model, fx: *Effects, output: Output) void {
             .webp => webp_encode_key,
         },
         .argv = switch (output) {
-            .avif => &.{ "avifenc", "-q", avif_quality, "--speed", avif_speed, model.path(), destination },
-            .webp => &.{ "cwebp", "-q", webp_quality, model.path(), "-o", destination },
+            .avif => &.{ "avifenc", "-q", avif_quality, "--speed", avif_speed, input_path, destination },
+            .webp => &.{ "cwebp", "-q", webp_quality, input_path, "-o", destination },
         },
         // `.collect` rather than `.lines`: the encoders' progress output is
         // of no use to the UI, and collect is the mode that also delivers
@@ -1157,6 +1194,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.cancel(dimensions_key);
             fx.cancel(thumbnail_key);
             fx.cancel(preview_image_id);
+            fx.cancel(heic_convert_key);
             fx.cancel(avif_encode_key);
             fx.cancel(webp_encode_key);
             fx.cancel(avif_stat_key);
@@ -1181,11 +1219,50 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 
             model.clearResults();
             model.status = .compressing;
+            // M12: HEIC/HEIF cannot go to the encoders directly (see
+            // `isHeicSource`) — stage it as a PNG first, ONE shared spawn
+            // for whichever format(s) were requested, rather than one per
+            // format. `.pending` on each requested outcome is the same
+            // marker `beginEncode` itself would set; `.convert_result`
+            // reads it back to know which formats to actually start.
+            if (isHeicSource(model.path())) {
+                if (model.format != .webp) model.avif_outcome = .pending;
+                if (model.format != .avif) model.webp_outcome = .pending;
+                fx.spawn(.{
+                    .key = heic_convert_key,
+                    .argv = &.{ "/usr/bin/sips", "-s", "format", "png", model.path(), "--out", converted_path },
+                    .output = .collect,
+                    .on_exit = Effects.exitMsg(.convert_result),
+                });
+                return;
+            }
             // Two independent encodes, not one operation with two steps.
-            if (model.format != .webp) beginEncode(model, fx, .avif);
-            if (model.format != .avif) beginEncode(model, fx, .webp);
+            if (model.format != .webp) beginEncode(model, fx, .avif, model.path());
+            if (model.format != .avif) beginEncode(model, fx, .webp, model.path());
             // Every requested format may have short-circuited (both
             // encoders missing), in which case the run is already over.
+            finishIfComplete(model);
+        },
+
+        .convert_result => |exit| {
+            // Same staleness hazard as the rest of the encode chain:
+            // `.reset` cancels this spawn too.
+            if (model.status != .compressing) return;
+            if (exit.reason != .exited or exit.code != 0) {
+                // The staging step is ONE shared prerequisite for whichever
+                // formats were requested, not two independent encoder
+                // failures — fail directly with one sentence rather than
+                // routing through `finishIfComplete`, which would
+                // concatenate the identical message twice in "Both" mode.
+                // Nothing landed either way, so `.failed` is correct here
+                // regardless of how many formats were requested (the same
+                // "all-failed floor" M7 already established).
+                if (model.avif_outcome == .pending) setOutcome(model, .avif, .convert_failed);
+                if (model.webp_outcome == .pending) setOutcome(model, .webp, .convert_failed);
+                return model.fail("Couldn't prepare that HEIC file for encoding.", .{});
+            }
+            if (model.avif_outcome == .pending) beginEncode(model, fx, .avif, converted_path);
+            if (model.webp_outcome == .pending) beginEncode(model, fx, .webp, converted_path);
             finishIfComplete(model);
         },
 
@@ -1452,11 +1529,20 @@ const HostBridge = struct {
 /// and `fx.loadImage` refuses encoded sources past 1.25 MiB, so no real
 /// photo can ever be registered directly. `sips -Z 160` downscales into
 /// this path first; `fx.loadImage` then reads THAT. See PLAN.md M3.
-fn resolveThumbnailPath(io: std.Io, environ: std.process.Environ) ![]const u8 {
+///
+/// Shared by `thumbnail_path` and M12's `converted_path` — same app-temp-dir
+/// resolution, different filename. `dir_buf`/`path_buf` are caller-owned
+/// (not function-local statics) on purpose: this runs twice at startup, and
+/// both resolved paths must stay valid simultaneously, so they cannot share
+/// backing storage the way a function-local `var` would force them to.
+fn resolveAppTempPath(
+    io: std.Io,
+    environ: std.process.Environ,
+    filename: []const u8,
+    dir_buf: []u8,
+    path_buf: []u8,
+) ![]const u8 {
     const State = struct {
-        var dir_buf: [platform.max_dialog_path_bytes]u8 = undefined;
-        var path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
-
         /// `getPosix` hands back a sentinel slice; `app_dirs.Env` wants a
         /// plain one, and the optional blocks the implicit coercion.
         fn env(block: std.process.Environ, key: []const u8) ?[]const u8 {
@@ -1469,11 +1555,16 @@ fn resolveThumbnailPath(io: std.Io, environ: std.process.Environ) ![]const u8 {
         app_dirs.currentPlatform(),
         .{ .home = State.env(environ, "HOME"), .tmpdir = State.env(environ, "TMPDIR") },
         .temp,
-        &State.dir_buf,
+        dir_buf,
     );
     try std.Io.Dir.cwd().createDirPath(io, dir);
-    return app_dirs.join(app_dirs.currentPlatform(), &State.path_buf, &.{ dir, "preview.png" });
+    return app_dirs.join(app_dirs.currentPlatform(), path_buf, &.{ dir, filename });
 }
+
+var thumbnail_dir_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+var thumbnail_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+var converted_dir_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+var converted_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
 
 pub fn main(init: std.process.Init) !void {
     const app_info: platform.AppInfo = .{
@@ -1534,7 +1625,8 @@ pub fn main(init: std.process.Init) !void {
         .environ = spawn_environ,
     });
 
-    thumbnail_path = try resolveThumbnailPath(init.io, spawn_environ);
+    thumbnail_path = try resolveAppTempPath(init.io, spawn_environ, "preview.png", &thumbnail_dir_buf, &thumbnail_path_buf);
+    converted_path = try resolveAppTempPath(init.io, spawn_environ, "converted.png", &converted_dir_buf, &converted_path_buf);
 
     var bridge = HostBridge{ .runtime = runtime, .app_state = app_state, .io = init.io };
     app_state.effects.bindHostCalls(.{

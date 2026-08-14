@@ -121,7 +121,7 @@ For a hand-authored root, window geometry is stated three times and all three mu
   about behavior.
 
 ## Current status
-**M1-M11 done — v0.1 ships, with real file drops on top.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
+**M1-M12 done — v0.1 ships, with real file drops and working HEIC encode on top.** M1: skeleton launches to a blank window. M2: real `Model`/`Msg` (no-op `update`) and
 an ugly-but-complete `src/app.native` every later milestone can drive via `native automate`;
 `test-images/` fixtures created. M2a: `src/tests.zig` — the tier-1 harness (markup builds, dispatch,
 chip payload coercion, model accessors) later milestones extend. M3: the real pick chain —
@@ -197,9 +197,10 @@ helper. `app.zon` gained the real `"file_drops"` capability. `native build`/`che
 (93/93 tests, zero warnings); live, a hand-dragged `photo.heic` landed in `.ready` correctly (drops
 cannot be automated at all, unlike dialogs — a different constraint, same "ask the user" answer), and a
 hand-dragged `large.jpg` smooshed end to end to the exact numbers M7's own check recorded. Full writeup
-in PLAN.md's M11 entry. **Known limitation found along the way, not yet fixed:** HEIC input cannot
-actually be encoded (`avifenc`/`cwebp` reject it as an input format outright, though `sips` decodes it
-fine for the preview) — see PLAN.md's new "Known limitations" section for the two candidate fixes.
+in PLAN.md's M11 entry. **Known limitation found along the way, fixed in M12:** HEIC input could not be
+encoded (`avifenc`/`cwebp` reject it as an input format outright, though `sips` decodes it fine for the
+preview) — M12 stages a `sips`-to-PNG conversion ahead of the encode when the source is HEIC/HEIF. Full
+writeup in PLAN.md's M12 entry.
 **`PLAN.md` is the source of truth** for milestones,
 locked decisions, per-milestone model/session guidance, and open questions. Do not restate its
 contents here — link to it.

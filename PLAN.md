@@ -870,16 +870,66 @@ before touching anything else, not assumed. `native test` **93/93 pass** and `na
 **zero** warnings on 0.9.0 — no code changes needed. No pinned SDK version in the tree to bump (no
 `build.zig.zon`), so this was purely reinstalling the global CLI.
 
-## Milestones — v0.2 (planned, not started)
+## Milestones — v0.2
 
-**M12 — HEIC encode gap.** *(not started)* — see "Known limitations" below for the full writeup.
-`avifenc`/`cwebp` reject HEIC as an input format even though the app accepts, previews, and names HEIC
-files correctly through every stage up to the encode itself. Two candidate fixes are already scoped
-there (narrow the accepted-formats promise vs. convert-to-PNG-via-`sips` first); neither is chosen yet
-— that's the first decision a session picking this up needs to make, not further investigation. The
-`photo.heic` fixture already exists (`test-images/`, made in M2) and the failure is already reproduced
-live (M11's entry). Phase B (native decode) would make this moot outright, so whichever Phase A fix
-gets picked here should stay small rather than gold-plated.
+**M12 — HEIC encode gap.** *(share M11's reasoning, no new investigation needed)* [fixes the encode
+half of "Accept common raster formats"] — **DONE**
+Chose the "fix it in Phase A" direction over narrowing the promise (PLAN's own tradeoff, decided this
+session): `smoosh` now stages a HEIC/HEIF source as a PNG via `sips` before either encoder runs, and
+both encoders read the staged PNG instead of the original file. `avifenc`/`cwebp` never see a HEIC
+container at all.
+Settled/found here:
+- **ONE shared staging spawn per run, not one per format.** "Both" mode would otherwise pay for the
+  same `sips` conversion twice. `.smoosh` marks whichever outcomes were requested `.pending` (the same
+  marker `beginEncode` itself would set) and fires a single `heic_convert_key` spawn; `.convert_result`
+  reads those `.pending` markers back to know which format(s) to actually start once the PNG lands.
+- **The destination path still derives from the ORIGINAL source name, never the staging file.**
+  `beginEncode` gained an `input_path` parameter — what the encoder reads — kept strictly separate from
+  `model.path()`, which `outputPath`/the `same_path` check still use exclusively. A HEIC `photo.heic`
+  becomes `photo.avif`, not something named after `converted.png`.
+- **A conversion failure is ONE direct `.fail`, not a run through `finishIfComplete`.** Unlike M7's two
+  genuinely independent encoders, the staging step is a single shared prerequisite — if it fails,
+  neither requested format could ever have started, so there is no partial-success case to preserve.
+  Routing it through the per-format join would have concatenated the identical sentence twice in "Both"
+  mode ("Couldn't prepare that HEIC file for encoding. Couldn't prepare that HEIC file for encoding.");
+  failing directly in `.convert_result` avoids that duplication and is still consistent with M7's
+  all-failed floor (nothing landed, so `.failed` is correct either way). A new `EncodeOutcome.convert_failed`
+  keeps the outcome fields non-`.pending` afterward for consistency, even though this path never reads
+  `failureText` for it.
+- **`resolveThumbnailPath` became `resolveAppTempPath`, parameterized on filename and caller-owned
+  buffers**, not left as a single-purpose function duplicated for the new `converted_path`. The original
+  used function-local `var` statics sized for exactly one call at startup; calling the same function
+  twice for two paths that must both stay valid simultaneously would have aliased them onto the same
+  backing memory — caught before it shipped, not found live, by reasoning through where the static
+  storage actually lives.
+- **A live mutation-testing gap, found and closed this session**: the first version of "a HEIC
+  conversion result that lands after reset is ignored" only checked model state right after `.reset`,
+  which zeroes `status` unconditionally regardless of whether the new `fx.cancel(heic_convert_key)` line
+  was even present — removing that line left the test green. The same latent weakness exists in the
+  pre-existing (M7) "an encode result that lands after reset is ignored" test, confirmed by the same
+  removal-doesn't-fail experiment against `avif_encode_key`'s cancel. Fixed for M12's own test by
+  dispatching a synthetic stale `.convert_result` directly (bypassing `fx` entirely, M8's dead-code-guard
+  technique) after reset and asserting it changes nothing — this version does fail when the `status !=
+  .compressing` guard is removed. The pre-existing M7 test was left as-is (out of scope for this
+  milestone), but a future session touching that guard should know the test does not currently prove it.
+- `pub fn isHeicSource` (case-insensitive `.heic`/`.heif`), matching `formatBytes`/`formatSavings`/
+  `resolveSpawnEnviron`/`onDrop`'s standing precedent for a pure helper worth unit-testing directly.
+*Verified:* `native test` 99/99 (6 new: `isHeicSource`'s case-insensitivity and non-matches including the
+dot-in-parent-directory hazard `outputPath` already guards against, a single-format HEIC run's full argv
+pinned at both the staging and encode spawns, "Both" sharing exactly one staging spawn then two encodes
+both reading the staged path, a single-format conversion failure with no encoder ever spawned, a "Both"
+conversion failure producing the message exactly once, and the reset/stale-result guard above). Every
+mutation applied to the new logic was caught, including the one that needed the test rewritten first (see
+above) — same discipline as M7/M8/M11. `native check` clean at zero warnings, `native build` clean.
+*Live, against `native dev`, real fixtures:* hand-verified the raw pipeline first (`sips -s format png
+test-images/photo.heic --out /tmp/....png` then both `avifenc`/`cwebp` against that PNG, both exit 0) before
+touching the app, to confirm the shape of the fix independent of any wiring bug. Then a hand-dragged
+`test-images/photo.heic` (M11's drop path) landed in `.ready` at "Original 2.2 MB"; selecting "Both" and
+pressing Smoosh (via `native automate widget-click`, fair game once a file has loaded) produced `AVIF
+639.8 KB −72%` / `WebP 589.9 KB −74%` and status "Done." with `dispatch_errors=0`. `test-images/photo.avif`
+(655,145 B) and `test-images/photo.webp` (604,060 B) landed on disk — byte-identical to the by-hand
+verification run moments earlier, confirming the app's spawn wiring matches the hand-run command exactly.
+This closes the "Known limitation" M11 left open; see below.
 
 ## Open decisions
 - ~~Partial failure in "Both" mode: report success-with-warning, or fail the whole operation?~~
@@ -898,28 +948,10 @@ gets picked here should stay small rather than gold-plated.
 
 ## Known limitations
 
-- **HEIC input cannot be encoded to AVIF or WebP.** *(tracked as M12, above — not started.)* `avifenc`/`cwebp` (Phase A's system tools) reject
-  `.heic`/`.heif` outright as an INPUT format — confirmed by running both directly against
-  `test-images/photo.heic`: `avifenc` says "Unrecognized file format for input file", `cwebp` says
-  "Cannot read input picture file". A HEIC picks, drops, and previews correctly (`sips` decodes it fine
-  for the thumbnail — see M3), and the file card names and sizes it correctly, so nothing looks wrong
-  until Smoosh is pressed, where it fails every time with "AVIF encoding failed." / "WebP encoding
-  failed.", regardless of whether the file arrived via the open dialog or a window drop (confirmed live
-  for both paths in M11's entry above).
-  - **This makes existing copy inaccurate, not just the encode itself.** PLAN's own "Accept common
-    raster formats" line names HEIC as accepted, the open-dialog's file filter offers `.heic`/`.heif`,
-    `test-images/photo.heic` exists specifically to exercise it (M2), and M9's failed-decode message
-    ("Try JPEG, PNG, HEIC or WebP.") implies HEIC round-trips end to end — none of that is true today
-    for the encode side, only for decode/preview.
-  - **Two directions for a follow-up session, not yet decided between:**
-    1. *Narrow the promise.* Drop HEIC from the accepted-formats copy, the open-dialog filter, and the
-       error message until it genuinely works — fail a picked/dropped HEIC earlier and honestly (at
-       pick time) instead of letting it ride the full chain into a confusing encode failure.
-    2. *Fix it in Phase A.* `sips` already decodes HEIC correctly — it is what builds the preview
-       thumbnail — so convert HEIC to PNG first (`sips -s format png <input> --out <tmp>.png`, the same
-       shape as M3's thumbnail spawn) and feed `avifenc`/`cwebp` that PNG instead of the original file,
-       one more `sips` hop ahead of each encode.
-    - Either way, this is exactly the kind of gap Phase B (native decode via Apple ImageIO/CoreGraphics
-      into Zig, see "Technical approach" above) makes moot outright — decoding to RGBA ourselves removes
-      the "can avifenc's own file reader open this container" question entirely. Worth keeping in mind so
-      a Phase A patch here isn't over-engineered against a problem Phase B deletes for free.
+- ~~HEIC input cannot be encoded to AVIF or WebP.~~ **Fixed in M12** by staging the HEIC/HEIF source as
+  a PNG via `sips` before either encoder runs (the "fix it in Phase A" direction, chosen over narrowing
+  the accepted-formats promise). Existing copy — "Accept common raster formats", the open-dialog's
+  `.heic`/`.heif` filter, M9's "Try JPEG, PNG, HEIC or WebP." — is accurate again end to end. Full
+  writeup in the M12 entry above. Phase B (native decode via Apple ImageIO/CoreGraphics into Zig) would
+  still make this class of gap moot outright by removing the "can the encoder's own file reader open
+  this container" question entirely — worth keeping in mind if another format hits the same wall.
