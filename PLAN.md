@@ -802,11 +802,6 @@ and `check` went quiet — the M1 note about running `test` before `check` appli
 There is no pinned SDK version in the tree to bump: no `build.zig.zon` exists, so `native build` links
 whatever the globally installed CLI carries.
 
-*Before writing code, refresh the skills.* `~/.claude/skills/native-ui/SKILL.md` was installed
-2026-08-03 (0.8.0) and differs from 0.8.4's `skill-data/native-ui/SKILL.md`; `native skills get`
-re-emits them. Be aware that **even 0.8.4's `native-ui` and `zig` skills do not document `on_drop`** —
-only ts-core's does, and only as a one-line adapter aside — so this entry is the authoritative
-reference for the Zig signature.
 Built exactly the spec above: one `Msg` field, one pure callback, one shared helper, one options
 wire-up.
 Settled/found here:
@@ -870,6 +865,22 @@ down above before this session started. What remained was the small, fully speci
 pipeline this repo already owned — M8-shaped, as predicted. The hand-drag behaved exactly as the
 investigation predicted; no escalation was needed.
 
+**Toolchain — upgraded to `native` 0.9.0 (2026-08-13).** Same pattern as M11's 0.8.4 bump: verified
+before touching anything else, not assumed. `native test` **93/93 pass** and `native check` clean at
+**zero** warnings on 0.9.0 — no code changes needed. No pinned SDK version in the tree to bump (no
+`build.zig.zon`), so this was purely reinstalling the global CLI.
+
+## Milestones — v0.2 (planned, not started)
+
+**M12 — HEIC encode gap.** *(not started)* — see "Known limitations" below for the full writeup.
+`avifenc`/`cwebp` reject HEIC as an input format even though the app accepts, previews, and names HEIC
+files correctly through every stage up to the encode itself. Two candidate fixes are already scoped
+there (narrow the accepted-formats promise vs. convert-to-PNG-via-`sips` first); neither is chosen yet
+— that's the first decision a session picking this up needs to make, not further investigation. The
+`photo.heic` fixture already exists (`test-images/`, made in M2) and the failure is already reproduced
+live (M11's entry). Phase B (native decode) would make this moot outright, so whichever Phase A fix
+gets picked here should stay small rather than gold-plated.
+
 ## Open decisions
 - ~~Partial failure in "Both" mode: report success-with-warning, or fail the whole operation?~~
   **Resolved in M7: success-with-warning**, with an all-failed floor that stays `.failed`. The
@@ -887,7 +898,7 @@ investigation predicted; no escalation was needed.
 
 ## Known limitations
 
-- **HEIC input cannot be encoded to AVIF or WebP.** `avifenc`/`cwebp` (Phase A's system tools) reject
+- **HEIC input cannot be encoded to AVIF or WebP.** *(tracked as M12, above — not started.)* `avifenc`/`cwebp` (Phase A's system tools) reject
   `.heic`/`.heif` outright as an INPUT format — confirmed by running both directly against
   `test-images/photo.heic`: `avifenc` says "Unrecognized file format for input file", `cwebp` says
   "Cannot read input picture file". A HEIC picks, drops, and previews correctly (`sips` decodes it fine
