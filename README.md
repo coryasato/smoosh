@@ -47,7 +47,7 @@ installs anything on your behalf.
 ## Requirements
 
 - macOS (Apple Silicon targeted; no Linux or Windows in v0.1)
-- [`native`](https://native-sdk.dev) CLI **0.8.0**
+- [`native`](https://native-sdk.dev) CLI **0.10.1**
 - Zig **0.16.0**
 - Encoders, for Phase A:
   ```sh
@@ -63,7 +63,15 @@ native build    # ReleaseFast binary into zig-out/bin/
 native check    # validate markup + app.zon
 native test     # test suite
 native package --target macos --signing adhoc   # zig-out/package/smoosh.app
+native package --target macos --signing adhoc --archive   # + zig-out/package/smoosh.dmg
 ```
+
+`--archive` wraps the `.app` in a zero-config drag-to-Applications DMG (generated
+Retina background, Applications alias, no `app.zon` configuration required).
+Installing means double-clicking the `.dmg` to mount it, then dragging the app
+icon onto the Applications alias inside that window — otherwise, just drag
+`zig-out/package/smoosh.app` straight into `/Applications` yourself, no DMG
+needed.
 
 Driving the running app:
 
