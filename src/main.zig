@@ -479,7 +479,9 @@ pub const Model = struct {
         // model.
         if (model.save_message_len > 0) return model.saveMessage();
         return switch (model.status) {
-            .idle => "Drop or choose an image to get started.",
+            // Idle copy lives on the dropzone itself, not here — no need
+            // to say it twice.
+            .idle => "",
             .loading => "Loading…",
             .ready => "Ready to smoosh.",
             .compressing => "Smooshing…",
@@ -493,7 +495,7 @@ pub const Model = struct {
 };
 
 pub const Msg = union(enum) {
-    pick_file, // "Choose Image…" clicked
+    pick_file, // dropzone clicked
     dialog_result: native_sdk.EffectHostResult, // host open-dialog callback
     dropped_file: []const u8, // on_drop callback — a file dragged onto the window
     stat_result: native_sdk.EffectHostResult, // host file-size callback -> original_size

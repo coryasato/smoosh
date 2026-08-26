@@ -83,13 +83,13 @@
     </toggle-group>
   </row>
 
-  <!-- One size register per row: all three buttons take the default
-       control height, so the row reads as one band. Smoosh and Save As
-       disable on exactly the guards `update`'s own arms enforce
-       (`canSmoosh`/`canSave`) — a press that would be a silent no-op is
-       better shown as unavailable. -->
+  <!-- One size register per row: both buttons take the default control
+       height, so the row reads as one band. Smoosh and Save As disable on
+       exactly the guards `update`'s own arms enforce (`canSmoosh`/`canSave`)
+       — a press that would be a silent no-op is better shown as
+       unavailable. Choosing a file lives on the dropzone/hero above, not
+       here, so this row is purely post-pick actions. -->
   <row key="actions" gap="8" cross="center">
-    <button icon="folder-open" on-press="pick_file">Choose Image…</button>
     <spacer grow="1" />
     <button on-press="save_as" disabled="{not canSave}">Save As…</button>
     <button variant="primary" on-press="smoosh" disabled="{not canSmoosh}">Smoosh</button>

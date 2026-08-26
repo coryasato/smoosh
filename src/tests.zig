@@ -152,7 +152,6 @@ test "the view exposes every control update drives" {
     var model: Model = .{};
     const tree = try buildTree(arena, &model);
 
-    _ = try expectByText(tree.root, .button, "Choose Image…");
     _ = try expectByText(tree.root, .button, "Smoosh");
     _ = try expectByText(tree.root, .button, "Save As…");
     _ = try expectByText(tree.root, .button, "Reset");
@@ -319,7 +318,7 @@ test "widget ids survive the conditional rows appearing" {
     try testing.expect(findByKind(before.root, .image) == null);
     try testing.expect(findByKind(after.root, .image) != null);
 
-    for ([_][]const u8{ "Smoosh", "Save As…", "Choose Image…", "Reset" }) |label| {
+    for ([_][]const u8{ "Smoosh", "Save As…", "Reset" }) |label| {
         const empty_widget = try expectByText(before.root, .button, label);
         const full_widget = try expectByText(after.root, .button, label);
         try testing.expectEqual(empty_widget.id, full_widget.id);
@@ -347,9 +346,6 @@ test "every control dispatches the message it claims" {
     model.avif_outcome = .ok;
     model.avif_size = 717_003;
     const tree = try buildTree(arena, &model);
-
-    const choose = try expectByText(tree.root, .button, "Choose Image…");
-    try expectMsgTag(.pick_file, tree.msgForPointer(choose.id, .up));
 
     const smoosh = try expectByText(tree.root, .button, "Smoosh");
     try expectMsgTag(.smoosh, tree.msgForPointer(smoosh.id, .up));
@@ -438,14 +434,20 @@ test "path buffers hold a maximum-length dialog path" {
 test "statusLine names every Status, and .failed reports the error message" {
     var model: Model = .{};
 
-    // Non-failed statuses each get their own non-empty line, all distinct —
-    // a copy/paste duplicate in the switch would otherwise ship silently.
+    // Non-failed, non-idle statuses each get their own non-empty line, all
+    // distinct — a copy/paste duplicate in the switch would otherwise ship
+    // silently. `.idle` is deliberately blank: its copy lives on the
+    // dropzone itself, not the status bar.
     var seen: [std.enums.values(Status).len][]const u8 = undefined;
     var count: usize = 0;
     for (std.enums.values(Status)) |status| {
         if (status == .failed) continue;
         model.status = status;
         const line = model.statusLine();
+        if (status == .idle) {
+            try testing.expectEqual(@as(usize, 0), line.len);
+            continue;
+        }
         try testing.expect(line.len > 0);
         for (seen[0..count]) |previous| {
             try testing.expect(!std.mem.eql(u8, previous, line));
