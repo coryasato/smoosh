@@ -170,7 +170,7 @@ pub const Model = struct {
     webp_size: u64 = 0,
     webp_outcome: EncodeOutcome = .none,
     // options
-    format: Format = .avif,
+    format: Format = .both,
     // encoders — the launch-time `which avifenc`/`which cwebp` presence
     // check. `null` until that hop answers; both land before any user
     // input is possible, so `update`'s arms below never need to guard on
@@ -191,19 +191,16 @@ pub const Model = struct {
     warning_message_buffer: [256]u8 = undefined,
     warning_message_len: usize = 0,
 
-    // Save As. `showSaveDialog` only ever returns ONE path, so "Both"
-    // mode runs two dialog+copy rounds back to back rather than a
-    // folder picker — `save_queue` is that round-robin. `index == len`
-    // (true at rest, including 0 == 0) means "no save in flight";
-    // `save_as` rebuilds the queue fresh on every press.
-    save_queue: [2]Output = undefined,
-    save_queue_len: usize = 0,
-    save_queue_index: usize = 0,
-    /// Accumulates one short note per format that actually resolved (a
-    /// cancel is silent — see `update`'s `.save_as_dialog_result` arm).
-    /// Its own buffer, not `warning_message_buffer`: a save note and an
-    /// encode warning are different facts, and folding them into one
-    /// field would mean one silently overwriting the other.
+    // Save As is per-format: each landed result line carries its own save
+    // icon, dispatching `save_avif_as`/`save_webp_as` directly — no queue,
+    // since only one dialog+copy round is ever in flight at once.
+    /// Which format the in-flight round is for, if any. `null` at rest.
+    saving: ?Output = null,
+    /// The one-line note the last round left behind (a cancel is silent —
+    /// see `update`'s `.save_as_dialog_result` arm). Its own buffer, not
+    /// `warning_message_buffer`: a save note and an encode warning are
+    /// different facts, and folding them into one field would mean one
+    /// silently overwriting the other.
     save_message_buffer: [256]u8 = undefined,
     save_message_len: usize = 0,
 
@@ -252,9 +249,7 @@ pub const Model = struct {
         "error_message_len",
         "warning_message_buffer",
         "warning_message_len",
-        "save_queue",
-        "save_queue_len",
-        "save_queue_index",
+        "saving",
         "save_message_buffer",
         "save_message_len",
         "path",
@@ -329,11 +324,11 @@ pub const Model = struct {
         return model.hasPreview() and model.status != .compressing;
     }
 
-    /// Same gate the `.save_as` arm enforces: at least one landed output,
-    /// and no save round already in flight.
-    pub fn canSave(model: *const Model) bool {
-        return (model.hasAvifResult() or model.hasWebpResult()) and
-            model.save_queue_index >= model.save_queue_len;
+    /// Gates each result line's save icon: only while no round is already
+    /// in flight. The icon's own existence (inside `hasAvifResult`/
+    /// `hasWebpResult`) already implies that format landed.
+    pub fn isSaving(model: *const Model) bool {
+        return model.saving != null;
     }
 
     /// "2.4 MB" — the picked file's size on its own line, the sketch's
@@ -463,8 +458,7 @@ pub const Model = struct {
         model.webp_path_len = 0;
         model.webp_size = 0;
         model.warning_message_len = 0;
-        model.save_queue_len = 0;
-        model.save_queue_index = 0;
+        model.saving = null;
         model.save_message_len = 0;
     }
 
@@ -507,7 +501,8 @@ pub const Msg = union(enum) {
     convert_result: native_sdk.EffectExit, // `sips` HEIC->PNG staging callback, shared by both formats
     encode_result: native_sdk.EffectExit, // fx.spawn callback, one per format encoded
     encode_size_result: native_sdk.EffectHostResult, // host file-size callback -> avif_size/webp_size
-    save_as, // "Save As…" clicked
+    save_avif_as, // AVIF result row's save icon clicked
+    save_webp_as, // WebP result row's save icon clicked
     save_as_dialog_result: native_sdk.EffectHostResult, // host save-dialog callback
     // A host command we bind ourselves, `file.copy` — not `fx.writeFile`.
     // `fx.writeFile`/`fx.readFile` cap at 1 MiB (`max_effect_file_bytes`),
@@ -939,14 +934,13 @@ fn finishIfComplete(model: *Model) void {
 
 // -------------------------------------------------------------- Save As
 //
-// `save_as` -> `showSaveDialog` -> copy the already-produced output(s) to
-// the chosen location, without touching the auto-saved originals.
-// `showSaveDialog` only ever returns ONE path, and Smoosh can produce two
-// files ("Both"), so this is SEQUENTIAL rather than a folder picker: one
-// save-dialog-then-copy round per landed format, one after another. A
-// user who cancels one round still gets offered the other; only a copy
-// failure is reported as a problem — a cancel is an ordinary "not now",
-// same as `dialog_result`'s cancel-is-not-an-error precedent above.
+// `save_avif_as`/`save_webp_as` -> `showSaveDialog` -> copy that one
+// already-produced output to the chosen location, without touching the
+// auto-saved original. One format, one dialog-then-copy round — each
+// result line's own icon names which format it wants, so there is no
+// queue to sequence. Only a copy failure is reported as a problem; a
+// cancelled dialog is an ordinary "not now", same as `dialog_result`'s
+// cancel-is-not-an-error precedent above.
 
 /// `/a/b/large.avif` -> `large.avif` — the default filename `HostBridge`
 /// hands the save panel. Truncates (silently, via `@min`) rather than
@@ -960,28 +954,20 @@ fn defaultSaveName(model: *const Model, output: Output, buf: []u8) []const u8 {
     return buf[0..len];
 }
 
-/// One line per format that actually resolved — never for a cancel, which
-/// is silent. Appended, not overwritten: "Both" can report on both formats
-/// in the one status line.
-fn appendSaveNote(model: *Model, comptime fmt: []const u8, args: anytype) void {
-    var note_buf: [128]u8 = undefined;
-    const note = std.fmt.bufPrint(&note_buf, fmt, args) catch return;
-    const existing = model.save_message_len;
-    const sep: []const u8 = if (existing > 0) " " else "";
-    if (existing + sep.len + note.len > model.save_message_buffer.len) return;
-    @memcpy(model.save_message_buffer[existing..][0..sep.len], sep);
-    @memcpy(model.save_message_buffer[existing + sep.len ..][0..note.len], note);
-    model.save_message_len = existing + sep.len + note.len;
+/// Overwrites the save note. Unlike `fail`/`warn` there is never a second
+/// note to append beside it — only one round is ever in flight.
+fn setSaveMessage(model: *Model, comptime fmt: []const u8, args: anytype) void {
+    const written = std.fmt.bufPrint(&model.save_message_buffer, fmt, args) catch return;
+    model.save_message_len = written.len;
 }
 
-/// Starts the save-dialog round for whatever `save_queue_index` currently
-/// points at. Called by `.save_as` for the first round and by the two
-/// result arms below for every subsequent one — the same "dialogs block
-/// the loop" fact that lets the pick chain issue one host request per arm
-/// with no staleness guard applies here too, so this needs none either.
+/// Starts the save-dialog round for whatever format `model.saving` names.
+/// Its only caller is `beginSave` — a cancelled or completed round simply
+/// clears `model.saving` rather than chaining into another round.
 fn beginSaveRound(model: *Model, fx: *Effects) void {
+    const output = model.saving orelse return;
     var name_buf: [128]u8 = undefined;
-    const default_name = defaultSaveName(model, model.save_queue[model.save_queue_index], &name_buf);
+    const default_name = defaultSaveName(model, output, &name_buf);
     fx.hostRequest(.{
         .key = save_dialog_key,
         .name = host_save_file,
@@ -990,13 +976,15 @@ fn beginSaveRound(model: *Model, fx: *Effects) void {
     });
 }
 
-/// Moves to the next queued format, if any. The queue sits at `index ==
-/// len` when nothing is in flight (true at rest, since both start at 0) —
-/// reached exactly when this increments past the last round, so nothing
-/// else needs to reset it.
-fn advanceSaveQueue(model: *Model, fx: *Effects) void {
-    model.save_queue_index += 1;
-    if (model.save_queue_index < model.save_queue_len) beginSaveRound(model, fx);
+/// Shared by `.save_avif_as`/`.save_webp_as`: refuses to start a round for
+/// a format that never landed, or while another round is already using
+/// the shared dialog/copy keys.
+fn beginSave(model: *Model, fx: *Effects, output: Output) void {
+    if (outcomeOf(model, output) != .ok) return;
+    if (model.saving != null) return;
+    model.saving = output;
+    model.save_message_len = 0;
+    beginSaveRound(model, fx);
 }
 
 // ------------------------------------------------------------------ drops
@@ -1310,39 +1298,20 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             finishIfComplete(model);
         },
 
-        .save_as => {
-            var queue: [2]Output = undefined;
-            var len: usize = 0;
-            if (model.hasAvifResult()) {
-                queue[len] = .avif;
-                len += 1;
-            }
-            if (model.hasWebpResult()) {
-                queue[len] = .webp;
-                len += 1;
-            }
-            if (len == 0) return; // nothing produced yet — nothing to save
-            // Defensive, like `smoosh`'s own re-press guard: a save round
-            // is only ever "in progress" while a dialog blocks the loop,
-            // which this dispatch cannot observe live, but a stray
-            // double-send under automation/tests should still be a no-op
-            // rather than clobbering a queue mid-round.
-            if (model.save_queue_index < model.save_queue_len) return;
-            model.save_queue = queue;
-            model.save_queue_len = len;
-            model.save_queue_index = 0;
-            model.save_message_len = 0;
-            beginSaveRound(model, fx);
-        },
+        .save_avif_as => beginSave(model, fx, .avif),
+        .save_webp_as => beginSave(model, fx, .webp),
 
         .save_as_dialog_result => |result| {
-            if (model.save_queue_index >= model.save_queue_len) return;
-            if (!result.ok) return advanceSaveQueue(model, fx); // cancelled: silent, offer the next format
-            const output = model.save_queue[model.save_queue_index];
+            const output = model.saving orelse return;
+            if (!result.ok) { // cancelled: silent, not a failure
+                model.saving = null;
+                return;
+            }
             var payload_buf: [platform.max_dialog_path_bytes * 2 + 1]u8 = undefined;
             const payload = std.fmt.bufPrint(&payload_buf, "{s}\n{s}", .{ outputPathOf(model, output), result.bytes }) catch {
-                appendSaveNote(model, "Couldn't save {s} — the destination path is too long.", .{outputLabel(output)});
-                return advanceSaveQueue(model, fx);
+                setSaveMessage(model, "Couldn't save {s} — the destination path is too long.", .{outputLabel(output)});
+                model.saving = null;
+                return;
             };
             fx.hostRequest(.{
                 .key = save_copy_key,
@@ -1353,17 +1322,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
 
         .save_as_result => |result| {
-            if (model.save_queue_index >= model.save_queue_len) return;
-            const output = model.save_queue[model.save_queue_index];
+            const output = model.saving orelse return;
             if (result.ok) {
-                appendSaveNote(model, "Saved {s}.", .{outputLabel(output)});
+                setSaveMessage(model, "Saved {s}.", .{outputLabel(output)});
             } else {
                 // The same family of failure as the auto-save write step,
                 // just at a user-chosen destination instead of next to
                 // the source.
-                appendSaveNote(model, "Couldn't save {s} — check the folder's permissions.", .{outputLabel(output)});
+                setSaveMessage(model, "Couldn't save {s} — check the folder's permissions.", .{outputLabel(output)});
             }
-            advanceSaveQueue(model, fx);
+            model.saving = null;
         },
 
         .encoder_check_result => |exit| {

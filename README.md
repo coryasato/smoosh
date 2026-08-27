@@ -9,14 +9,12 @@ something local and instant.
 
 ## Status
 
-**v0.1 — feature-complete and packaged.** Smoosh launches to a drop zone, you pick
-an image, see a preview and its size, choose AVIF / WebP / Both, and press
-Smoosh — the compressed files land next to the original and the before/after size
-and savings percentage are shown per format. "Save As…" copies the produced
-file(s) to a location you choose, without touching the auto-saved originals.
-
-The drop zone is click-to-choose: file drops are not wired up yet, so nothing in
-the UI claims they are.
+**v0.1 — feature-complete and packaged.** Smoosh launches to a drop zone — pick an
+image or drag one onto the window — see a preview and its size, choose AVIF / WebP
+/ Both, and press Smoosh — the compressed files land next to the original and the
+before/after size and savings percentage are shown per format, each with its own
+save icon to copy that one file to a location you choose, without touching the
+auto-saved original.
 
 Ships as a `.app` (`native package --target macos --signing adhoc`) — ad-hoc
 signed, not notarized (no Apple Developer account behind this build; fine for a

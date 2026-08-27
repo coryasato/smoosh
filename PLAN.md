@@ -9,9 +9,10 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 
 ## Status
 **v0.1 shipped** (M1-M12, archived). Pick or drop an image, choose AVIF/WebP/Both, Smoosh
-auto-saves next to the source, optionally Save As to another location, packaged as an ad-hoc-signed
-`.app`. `native test` 99/99, `native check` zero warnings, `native build` clean. No known
-limitations open. Next round: UI polishing (not yet planned — see "Next up" below).
+auto-saves next to the source; each landed result row carries its own save icon to copy that one
+file elsewhere, packaged as an ad-hoc-signed `.app`. `native test` 100/100, `native check` zero
+warnings, `native build` clean. No known limitations open. Next round: UI polishing (not yet
+planned — see "Next up" below).
 
 ## Success criteria for v0.1 (MVP) — all shipped
 - [x] App launches to a clean drop-zone UI that becomes a file card once a file lands
@@ -19,10 +20,11 @@ limitations open. Next round: UI polishing (not yet planned — see "Next up" be
   `HostCallBinding` — see CLAUDE.md's "File acquisition, honestly") or drag-and-drop onto the window
   (`UiApp.Options.on_drop`, SDK 0.8.2+)
 - [x] Image appears as preview with original size
-- [x] User can choose output: AVIF (default), WebP, or Both
+- [x] User can choose output: AVIF, WebP, or Both (default)
 - [x] "Smoosh" produces the selected format(s) via system tools and auto-saves next to the source file
 - [x] Before/after file size + savings % are shown
-- [x] User can optionally re-save output to a different location via "Save As…"
+- [x] User can optionally re-save any landed output to a different location, via a save icon on
+  that format's own result row
 - [x] Works on macOS only
 - [x] Reasonable input size limits (100 MB / 50 MP) with clear feedback
 - [x] Ships as a packaged `.app` (ad-hoc signed) that launches on a machine that never ran `native build`
@@ -69,9 +71,9 @@ A negative-savings result (output larger than a tiny source) is real, not an err
 
 ### Format selection
 - User choice in the UI:
-  - **AVIF** (default) — best compression for modern browsers
+  - **AVIF** — best compression for modern browsers
   - **WebP** — broader compatibility
-  - **Both** — produce both files so the source can serve AVIF with WebP fallback for older browsers
+  - **Both** (default) — produce both files so the source can serve AVIF with WebP fallback for older browsers
 - When "Both" is selected, two files are written (e.g. `photo.avif` + `photo.webp`) and each shows
   its own savings line — never a summed "combined savings," since no client ever downloads both.
 
@@ -87,7 +89,7 @@ A negative-savings result (output larger than a tiny source) is real, not an err
 ### Output handling
 - Auto-save next to the source file (e.g. `photo.jpg` → `photo.avif` / `photo.webp`) as soon as "Smoosh" completes — no save dialog in the default path.
 - If an output file already exists, overwrite it silently. Re-running "Smoosh" on the same source is treated as "redo this."
-- "Save As…" is an optional secondary action to copy the result(s) to a different location; it does not replace auto-save.
+- Each landed result row carries its own save icon, an optional secondary action to copy that one file to a different location; it does not replace auto-save.
 
 ### Error states
 Each maps to a user-facing message and the `.failed` Model state:
@@ -152,8 +154,10 @@ Quick reference; full rationale for each is in `docs/plan-v0.1-archive.md`.
   going through the per-format partial-failure join.
 - **Signed ad-hoc, not notarized, not unsigned**, for a single-machine local tool with no paid Apple
   Developer identity. Revisit only if this ever needs sharing with someone else.
-- **"Both" mode's Save As runs two save-dialog-then-copy rounds SEQUENTIALLY**, not a folder picker —
-  `showSaveDialog` only ever returns one path.
+- **Save As is per-format, not a single "Both" action.** Each result row has its own save icon
+  (`save_avif_as`/`save_webp_as`), each running its own one-shot save-dialog-then-copy round — no
+  queue, since `showSaveDialog` only ever needs to answer one path at a time this way. Pressing
+  either icon while a round is already in flight is a no-op.
 
 ## Known limitations
 None currently open.

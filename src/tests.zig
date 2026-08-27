@@ -55,6 +55,17 @@ fn findByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8) 
     return null;
 }
 
+/// For icon-only controls (the per-format save buttons): no text content
+/// of their own, so their accessible name lives in `semantics.label`
+/// instead of `text`.
+fn findByLabel(widget: canvas.Widget, kind: canvas.WidgetKind, label: []const u8) ?canvas.Widget {
+    if (widget.kind == kind and std.mem.eql(u8, widget.semantics.label, label)) return widget;
+    for (widget.children) |child| {
+        if (findByLabel(child, kind, label)) |found| return found;
+    }
+    return null;
+}
+
 /// For leaves with no text of their own to find them by (the preview
 /// `<image>`), where the kind alone is unambiguous in this view.
 fn findByKind(widget: canvas.Widget, kind: canvas.WidgetKind) ?canvas.Widget {
@@ -88,6 +99,16 @@ fn expectByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8
         std.debug.print(
             "no {t} with text \"{s}\" in the view - if you changed app.native, update this test to match\n",
             .{ kind, text },
+        );
+        return error.WidgetNotFound;
+    };
+}
+
+fn expectByLabel(widget: canvas.Widget, kind: canvas.WidgetKind, label: []const u8) !canvas.Widget {
+    return findByLabel(widget, kind, label) orelse {
+        std.debug.print(
+            "no {t} labelled \"{s}\" in the view - if you changed app.native, update this test to match\n",
+            .{ kind, label },
         );
         return error.WidgetNotFound;
     };
@@ -153,7 +174,6 @@ test "the view exposes every control update drives" {
     const tree = try buildTree(arena, &model);
 
     _ = try expectByText(tree.root, .button, "Smoosh");
-    _ = try expectByText(tree.root, .button, "Save As…");
     _ = try expectByText(tree.root, .button, "Reset");
     // One chip per Format, labelled by `Format.label` — an item-method
     // binding, so the chips read "AVIF"/"WebP"/"Both" instead of the
@@ -190,38 +210,63 @@ test "the empty state offers a drop zone that picks a file" {
     _ = try expectByText(card.root, .text, "photo.jpg");
 }
 
-test "Smoosh and Save As disable on exactly the guards update enforces" {
+test "Smoosh disables on exactly the guard update enforces" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Nothing picked: both actions are dead ends in `update` (`.smoosh`
-    // returns on `!hasPreview`, `.save_as` on an empty queue), so the view
-    // says so rather than accepting a press that does nothing.
+    // Nothing picked: `.smoosh` returns on `!hasPreview`, so the view says
+    // so rather than accepting a press that does nothing.
     var empty: Model = .{};
     const idle = try buildTree(arena, &empty);
     try testing.expect((try expectByText(idle.root, .button, "Smoosh")).state.disabled);
-    try testing.expect((try expectByText(idle.root, .button, "Save As…")).state.disabled);
 
-    // A picked file enables Smoosh — and only Smoosh: nothing has been
-    // encoded, so there is still nothing to save.
+    // A picked file enables it.
     var ready = readyModel();
     const with_file = try buildTree(arena, &ready);
     try testing.expect(!(try expectByText(with_file.root, .button, "Smoosh")).state.disabled);
-    try testing.expect((try expectByText(with_file.root, .button, "Save As…")).state.disabled);
 
-    // Mid-encode, Smoosh goes quiet again (the arm's own re-press guard).
+    // Mid-encode, it goes quiet again (the arm's own re-press guard).
     ready.status = .compressing;
     const busy = try buildTree(arena, &ready);
     try testing.expect((try expectByText(busy.root, .button, "Smoosh")).state.disabled);
 
-    // A landed output enables Save As.
+    // A landed output keeps it enabled — Smoosh runs again over the same file.
     ready.status = .done;
     ready.avif_outcome = .ok;
     ready.avif_size = 717_003;
     const done = try buildTree(arena, &ready);
-    try testing.expect(!(try expectByText(done.root, .button, "Save As…")).state.disabled);
     try testing.expect(!(try expectByText(done.root, .button, "Smoosh")).state.disabled);
+}
+
+test "a format's save icon exists only once that format has landed, and disables mid-round" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Picked but not yet smooshed: no result, so no save icon at all —
+    // there is nothing yet for it to act on.
+    var ready = readyModel();
+    const with_file = try buildTree(arena, &ready);
+    try testing.expect(findByLabel(with_file.root, .button, "Save AVIF as…") == null);
+
+    // AVIF lands: its icon appears and is enabled; WebP's does not exist,
+    // since WebP never ran this go.
+    ready.status = .done;
+    ready.avif_outcome = .ok;
+    ready.avif_size = 717_003;
+    const avif_done = try buildTree(arena, &ready);
+    try testing.expect(!(try expectByLabel(avif_done.root, .button, "Save AVIF as…")).state.disabled);
+    try testing.expect(findByLabel(avif_done.root, .button, "Save WebP as…") == null);
+
+    // Mid-save-round, BOTH landed icons go quiet — `isSaving` gates the
+    // whole shared dialog/copy channel, not just the format in flight.
+    ready.webp_outcome = .ok;
+    ready.webp_size = 671_054;
+    ready.saving = .avif;
+    const mid_save = try buildTree(arena, &ready);
+    try testing.expect((try expectByLabel(mid_save.root, .button, "Save AVIF as…")).state.disabled);
+    try testing.expect((try expectByLabel(mid_save.root, .button, "Save WebP as…")).state.disabled);
 }
 
 test "the busy spinner tracks isBusy, not any single Status" {
@@ -318,7 +363,7 @@ test "widget ids survive the conditional rows appearing" {
     try testing.expect(findByKind(before.root, .image) == null);
     try testing.expect(findByKind(after.root, .image) != null);
 
-    for ([_][]const u8{ "Smoosh", "Save As…", "Reset" }) |label| {
+    for ([_][]const u8{ "Smoosh", "Reset" }) |label| {
         const empty_widget = try expectByText(before.root, .button, label);
         const full_widget = try expectByText(after.root, .button, label);
         try testing.expectEqual(empty_widget.id, full_widget.id);
@@ -337,21 +382,28 @@ test "every control dispatches the message it claims" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A model with a file AND a landed output, because the view disables
-    // Smoosh and Save As when there is nothing to act on — and `msgForPointer`
-    // yields null for a disabled control, so an empty model would prove
-    // nothing about their wiring.
+    // A model with a file AND both formats landed, because the view
+    // disables Smoosh and hides each save icon when there is nothing for
+    // it to act on — and `msgForPointer` yields null for a disabled
+    // control, so an empty model would prove nothing about their wiring.
+    // Both formats, not just one, so a copy-paste swap between the two
+    // icons' `on-press` targets would actually be caught.
     var model = readyModel();
     model.status = .done;
     model.avif_outcome = .ok;
     model.avif_size = 717_003;
+    model.webp_outcome = .ok;
+    model.webp_size = 671_054;
     const tree = try buildTree(arena, &model);
 
     const smoosh = try expectByText(tree.root, .button, "Smoosh");
     try expectMsgTag(.smoosh, tree.msgForPointer(smoosh.id, .up));
 
-    const save_as = try expectByText(tree.root, .button, "Save As…");
-    try expectMsgTag(.save_as, tree.msgForPointer(save_as.id, .up));
+    const save_avif = try expectByLabel(tree.root, .button, "Save AVIF as…");
+    try expectMsgTag(.save_avif_as, tree.msgForPointer(save_avif.id, .up));
+
+    const save_webp = try expectByLabel(tree.root, .button, "Save WebP as…");
+    try expectMsgTag(.save_webp_as, tree.msgForPointer(save_webp.id, .up));
 
     const reset = try expectByText(tree.root, .button, "Reset");
     try expectMsgTag(.reset, tree.msgForPointer(reset.id, .up));
@@ -1287,15 +1339,15 @@ test "the missing-encoder failure is decided only once both checks land, in eith
 //
 // The chip -> `set_format:{f}` payload coercion and the `selected="{f ==
 // format}"` binding are already proven at the markup level (above) — what's
-// left is confirming `update` actually moves `Model.format`. `.avif` is the
-// model default, so the AVIF case here also stands in as "sending your own
+// left is confirming `update` actually moves `Model.format`. `.both` is the
+// model default, so the Both case here also stands in as "sending your own
 // current selection is a no-op."
 
 test "set_format moves Model.format, one send per option" {
     var h = try Harness.create();
     defer h.destroy();
 
-    try testing.expectEqual(Format.avif, h.model().format);
+    try testing.expectEqual(Format.both, h.model().format);
     for (Model.formats) |chip| {
         try h.send(.{ .set_format = chip.value });
         try testing.expectEqual(chip.value, h.model().format);
@@ -1332,6 +1384,7 @@ test "AVIF alone spawns the pinned avifenc argv and writes next to the source" {
     var h = try Harness.create();
     defer h.destroy();
 
+    try h.send(.{ .set_format = .avif });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
 
@@ -1503,6 +1556,7 @@ test "the only selected format failing is an ordinary failed run" {
     var h = try Harness.create();
     defer h.destroy();
 
+    try h.send(.{ .set_format = .avif });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
     try h.encodeExit("avifenc", 1);
@@ -1544,6 +1598,7 @@ test "a missing encoder for the only selected format fails, naming its brew inst
     defer h.destroy();
 
     try h.resolveEncoders(false, true);
+    try h.send(.{ .set_format = .avif });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
 
@@ -1557,6 +1612,7 @@ test "an encoder that exits clean without leaving a file is a write failure" {
     var h = try Harness.create();
     defer h.destroy();
 
+    try h.send(.{ .set_format = .avif });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
     try h.encodeExit("avifenc", 0);
@@ -1637,6 +1693,7 @@ test "a HEIC source stages a sips conversion before either encoder runs" {
     var h = try Harness.create();
     defer h.destroy();
 
+    try h.send(.{ .set_format = .avif });
     try h.load(photo_heic, photo_heic_bytes);
     try h.send(.smoosh);
 
@@ -1866,6 +1923,7 @@ test "a second Smoosh press while encoding is ignored" {
     var h = try Harness.create();
     defer h.destroy();
 
+    try h.send(.{ .set_format = .avif });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
     try h.send(.smoosh);
@@ -1943,14 +2001,16 @@ test "changing the format mid-encode does not change what the run produces" {
 
 // ================================================================== Save As
 //
-// `showSaveDialog` only ever answers ONE path, so a "Both" run — two
-// produced files — cannot go through one save panel. The design decided
-// here: SEQUENTIAL rounds, one save-dialog-then-copy per landed format,
-// one after another. Cancelling one round still offers the other; only a
-// copy failure is reported, since a cancel is an ordinary "not now" (the
-// same read `dialog_result`'s own cancel handling already settled).
+// Each landed result row carries its own save icon (`save_avif_as`/
+// `save_webp_as`) rather than one button that would have to sequence two
+// dialogs for "Both" — `showSaveDialog` only ever answers ONE path, but
+// there is no longer a queue to answer it into: one press names one
+// format, runs one dialog-then-copy round, and reports one note. A
+// cancelled dialog is silent, same as `dialog_result`'s own cancel
+// handling; only a copy failure is reported. Pressing either icon while a
+// round is already in flight is a no-op — the two rounds never interleave.
 
-test "saving the only produced format opens one dialog defaulting to its filename" {
+test "saving a landed format opens one dialog defaulting to its filename" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -1958,7 +2018,7 @@ test "saving the only produced format opens one dialog defaulting to its filenam
     try h.send(.smoosh);
     try h.encodeOk("avifenc", ".avif", "717003");
 
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
     const request = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
     // The default name is a bare filename, not the full source-relative
     // path — a save panel starts in the user's own last-used folder, not
@@ -1978,8 +2038,7 @@ test "saving the only produced format opens one dialog defaulting to its filenam
     try h.saveCopy(true);
 
     try testing.expectEqualStrings("Saved AVIF.", h.model().statusLine());
-    // No second round: WebP was never produced this run.
-    try testing.expect(h.pendingHostNamed("dialog.saveFile") == null);
+    try testing.expect(!h.model().isSaving());
 }
 
 test "saving a copy does not touch the encode results" {
@@ -1989,7 +2048,7 @@ test "saving a copy does not touch the encode results" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
     try h.encodeOk("avifenc", ".avif", "717003");
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
     try h.saveRoundOk("/Users/someone/Desktop/large.avif");
 
     // Save As does not replace auto-save — the original next to the
@@ -1999,7 +2058,7 @@ test "saving a copy does not touch the encode results" {
     try testing.expectEqualStrings(large_jpg[0 .. large_jpg.len - 4] ++ ".avif", h.model().avif_path_buffer[0..h.model().avif_path_len]);
 }
 
-test "Both runs two rounds back to back, AVIF then WebP" {
+test "each format's icon saves independently, and the note names only the most recent one" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -2009,47 +2068,46 @@ test "Both runs two rounds back to back, AVIF then WebP" {
     try h.encodeOk("avifenc", ".avif", "717003");
     try h.encodeOk("cwebp", ".webp", "671054");
 
-    try h.send(.save_as);
-    const first = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
-    try testing.expectEqualStrings("large.avif", first.payload);
-    // The second dialog must not appear until the first round's copy
-    // finishes — genuinely sequential, not two dialogs fired at once.
-    try h.fx().feedHostResult(first.key, true, "/Users/someone/Desktop/large.avif");
-    try h.drain();
-    try testing.expect(h.pendingHostNamed("dialog.saveFile") == null);
-    try h.saveCopy(true);
+    try h.send(.save_avif_as);
+    const avif_request = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("large.avif", avif_request.payload);
+    try h.saveRoundOk("/Users/someone/Desktop/large.avif");
+    try testing.expectEqualStrings("Saved AVIF.", h.model().statusLine());
 
-    const second = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
-    try testing.expectEqualStrings("large.webp", second.payload);
+    // WebP's icon is untouched by AVIF's round having just finished — it
+    // runs its own round from scratch, same as if AVIF had never saved.
+    try h.send(.save_webp_as);
+    const webp_request = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("large.webp", webp_request.payload);
     try h.saveRoundOk("/Users/someone/Desktop/large.webp");
-
-    try testing.expectEqualStrings("Saved AVIF. Saved WebP.", h.model().statusLine());
-}
-
-test "cancelling one round is silent and still offers the other" {
-    var h = try Harness.create();
-    defer h.destroy();
-
-    try h.send(.{ .set_format = .both });
-    try h.load(large_jpg, large_jpg_bytes);
-    try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
-    try h.encodeOk("cwebp", ".webp", "671054");
-
-    try h.send(.save_as);
-    try h.saveDialog(null); // cancel AVIF's round
-    // No note for a cancel — it is a "not now", not a failure.
-    try testing.expectEqualStrings("", h.model().saveMessage());
-    // ...and the queue advanced: WebP's dialog is next, not stuck.
-    const second = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
-    try testing.expectEqualStrings("large.webp", second.payload);
-
-    try h.saveRoundOk("/Users/someone/Desktop/large.webp");
-    // Only WebP is mentioned — AVIF's cancel left nothing to say.
+    // Overwritten, not appended — the note is scoped to the round that
+    // just resolved, not a running log of every save this session.
     try testing.expectEqualStrings("Saved WebP.", h.model().statusLine());
 }
 
-test "cancelling every round leaves the status line exactly as it was" {
+test "cancelling a round is silent and leaves the other format's icon untouched" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk("cwebp", ".webp", "671054");
+
+    try h.send(.save_avif_as);
+    try h.saveDialog(null); // cancel AVIF's round
+    // No note for a cancel — it is a "not now", not a failure.
+    try testing.expectEqualStrings("", h.model().saveMessage());
+    try testing.expect(!h.model().isSaving());
+
+    // WebP's icon works exactly as if AVIF's round never happened.
+    try h.send(.save_webp_as);
+    try h.saveRoundOk("/Users/someone/Desktop/large.webp");
+    try testing.expectEqualStrings("Saved WebP.", h.model().statusLine());
+}
+
+test "cancelling a round leaves the status line exactly as it was" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -2058,14 +2116,14 @@ test "cancelling every round leaves the status line exactly as it was" {
     try h.encodeOk("avifenc", ".avif", "717003");
     const before = h.model().statusLine();
 
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
     try h.saveDialog(null);
 
     try testing.expectEqualStrings(before, h.model().statusLine());
     try testing.expectEqualStrings("", h.model().saveMessage());
 }
 
-test "a copy failure is reported and does not stop the next round" {
+test "a copy failure is reported, and the other format's icon still works" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -2075,34 +2133,35 @@ test "a copy failure is reported and does not stop the next round" {
     try h.encodeOk("avifenc", ".avif", "717003");
     try h.encodeOk("cwebp", ".webp", "671054");
 
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
     try h.saveDialog("/Volumes/Locked/large.avif");
     try h.saveCopy(false); // the destination volume is read-only
 
     const message = h.model().saveMessage();
     try testing.expect(std.mem.indexOf(u8, message, "AVIF") != null);
     try testing.expect(std.mem.indexOf(u8, message, "permissions") != null);
+    try testing.expect(!h.model().isSaving());
 
-    // The second round still runs — one bad destination must not strand
-    // the format that has nothing wrong with it.
+    // One format's failed copy must not strand the other, unrelated icon.
+    try h.send(.save_webp_as);
     try h.saveRoundOk("/Users/someone/Desktop/large.webp");
-    const final = h.model().saveMessage();
-    try testing.expect(std.mem.indexOf(u8, final, "Saved WebP.") != null);
+    try testing.expectEqualStrings("Saved WebP.", h.model().statusLine());
 }
 
-test "pressing Save As with nothing produced yet does nothing" {
+test "pressing a format's save icon before it has landed does nothing" {
     var h = try Harness.create();
     defer h.destroy();
 
     try h.load(large_jpg, large_jpg_bytes);
     // Ready, but never smooshed — there is no output to save.
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
+    try h.send(.save_webp_as);
 
     try testing.expectEqual(@as(usize, 0), h.fx().pendingHostCount());
     try testing.expectEqualStrings("", h.model().saveMessage());
 }
 
-test "a second Save As press after the first round has advanced is ignored" {
+test "pressing a save icon while a round is already in flight is ignored" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -2112,36 +2171,36 @@ test "a second Save As press after the first round has advanced is ignored" {
     try h.encodeOk("avifenc", ".avif", "717003");
     try h.encodeOk("cwebp", ".webp", "671054");
 
-    try h.send(.save_as);
-    try h.saveRoundOk("/Users/someone/Desktop/large.avif"); // round 1 done; round 2 (WebP) dialog now pending
+    try h.send(.save_avif_as);
+    const before = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("large.avif", before.payload);
 
     // A same-key re-request would just REPLACE the pending one (the
-    // channel's own documented behavior), which a naive `pendingHostCount
-    // == 1` check cannot tell apart from "the guard fired" — a single
-    // format's queue rebuilds to the same one-item queue either way. Both
-    // mode with an ALREADY-ADVANCED round is what actually distinguishes
-    // them: without the guard, a stray re-press rebuilds the queue back to
-    // [AVIF, WebP] at index 0 and replaces WebP's pending dialog with a
-    // fresh AVIF one under the same key — silently swapping the round the
-    // user is already looking at.
-    const before = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
-    try testing.expectEqualStrings("large.webp", before.payload);
-
-    try h.send(.save_as); // stray re-press mid-round-2
+    // channel's own documented behavior), so both a stray re-press of the
+    // SAME icon and a press of the OTHER icon must be refused by the
+    // guard itself — without it, either would silently swap the pending
+    // dialog request out from under the round already in progress.
+    try h.send(.save_avif_as);
+    try h.send(.save_webp_as);
 
     const still = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
-    try testing.expectEqualStrings("large.webp", still.payload);
+    try testing.expectEqualStrings("large.avif", still.payload);
     try testing.expectEqual(@as(usize, 1), h.fx().pendingHostCount());
 
+    try h.saveRoundOk("/Users/someone/Desktop/large.avif");
+    try testing.expectEqualStrings("Saved AVIF.", h.model().statusLine());
+
+    // Now that AVIF's round has resolved, WebP's icon works normally.
+    try h.send(.save_webp_as);
     try h.saveRoundOk("/Users/someone/Desktop/large.webp");
-    try testing.expectEqualStrings("Saved AVIF. Saved WebP.", h.model().statusLine());
+    try testing.expectEqualStrings("Saved WebP.", h.model().statusLine());
 }
 
 test "a save-dialog result with no round in progress is ignored" {
     var h = try Harness.create();
     defer h.destroy();
 
-    // No `save_as` was ever pressed — `save_queue_len` stays 0. A result
+    // No save icon was ever pressed — `model.saving` stays null. A result
     // landing here has no legitimate source (the effects channel itself
     // cannot re-feed a key that was never issued or was already
     // consumed), but the arm's own guard is what a wrong key routing
@@ -2151,10 +2210,10 @@ test "a save-dialog result with no round in progress is ignored" {
 
     try testing.expectEqual(Status.idle, h.model().status);
     try testing.expectEqualStrings("", h.model().saveMessage());
-    // Without the guard this reads `save_queue[0]` out of an
-    // uninitialized array and, on `ok = true`, goes on to issue a copy
-    // request nobody asked for — the failure mode that actually matters,
-    // since the model-state asserts above stay unchanged either way.
+    // Without the guard this unwraps a null `model.saving` and, on
+    // `ok = true`, goes on to issue a copy request nobody asked for — the
+    // failure mode that actually matters, since the model-state asserts
+    // above stay unchanged either way.
     try testing.expectEqual(@as(usize, 0), h.fx().pendingHostCount());
 }
 
@@ -2168,7 +2227,7 @@ test "a save-copy result with no round in progress is ignored" {
     try testing.expectEqualStrings("", h.model().saveMessage());
 }
 
-test "Save As after Save As runs a fresh round" {
+test "pressing the same icon again after a round finishes runs a fresh round" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -2176,13 +2235,13 @@ test "Save As after Save As runs a fresh round" {
     try h.send(.smoosh);
     try h.encodeOk("avifenc", ".avif", "717003");
 
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
     try h.saveRoundOk("/Users/someone/Desktop/copy-one.avif");
     try testing.expectEqualStrings("Saved AVIF.", h.model().statusLine());
 
     // Pressing it again (saving a SECOND copy elsewhere) must work exactly
-    // like the first press — the queue is not left in a used-up state.
-    try h.send(.save_as);
+    // like the first press — `model.saving` is not left in a used-up state.
+    try h.send(.save_avif_as);
     const request = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
     try testing.expectEqualStrings("large.avif", request.payload);
     try h.saveRoundOk("/Users/someone/Desktop/copy-two.avif");
@@ -2193,10 +2252,11 @@ test "re-smooshing clears a save note from the previous run" {
     var h = try Harness.create();
     defer h.destroy();
 
+    try h.send(.{ .set_format = .avif });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
     try h.encodeOk("avifenc", ".avif", "717003");
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
     try h.saveRoundOk("/Users/someone/Desktop/large.avif");
     try testing.expect(h.model().saveMessage().len > 0);
 
@@ -2214,7 +2274,7 @@ test "picking a new file clears a save note from the previous file" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
     try h.encodeOk("avifenc", ".avif", "717003");
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
     try h.saveRoundOk("/Users/someone/Desktop/large.avif");
     try testing.expect(h.model().saveMessage().len > 0);
 
@@ -2229,16 +2289,16 @@ test "reset clears an in-progress save round" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
     try h.encodeOk("avifenc", ".avif", "717003");
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
     try testing.expect(h.pendingHostNamed("dialog.saveFile") != null);
 
     try h.send(.reset);
 
     try testing.expectEqual(Status.idle, h.model().status);
     try testing.expectEqualStrings("", h.model().saveMessage());
-    // The queue is empty again, so a stray late answer to the cancelled
+    // `saving` is null again, so a stray late answer to the cancelled
     // dialog request has nothing to land on.
-    try testing.expectEqual(@as(usize, 0), h.model().save_queue_len);
+    try testing.expect(!h.model().isSaving());
 }
 
 test "reset cancels the pending save dialog, so a stray answer cannot land" {
@@ -2248,7 +2308,7 @@ test "reset cancels the pending save dialog, so a stray answer cannot land" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
     try h.encodeOk("avifenc", ".avif", "717003");
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
     const request = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
 
     try h.send(.reset);
@@ -2272,7 +2332,7 @@ test "the destination extension names the format, not the source's" {
     try h.load("/Users/someone/Pictures/photo.png", "204800");
     try h.send(.smoosh);
     try h.encodeOk("avifenc", ".avif", "98304");
-    try h.send(.save_as);
+    try h.send(.save_avif_as);
 
     const request = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
     try testing.expectEqualStrings("photo.avif", request.payload);

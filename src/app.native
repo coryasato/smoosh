@@ -50,15 +50,32 @@
       <column key="details" grow="1" gap="4">
         <text key="name"><span weight="medium">{fileName}</span></text>
         <text key="original" foreground="text_muted">Original {originalSize}</text>
-        <!-- One line per format that actually landed. Per-format rather
+        <!-- One row per format that actually landed. Per-format rather
              than a summed "combined savings" — no client ever downloads both
              files, so each line reports what would really be served. A format
-             that failed shows no line; the status bar names it. -->
+             that failed shows no row; the status bar names it. Each row
+             carries its own save icon — the file already exists on disk
+             next to the source, so "Save As" here means "copy THIS one
+             file elsewhere", not a global action. -->
         <if test="{hasAvifResult}">
-          <text key="avif-result" foreground="success">{avifResult}</text>
+          <row key="avif-result" gap="4" cross="center">
+            <text grow="1" foreground="success">{avifResult}</text>
+            <stack>
+              <button size="sm" variant="ghost" icon="save" on-press="save_avif_as"
+                      disabled="{isSaving}" label="Save AVIF as…" />
+              <tooltip anchor="above">Save AVIF as…</tooltip>
+            </stack>
+          </row>
         </if>
         <if test="{hasWebpResult}">
-          <text key="webp-result" foreground="success">{webpResult}</text>
+          <row key="webp-result" gap="4" cross="center">
+            <text grow="1" foreground="success">{webpResult}</text>
+            <stack>
+              <button size="sm" variant="ghost" icon="save" on-press="save_webp_as"
+                      disabled="{isSaving}" label="Save WebP as…" />
+              <tooltip anchor="above">Save WebP as…</tooltip>
+            </stack>
+          </row>
         </if>
       </column>
     </row>
@@ -83,15 +100,13 @@
     </toggle-group>
   </row>
 
-  <!-- One size register per row: both buttons take the default control
-       height, so the row reads as one band. Smoosh and Save As disable on
-       exactly the guards `update`'s own arms enforce (`canSmoosh`/`canSave`)
-       — a press that would be a silent no-op is better shown as
-       unavailable. Choosing a file lives on the dropzone/hero above, not
-       here, so this row is purely post-pick actions. -->
+  <!-- Smoosh disables on exactly the guard `update`'s own arm enforces
+       (`canSmoosh`) — a press that would be a silent no-op is better shown
+       as unavailable. Choosing a file lives on the dropzone/hero above,
+       and saving a copy lives on each result row's own icon — this row is
+       purely "run the compression". -->
   <row key="actions" gap="8" cross="center">
     <spacer grow="1" />
-    <button on-press="save_as" disabled="{not canSave}">Save As…</button>
     <button variant="primary" on-press="smoosh" disabled="{not canSmoosh}">Smoosh</button>
   </row>
 
