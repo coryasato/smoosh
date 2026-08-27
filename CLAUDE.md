@@ -75,8 +75,15 @@ Widget clicks take a **numeric id from `snapshot`**, not a label — snapshot fi
   scaffold's convention). Run with `native test`. See PLAN.md's "Testing strategy" for the two
   tiers and what belongs in each.
 - `README.md` — rewritten for Smoosh; keep the Status section honest as the app evolves.
-- `docs/spikes/` — reference implementations, not built as part of the app.
+- `docs/spikes/` — validated reference implementations, not built as part of the app. Each
+  file's header records what it proved AND what it did not; read that before transplanting.
+  `dialog-open-file-spike.zig` (file acquisition), `threaded-host-call-spike.zig` (long work off
+  the loop thread), `imageio-decode-spike.zig` (the ImageIO C-ABI seam; builds standalone with
+  `zig build-exe … -framework ImageIO -framework CoreGraphics -framework CoreFoundation`).
 - `docs/plan-v0.1-archive.md` — full v0.1 development history (see PLAN.md's header).
+- `docs/phase-b-baseline.md` — the pre-Phase-B measurement of the shipping app (size, PSNR, AVIF
+  `yuvFormat`, metadata) plus the fixture-set inventory and how to regenerate it. Append-only: it
+  is the gate M13/M14 are judged against and cannot be re-measured once the encoders change.
 
 (`src/core.ts`, `package.json`, `tsconfig.json`, `bun.lock`, and `node_modules/` were the abandoned
 TS-core editor surface and were deleted early on. There is no npm/bun surface in this tree at all.)
@@ -127,8 +134,11 @@ For a hand-authored root, window geometry is stated three times and all three mu
 v0.1 shipped (M1-M12; full history in `docs/plan-v0.1-archive.md`): pick or drop an image, choose
 AVIF/WebP/Both, Smoosh auto-saves next to the source, optionally Save As to another location,
 packaged as an ad-hoc-signed `.app`. `native build`/`check`/`test` all clean, zero `check`
-warnings. One limitation is open — Smoosh requires `brew install libavif webp` — and removing it
-is what Phase B (M13/M14) exists to do; see PLAN.md.
+warnings.
+
+Phase B (M13/M14) is under way and has not yet touched app code: its two prerequisite spikes are
+validated and the Phase A baseline is recorded. **PLAN.md is the source of truth** for what is
+done and what is next.
 
 Two standing rules from that round, still load-bearing for any future work:
 - **Never automate a native file dialog** (open or save panel). The app runs as a bare executable
