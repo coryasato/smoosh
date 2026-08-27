@@ -11,8 +11,10 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 **v0.1 shipped** (M1-M12, archived). Pick or drop an image, choose AVIF/WebP/Both, Smoosh
 auto-saves next to the source; each landed result row carries its own save icon to copy that one
 file elsewhere, packaged as an ad-hoc-signed `.app`. `native test` 100/100, `native check` zero
-warnings, `native build` clean. No known limitations open. Next round: UI polishing (not yet
-planned — see "Next up" below).
+warnings, `native build` clean.
+
+**One limitation is now open and drives the next two rounds:** Smoosh requires
+`brew install libavif webp` to do anything. See "Known limitations" and Phase B below.
 
 ## Success criteria for v0.1 (MVP) — all shipped
 - [x] App launches to a clean drop-zone UI that becomes a file card once a file lands
@@ -38,6 +40,9 @@ planned — see "Next up" below).
 - Vector / SVG handling
 - In-app image editing (crop, resize, etc.)
 - Shipping a Node or ImageMagick dependency
+- Metadata-preservation toggles (EXIF, GPS, ICC) — Phase B strips by default; revisit only on request
+- Wide-gamut output (P3 and beyond) — Phase B converts to sRGB deliberately
+- Quality/speed sliders — the pinned settings are the product
 
 ## Technical approach
 
@@ -61,13 +66,70 @@ cwebp  -q 80 <input> -o <output.webp>
 A negative-savings result (output larger than a tiny source) is real, not an error — it displays as
 `+1% larger`, not a failure.
 
-**Phase B — Native (future)**
-- Move encoding into Zig.
-- Decode via Apple's ImageIO / CoreGraphics (zero extra code, excellent HEIC/JPEG/PNG support) —
-  this would also make the HEIC-staging workaround above moot outright.
-- Statically link libavif + libwebp into the binary via `build.zig`.
-- Full control, single binary, maximum performance on Apple Silicon.
-- Promote this path once solid; keep system-tool path only as temporary fallback if needed.
+**Phase B — native (v0.2 + v0.3)**
+
+Phase B is a DEPENDENCY-REMOVAL round, not a feature round. Nothing user-facing changes. The
+success criterion is one sentence: Smoosh works on a Mac where nothing is installed. That is also
+the scope gate — anything that does not shrink the dependency surface or preserve current
+behavior is out.
+
+The shape is set by one platform fact: **macOS ImageIO encodes AVIF natively and cannot encode
+WebP** (`CGImageDestinationCopyTypeIdentifiers()` lists `public.avif`, not `public.webp`).
+Measured against our own `test-images/large.jpg`, ImageIO produced 633,154 B in 0.23s where
+`avifenc -q 58 --speed 6` produced 717,003 B in 0.60s — smaller and 2.6x faster, hardware
+accelerated on Apple Silicon. So AVIF needs no third-party code whatsoever, and only WebP needs a
+vendored library. The two halves also have very different build risk, which is why they are two
+milestones rather than one.
+
+**M13 (v0.2) — ImageIO decode + native AVIF.** No build-graph change: `CGImageSource*`/
+`CGImageDestination*` link via AppKit, which the SDK already links. New C-ABI surface lives in
+`src/imageio.zig` as plain `extern fn` declarations (not `@cImport`, which would need include
+paths; CoreFoundation types are opaque pointers and declare cleanly). Three new host commands on
+`HostBridge`, each answering off-thread:
+- `image.probe` — primary-frame index + dimensions from `CGImageSourceCopyPropertiesAtIndex`,
+  WITHOUT decoding. Replaces the `sips -g` spawn and feeds the existing megapixel guard, which
+  today runs only after a decode has already happened.
+- `image.thumbnail` — decode, orient, convert to sRGB, downscale to 160px longest edge, hand back
+  RGBA for `fx.registerImage`. Replaces the `sips` thumbnail spawn AND `fx.loadImage` AND the
+  entire temp-file path.
+- `image.encodeAvif` — decode primary frame, orient, convert to sRGB, encode via
+  `CGImageDestinationCreateWithURL` with `public.avif`, write to a `.tmp` in the DESTINATION
+  directory, then rename.
+
+Deletes: `isHeicSource`, `heic_convert_key`, the `convert_result` arm and the `convert_failed`
+outcome (ImageIO reads HEIC directly, so the staging hop is moot); the two `sips` spawns and
+`parseDimensions`; `thumbnail_path`, `converted_path`, `resolveAppTempPath` and its four buffers;
+the avifenc half of the launch probe. `resolveSpawnEnviron` and the `which` machinery must stay —
+`cwebp` is still spawned.
+
+**M14 (v0.3) — vendored libwebp, zero dependencies.** `native eject` to own `build.zig`, then
+swap `addApp` for `addAppArtifacts` so `artifacts.exe.root_module` is reachable — `AppOptions`
+has no link passthrough, so ejecting is the only route. Vendor libwebp under `third_party/` and
+compile its encoder sources with `addCSourceFiles` (no libpng/libjpeg: those serve libwebp's
+tools, not the library). `image.encodeWebp` reuses M13's decode/orient/sRGB pipeline, then
+`WebPConfig`/`WebPPicture` at quality 80 and the same tmp-then-rename write.
+
+Deletes: the `cwebp` spawn, `resolveSpawnEnviron` in full, the entire launch-time encoder probe
+(`initFx`, `encoder_check_result`, `avifenc_present`/`cwebp_present`), the `missing_encoder`
+outcome, and all three brew-install messages. The app then spawns no subprocesses at all.
+
+### Correctness requirements for Phase B
+Today `sips` applies orientation and color conversion implicitly. A raw
+`CGImageSourceCreateImageAtIndex` does not, so each of these is behavior to PRESERVE, not add:
+- **Primary frame, not index 0.** Live Photos and portrait HEICs carry extra images. Use
+  `CGImageSourceGetPrimaryImageIndex`.
+- **Bake in EXIF orientation.** Read `kCGImagePropertyOrientation` and transform before encoding,
+  or a sideways iPhone photo stays sideways.
+- **Convert to sRGB and tag sRGB.** ImageIO passes the source profile through by default, so a
+  Display P3 iPhone photo would emit P3. Web output is this tool's whole purpose, so convert:
+  predictable rendering everywhere beats preserving a gamut most consumers mishandle. This is a
+  deliberate, irreversible trade, recorded in "Key decisions carried forward."
+- **Strip metadata by default.** Building a destination from a decoded `CGImage` copies no
+  metadata unless asked, so this is the do-nothing path — but it also drops the ICC tag, which is
+  why sRGB must be tagged explicitly above. No GPS reaches an output. No toggle (see Non-goals).
+- **Atomic write.** Encode to `<name>.<ext>.tmp` in the DESTINATION directory (a temp dir would
+  cross filesystems and defeat the rename), then rename. Phase A does not do this either — a
+  crash mid-encode currently can leave a truncated file beside the source.
 
 ### Format selection
 - User choice in the UI:
@@ -89,7 +151,8 @@ A negative-savings result (output larger than a tiny source) is real, not an err
 ### Output handling
 - Auto-save next to the source file (e.g. `photo.jpg` → `photo.avif` / `photo.webp`) as soon as "Smoosh" completes — no save dialog in the default path.
 - If an output file already exists, overwrite it silently. Re-running "Smoosh" on the same source is treated as "redo this."
-- Each landed result row carries its own save icon, an optional secondary action to copy that one file to a different location; it does not replace auto-save.
+- Each landed result row carries its own save icon, an optional secondary action to copy that one
+  file to a different location; it does not replace auto-save.
 
 ### Error states
 Each maps to a user-facing message and the `.failed` Model state:
@@ -123,6 +186,13 @@ Every change should end with a check against the *running* app, not just a compi
 - Test fixtures live under `test-images/` (gitignored): a small PNG, a large JPEG, a HEIC, a WebP, an
   already-tiny PNG (negative-savings case), a non-image file renamed `.jpg`, and one file over the
   size limit.
+- **Record the Phase A baseline before touching code.** Every fixture's current output size goes
+  into `docs/phase-b-baseline.md`; it is the +/-15% gate for M13/M14 and cannot be reconstructed
+  afterwards.
+- **Two fixtures are missing and block the correctness requirements.** Every current fixture is
+  sRGB with `orientation: <nil>`, so nothing in the tree exercises orientation, color, or
+  multi-frame handling. Add a rotated Display-P3 iPhone HEIC and a Live Photo HEIC. Both are
+  gitignored, so they are tier-2 material only.
 
 ### Testing strategy
 Two tiers, in this order. Reaching for the GUI to answer a question a unit test answers faster is
@@ -143,6 +213,12 @@ is ReleaseFast and has neither automation nor hot reload — verification runs a
 in a unit test uses in-repo bytes: `canvas.png.writeRgba8` to encode a raw RGBA fixture plus
 `harness.null_platform.image_decode = true` for the decode→register→draw path.
 
+**Phase B moves the tier-1 seam.** Most encode and load coverage in `src/tests.zig` drives fake
+SPAWNS; after M13/M14 those paths are host requests, so the assertions move to
+`pendingHostCount`/`pendingHostAt` + `feedHostResult`. This is a real migration across a
+2,519-line suite, not a mechanical rename, and it is part of each milestone rather than a
+follow-up.
+
 ## Key decisions carried forward
 Quick reference; full rationale for each is in `docs/plan-v0.1-archive.md`.
 - **Partial failure in "Both" mode is partial SUCCESS.** The two encodes are independent; one landing
@@ -158,9 +234,39 @@ Quick reference; full rationale for each is in `docs/plan-v0.1-archive.md`.
   (`save_avif_as`/`save_webp_as`), each running its own one-shot save-dialog-then-copy round — no
   queue, since `showSaveDialog` only ever needs to answer one path at a time this way. Pressing
   either icon while a round is already in flight is a no-op.
+- **AVIF via ImageIO, not a vendored libavif.** "Statically link libavif" hides libaom: libavif is
+  a wrapper and the real encoder is an AV1 encoder, a large CMake C project. macOS ImageIO
+  encodes AVIF natively and, measured on `test-images/large.jpg`, produced 633,154 B in 0.23s
+  against `avifenc -q 58 --speed 6`'s 717,003 B in 0.60s. AVIF therefore needs zero third-party
+  code; only WebP needs a vendored library.
+- **Phase B output is calibrated to a size band, not matched byte-for-byte.** ImageIO's knob is
+  `kCGImageDestinationLossyCompressionQuality`, an opaque 0.0-1.0 float with no published mapping
+  to `avifenc -q` and no speed knob at all. Bytes cannot be identical across two encoders. The
+  gate is Phase A's recorded sizes +/-15% with no visible regression, not reproduction.
+- **Long work runs off the loop thread via a host command, because there is no worker effect.**
+  `Effects` offers spawn/fetch/file/db/pty/channel and nothing that runs arbitrary Zig off-loop.
+  The seam is a `HostCallBinding.request_fn` that returns WITHOUT answering, with a worker thread
+  calling `effects.feedHostResult` when it finishes (`feedHostResult` uses atomic slot state and
+  calls `wakeHost()`, so it is built for this). Every `request_fn` in `HostBridge` today answers
+  synchronously, so this is a new pattern and gets its own spike. Note this is a hitch Phase B
+  INTRODUCES — today's subprocess encode never blocks the loop.
 
 ## Known limitations
-None currently open.
+- **Smoosh requires `brew install libavif webp`.** The app detects the missing tools and names the
+  install command, but a zero-friction local tool should not need either. This is what Phase B
+  exists to remove.
+- **A crash mid-encode can leave a truncated output** beside the source; the encoders write their
+  destination directly. Fixed by Phase B's atomic write.
 
 ## Next up
-The UI polishing round has not been planned yet. Add its milestones here when that starts.
+Phase B, in order. M13 and M14 are separately shippable; the spike gates both.
+1. **Spike the threaded host command** (`docs/spikes/threaded-host-call-spike.zig`, following
+   `dialog-open-file-spike.zig`'s precedent): a `request_fn` that spawns a `std.Thread`, returns
+   immediately, and feeds `feedHostResult` from that thread. Prove the Msg lands and the window
+   still paints. If this does not work, stop and re-plan — every long operation in M13/M14
+   depends on it.
+2. **Record the Phase A baseline** and add the two missing fixtures.
+3. **M13 (v0.2)** — ImageIO decode + native AVIF.
+4. **M14 (v0.3)** — vendored libwebp; zero dependencies.
+
+UI polishing remains unplanned and now sits behind Phase B.

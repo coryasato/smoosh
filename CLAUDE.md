@@ -46,7 +46,7 @@ re-enters the exact same load chain a picked one does. Full spec and source cita
 authoring guides; this file only records project-specific decisions.
 
 ### Toolchain
-- `native` CLI **0.9.0**, installed globally (`~/.npm-global/bin/native`) — not a devDependency.
+- `native` CLI **0.10.1**, installed globally (`~/.npm-global/bin/native`) — not a devDependency.
 - Zig **0.16.0** (`/usr/local/bin/zig-aarch64-macos-0.16.0/zig`).
 - `node_modules/` + `package.json` + `tsconfig.json` are an **editor-only** surface for the
   abandoned TS-core path. Builds never read them. Do not run installs to "fix" a build.
@@ -126,8 +126,9 @@ For a hand-authored root, window geometry is stated three times and all three mu
 ## Current status
 v0.1 shipped (M1-M12; full history in `docs/plan-v0.1-archive.md`): pick or drop an image, choose
 AVIF/WebP/Both, Smoosh auto-saves next to the source, optionally Save As to another location,
-packaged as an ad-hoc-signed `.app`. `native build`/`check`/`test` all clean (99/99 tests, zero
-`check` warnings). No known limitations currently open.
+packaged as an ad-hoc-signed `.app`. `native build`/`check`/`test` all clean, zero `check`
+warnings. One limitation is open — Smoosh requires `brew install libavif webp` — and removing it
+is what Phase B (M13/M14) exists to do; see PLAN.md.
 
 Two standing rules from that round, still load-bearing for any future work:
 - **Never automate a native file dialog** (open or save panel). The app runs as a bare executable
