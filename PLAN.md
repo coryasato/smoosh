@@ -26,8 +26,14 @@ arm64-macos and link into both a running ReleaseFast exe and the Debug test arti
 cost of +5.20 MiB. Written up in `docs/phase-b-baseline.md` under "Phase B step 6". Nothing in
 THIS tree is ejected or vendored yet — that is M14.
 
-**The encoders are untouched, exactly as M13 promised** — `avifenc`/`cwebp` still read the source
-file with the pinned argv, so no output byte moved. What changed is everything upstream of them:
+**M14a is DONE** (2026-08-28): `native eject` ran, `build.zig` is ours and links the four vendored
+encode-only archives under `third_party/` into both the exe and the test artifact, `src/encoders.zig`
+exists holding version probes only, and `src/imageio_tests.zig` runs under `native test` at last
+(108 -> 116 tests). The app calls no vendored encoder yet and still needs Homebrew; M14b and M14c
+are what change that. Exe grew 128 bytes.
+
+**The encoders are untouched, exactly as M13 promised and as M14a preserved** — `avifenc`/`cwebp`
+still read the source file with the pinned argv, so no output byte moved. What changed is everything upstream of them:
 the preview and the megapixel guard now read the file's PRIMARY frame, with EXIF orientation baked
 and the profile converted to sRGB.
 
@@ -193,10 +199,12 @@ Deliberately KEPT until M14, because the encoder spawns still need them: the HEI
 `Model`; switching it would be a behavior change (a mis-named HEIC would start staging) for a step
 M14 deletes outright.
 
-**M14 (v0.3) — vendored encoders, zero dependencies.** One build round for both formats.
+**M14 (v0.3) — vendored encoders, zero dependencies.** Split into M14a/b/c; see "Next up".
 `native eject` to own `build.zig`, then swap `addApp` for `addAppArtifacts` so
 `artifacts.exe.root_module` is reachable — `AppOptions` has no link passthrough, so owning the
-build is the only route. **That gate is now PASSED** (step 5, 2026-08-28): `addAppArtifacts` is
+build is the only route. **ALL OF THIS IS DONE — it was M14a** (2026-08-28); what follows is kept
+as the record of why the build looks the way it does, and `build.zig`'s own comments are the live
+version. The gate was passed earlier still (step 5, 2026-08-28): `addAppArtifacts` is
 public in CLI 0.10.1 and returns `AppArtifacts{ exe, tests, install, run }`, `eject`'s output
 builds, and a prebuilt `libwebp.a` links into the executable and runs. The hand-written-`build.zig`
 fallback is not needed. Four things the spike settled that M14 must carry
@@ -209,14 +217,15 @@ fallback is not needed. Four things the spike settled that M14 must carry
   (`b.sysroot ++ "/System/Library/Frameworks"`; `addAppArtifacts` has already resolved
   `b.sysroot`), or the link fails with `searched paths:  none`.
 - **Therefore M14 can fold `src/imageio_tests.zig` back into `native test`** — proven with a test
-  calling `CGImageSourceGetTypeID()`. When that lands, CLAUDE.md's "`native test` links no
-  frameworks" note and the run-by-hand instruction in `src/imageio_tests.zig` both stop being true
-  and must be rewritten in the same commit.
+  calling `CGImageSourceGetTypeID()`. **DONE in M14a**, along with the rewrites it forced:
+  CLAUDE.md's "`native test` links no frameworks" note, the run-by-hand instruction in
+  `src/imageio_tests.zig`, and the matching claim in `src/imageio.zig`'s header.
 - **`native eject` is one-shot and refuses if `build.zig`/`build.zig.zon` already exist.**
   `build`, `test` and `check` all keep working afterwards (`check` still validates markup against
   the model contract).
 
-Vendor under `third_party/`, encode-only in every case:
+Vendor under `third_party/`, encode-only in every case (**DONE in M14a**; `third_party/README.md`
+is the live record):
 - **libwebp** + libsharpyuv — the second is MANDATORY, not a nicety: `picture_csp_enc.c.o` calls
   `SharpYuvConvert`/`SharpYuvInit`/`SharpYuvGetConversionMatrix` (measured in step 5, where the
   ReleaseFast exe linked clean without it and only the Debug test artifact failed — a missing
@@ -462,15 +471,20 @@ the failure mode to avoid.
 **Tier 1 — `native test` (`src/tests.zig`).** Deterministic, no GUI, no processes, no network. This
 is where logic gets proven.
 
-**`native test` LINKS NO FRAMEWORKS, so ImageIO is out of reach from tier 1.** Found in M13, from
-the SDK source: `build/app.zig` derives `test_app_mod` as a fresh Debug module whenever
-`app_optimize != optimize`, and `app_optimize` defaults to ReleaseFast — so `linkPlatform`, which
-is what adds `linkFramework("AppKit")` and everything ImageIO rides in on, never runs on it. Any
-test reaching `imageio.probe`/`thumbnail` fails at LINK time with `undefined symbol: _CFRelease`.
-Note this catches tests in ANY file reachable from `main.zig`, not just `src/tests.zig`, so the
-ImageIO tests live in `src/imageio_tests.zig`, which nothing imports; its header carries the
-standalone `zig test` command. They embed their own PNGs rather than reading `test-images/`, so
-they run on a fresh clone. Fold them in once M14 owns `build.zig` and can link the test module. The seam is the same dispatch path the runtime uses: build the markup
+**`native test` LINKS FRAMEWORKS AS OF M14a, so ImageIO is now reachable from tier 1.** The
+constraint it replaces, found in M13 from the SDK source, is worth keeping because its SHAPE still
+applies: `build/app.zig` derives `test_app_mod` as a fresh Debug module whenever
+`app_optimize != optimize` (and `app_optimize` defaults to ReleaseFast), so `linkPlatform` — which
+adds `linkFramework("AppKit")` and everything ImageIO rides in on — never runs on it. Any test
+reaching `imageio.probe`/`thumbnail` died at LINK time on `undefined symbol: _CFRelease`, in ANY
+file reachable from `main.zig`. M14a's ejected `build.zig` states the frameworks on
+`artifacts.tests.root_module` itself, and `src/imageio_tests.zig` is now imported by `main.zig`'s
+`test` block and runs under `native test` (suite went 108 -> 116: 5 ImageIO tests plus 3 encoder
+link probes). Its tests embed their own PNGs rather than reading `test-images/`, so they still run
+on a fresh clone.
+
+**The trap generalizes to anything you link next.** `exe.root_module` and `tests.root_module` are
+separate modules; wire only the exe and the failure shows up solely in the test artifact. The seam is the same dispatch path the runtime uses: build the markup
 against the real `Model`, find a widget, ask the tree for the `Msg`, feed it to `update`.
 - Effects-bearing paths drive `Effects` in fake-executor mode (`fx.executor = .fake`, via the
   `Harness` in `src/tests.zig`) — assert the *request* an arm made, then feed the answer and drain.
@@ -586,9 +600,14 @@ them. Each entry says which half it is in.
   destination directly. Fixed by Phase B's atomic write.
 
 ## Next up
-Phase B, in order. M13 and M14 are separately shippable. **Steps 1-6 are DONE** (2026-08-27/28) —
-every spike is behind us and both M14 gates (the link path and the encoder artifacts) are passed.
-**M14 is next and is unblocked.**
+Phase B, in order. M13 and M14 are separately shippable. **Steps 1-7 are DONE** (2026-08-27/28) —
+every spike is behind us, both M14 gates are passed, and M14a has landed the build ownership and
+the vendored archives. **M14b is next and is unblocked.**
+
+M14 is split into three because it does not fit one sitting: M14a (build + vendor, done) was the
+fully de-risked half and moves no output byte; M14b is pure logic; M14c is the encoder swap plus an
+open-ended parity investigation. The a/b boundary is a true shippable seam. The b/c boundary is
+softer — M14b leaves `image.decode` with no consumer — so fold b into c if b goes quickly.
 
 1. ~~**Spike the threaded host command.**~~ **DONE** — `docs/spikes/threaded-host-call-spike.zig`.
    Verdict: works, but NOT the way this plan assumed. `feedHostResult` is loop-thread-only; the
@@ -640,6 +659,41 @@ every spike is behind us and both M14 gates (the link path and the encoder artif
    - **Output parity is NOT yet proven.** Our libaom is `-O3` (upstream Release) where Homebrew's
      is `-Os`, and libaom's rate control carries floating-point math, so M14 must re-encode the
      fixture set against the Phase A table rather than assume the bitstream is unchanged.
-7. **M14 (v0.3)** — vendored libwebp + libavif/libaom; zero dependencies.
+7. ~~**M14a — own the build, vendor the archives.**~~ **DONE** (2026-08-28). `native eject` ran;
+   `build.zig` and `build.zig.zon` are ours and the CLI drives `zig build`. `build.zig` swaps
+   `addApp` for `addAppArtifacts` and links the four encode-only archives plus the three ImageIO
+   frameworks into BOTH `exe.root_module` and `tests.root_module`, transplanted from the step-5
+   spike. Archives and the two headers we call are vendored under `third_party/` (8.8 MB, tracked)
+   with `third_party/README.md` recording provenance. `src/encoders.zig` is created holding ONLY
+   version probes; `src/imageio_tests.zig` is folded into `native test`. Suite 108 -> 116, `check`
+   zero warnings, exe 5,522,248 -> 5,522,376 bytes (+128) and `otool -L` shows no new dylibs.
+   Four things worth carrying:
+   - **The exe does not reference the archives yet, only the test artifact does.** `encoders.zig`
+     is reachable from `tests.zig`, not from `main`, so the ReleaseFast exe emits none of the
+     extern symbols and the +128 bytes is framework wiring, not encoder code. The exe-side link is
+     proven by the step-5 spike (which called into the archive from a running GUI app), not by
+     this tree. It stops being a question the moment M14c calls an encoder.
+   - **`native dev` and `native package` both work on an ejected tree** — two of the three edges
+     the spike left open. Verified live: `native dev` built Debug, launched, rendered the full
+     20-widget tree with `markup_watch=armed`, and `native automate snapshot` drove it. The third
+     edge (x86_64/universal) is untouched and out of scope.
+   - **The version pins are a real gate, not decoration.** `encoders.pinned` holds libwebp 1.6.0 /
+     libavif 1.4.2 / libaom v3.14.1 and three tests assert them, so a re-copied archive cannot
+     change the encoder out from under `docs/phase-b-baseline.md` silently.
+   - **`native eject` is one-shot and refuses if the files exist.** There is no re-ejecting to
+     pick up CLI changes; `build.zig` is now a file we maintain.
+8. **M14b (v0.3)** — `image.decode` (full-res 8-bit RGBA, primary frame, EXIF transform applied by
+   hand, sRGB), the JPEG SOF chroma parser, and the chroma table from "Correctness requirements".
+   Pure logic plus one host command; all tier-1 testable. Note `image.decode` has no consumer until
+   M14c, so this step deliberately lands code the app does not call yet.
+9. **M14c (v0.3)** — the two encode seams in `src/encoders.zig` (libwebp and libavif, written
+   together so they share a shape), atomic write, then the deletions: both encoder spawns, the HEIC
+   staging step in full, `resolveSpawnEnviron`, the launch probe, `missing_encoder`, the brew
+   messages. Then the tier-1 encode tests migrate off `pendingSpawnAt`/`feedExit` (23 call sites)
+   onto the new seam, and the fixture set is re-encoded against the Phase A table.
+   **Budget the parity investigation as real work, not a checkbox** — our libaom is `-O3` where
+   Homebrew's is `-Os` and rate control carries FP math, so the bitstream may legitimately differ.
+   Keep M14c in ONE session: the two seams should rhyme, and breaking mid-parity-investigation
+   loses the per-fixture state that makes it tractable.
 
 UI polishing remains unplanned and now sits behind Phase B.

@@ -1866,4 +1866,9 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("tests.zig");
+    // Runnable under `native test` since M14a: `build.zig` now states the
+    // ImageIO frameworks on the test artifact's module, which the SDK's
+    // own platform wiring never reached. Before that these had to be run
+    // by hand from a file nothing imported.
+    _ = @import("imageio_tests.zig");
 }

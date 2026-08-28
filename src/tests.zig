@@ -16,6 +16,7 @@ const std = @import("std");
 const native_sdk = @import("native_sdk");
 const main = @import("main.zig");
 const imageio = @import("imageio.zig");
+const encoders = @import("encoders.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -2635,4 +2636,32 @@ test "a drop clears the previous file's results and preview, like a pick does" {
     try testing.expectEqualStrings("/Users/someone/Pictures/tiny.png", h.model().path());
     try testing.expect(!h.model().hasAvifResult());
     try testing.expect(!h.model().hasPreview());
+}
+
+// ---------------------------------------------------------------------
+// M14a: the vendored encoder archives.
+//
+// These are the reachable callers that make the link proof real. A test
+// build never analyzes `main`, so without a call the extern symbols are
+// never emitted and this artifact would link clean whether or not
+// `build.zig` wired the archives in at all. They also pin the versions
+// the Phase A baseline was measured against, so a re-copied archive
+// cannot change the encoder out from under `docs/phase-b-baseline.md`
+// without a test going red.
+//
+// That they run HERE, in the test artifact, is the other half of the
+// proof: `tests.root_module` is a separate Debug module that inherits
+// nothing from the exe's, and wiring only the exe is the mistake this
+// catches.
+
+test "libwebp links, at the version the baseline was measured against" {
+    try testing.expectEqual(encoders.pinned.libwebp, encoders.libwebpVersion());
+}
+
+test "libavif links, at the version the baseline was measured against" {
+    try testing.expectEqualStrings(encoders.pinned.libavif, encoders.libavifVersion());
+}
+
+test "libaom links, at the version the baseline was measured against" {
+    try testing.expectEqualStrings(encoders.pinned.libaom, encoders.libaomVersion());
 }

@@ -13,7 +13,8 @@ Goal: replace the "upload to TinyPNG / Squoosh / browser tab" workflow with a ze
 - **Platform**: macOS only (for now)
 - **Image handling**:
   - Decode/preview: Apple ImageIO, called from Zig (`src/imageio.zig`) — landed in M13.
-  - Encode: still system tools via `fx.spawn` (`avifenc`, `cwebp`); M14 vendors libavif/libwebp.
+  - Encode: still system tools via `fx.spawn` (`avifenc`, `cwebp`). The vendored libavif/libaom/
+    libwebp archives are already linked in (M14a) but nothing calls them yet; M14c swaps the seam.
 
 ## Why Zig, not TS-core
 Originally planned as a TS-core app (`src/core.ts`, "no JS runtime in binary" — see git history). Reversed after spiking file acquisition: native open/save dialogs (`native-sdk.dialog.openFile`/`saveFile`) and file drops are gated behind `RunOptions.bridge`/`.builtin_bridge`, fields that only exist on hand-authored `main.zig`. Verified from source (`@native-sdk/cli@0.8.0`'s `build/app.zig`): `addApp`'s `AppOptions` has no passthrough for them, the CLI-generated TS-core `main.zig` hardcodes them off with no override, and the build hard-panics if a tree carries both `src/core.ts` and `src/main.zig` ("an app has exactly one core"). There is no partial-adoption path — TS-core categorically cannot reach these. Confirmed by building and `native check`-validating a throwaway spike app, not by reading docs alone.
@@ -50,9 +51,16 @@ authoring guides; this file only records project-specific decisions.
 - Zig **0.16.0** (`/usr/local/bin/zig-aarch64-macos-0.16.0/zig`).
 - `node_modules/` + `package.json` + `tsconfig.json` are an **editor-only** surface for the
   abandoned TS-core path. Builds never read them. Do not run installs to "fix" a build.
-- No pinned SDK version in the tree (no `build.zig.zon`), so `native build` always links whatever
-  the globally installed CLI carries. Run `native test` before `native check` after any CLI upgrade
-  — `check` degrades to grammar-only with a loud note until `test` regenerates the model contract.
+- **This app owns its build** (`build.zig` + `build.zig.zon`), as of M14a — `native eject` ran and
+  the CLI now drives `zig build` instead of generating a graph. It will never rewrite those files.
+  `build.zig` calls `addAppArtifacts` rather than `addApp` so the vendored archives and the ImageIO
+  frameworks can be stated on the artifacts; a framework upgrade still upgrades the wiring, because
+  everything else still comes from the SDK's `build/app.zig`. **`native eject` is one-shot and
+  refuses if either file exists** — there is no re-ejecting to pick up CLI changes.
+- Still no pinned SDK VERSION: `build.zig.zon` depends on the global CLI by relative path, so
+  `native build` links whatever the installed CLI carries. Run `native test` before `native check`
+  after any CLI upgrade — `check` degrades to grammar-only with a loud note until `test`
+  regenerates the model contract.
 
 ### Commands
 ```sh
@@ -68,29 +76,40 @@ native automate screenshot <view-label>        # gpu_surface views only
 `native dev --core` is TS-core only and does not apply here.
 Widget clicks take a **numeric id from `snapshot`**, not a label — snapshot first.
 
-**`native test` links no frameworks.** `build/app.zig` builds its test artifact from a fresh Debug
-module whenever `app_optimize != optimize` (and `app_optimize` defaults to ReleaseFast), so
-`linkPlatform` never runs on it. Anything reaching ImageIO — from any file reachable from
-`main.zig`, tests included — fails at link time with `undefined symbol: _CFRelease`. That is why
-`src/imageio_tests.zig` is imported by nothing and run by hand:
+**`native test` links frameworks now — since M14a.** It did not before, and the reason is worth
+keeping: `build/app.zig` builds its test artifact from a fresh Debug module whenever
+`app_optimize != optimize` (and `app_optimize` defaults to ReleaseFast), so the SDK's private
+`linkPlatform` never runs on it. Anything reaching ImageIO from any file reachable from `main.zig`,
+tests included, died at link time on `undefined symbol: _CFRelease`. `src/imageio_tests.zig` was
+therefore imported by nothing and run by hand.
 
-```sh
-zig test src/imageio_tests.zig -lc \
-  -framework ImageIO -framework CoreGraphics -framework CoreFoundation
-```
+Owning `build.zig` fixed it: it states the frameworks on `artifacts.tests.root_module` directly.
+`src/imageio_tests.zig` is now imported by `main.zig`'s `test` block and runs like everything else.
 
-This is a consequence of the CLI owning the build graph, not a law: step 5's spike showed that an
-ejected `build.zig` can state the frameworks on `artifacts.tests.root_module` itself and link them.
-M14 ejects, so this note and the run-by-hand instruction both expire then — see PLAN.md's M14.
+**The shape of that trap still applies to anything new you link.** `artifacts.exe.root_module` and
+`artifacts.tests.root_module` are SEPARATE modules and both must be wired; wire only the exe and
+the failure appears solely in the test artifact. `linkFramework` also needs an explicit
+`addFrameworkPath`, or the link fails with `searched paths:  none`. Both are commented in
+`build.zig` — read it before adding a library.
 
 ### Repo layout
 - `src/main.zig` — the app. Hand-authored root: builds its own platform + Runtime.
 - `src/app.native` — markup view.
 - `src/imageio.zig` — the whole ImageIO C-ABI seam (`extern fn`, not `@cImport`): `probe` and
   `thumbnail`, both callable from a worker thread and both returning straight-alpha 8-bit sRGB.
-- `src/imageio_tests.zig` — its tests, in a file NOTHING imports. `native test` links no
-  frameworks (see "Commands"), and it compiles every test reachable from `main.zig`, so this is
-  the only place they can live. Run them by hand; the file's header has the command.
+- `src/imageio_tests.zig` — its tests. Imported by `main.zig`'s `test` block and run by
+  `native test` like everything else, since M14a. (It used to be a file nothing imported, run by
+  hand — see "Commands" for why, and do not reintroduce that pattern.)
+- `src/encoders.zig` — the Zig-to-encoder seam, the mirror of `imageio.zig`. **M14a wired the
+  build but wrote no encoders**: right now this holds only the three version probes that prove the
+  vendored archives link, and the app still spawns `avifenc`/`cwebp`. The encode functions land in
+  M14c.
+- `build.zig` / `build.zig.zon` — ours since M14a (see "Toolchain"). `build.zig` links the vendored
+  archives and the ImageIO frameworks into both the exe and the test artifact; its comments record
+  why each line is there.
+- `third_party/` — vendored encode-only static archives (libavif, libaom, libwebp + libsharpyuv)
+  and the headers for the two APIs we call. `third_party/README.md` records versions, provenance
+  and the two traps the build cannot state.
 - `src/tests.zig` — unit tests, pulled in by a `test {}` block at the bottom of `main.zig` (the
   scaffold's convention). Run with `native test`. See PLAN.md's "Testing strategy" for the two
   tiers and what belongs in each.
@@ -164,10 +183,15 @@ AVIF/WebP/Both, Smoosh auto-saves next to the source, optionally Save As to anot
 packaged as an ad-hoc-signed `.app`.
 
 Phase B M13 (v0.2) is DONE: the load chain runs on ImageIO, both `sips` reads and `fx.loadImage`
-are gone, and the preview now shows the file's primary frame, upright and in sRGB. The encoders are
-untouched, so no output byte moved — M14 is what removes the Homebrew dependency.
-`native build`/`check`/`test` all clean, zero `check` warnings. **PLAN.md is the source of truth**
-for what is done and what is next.
+are gone, and the preview now shows the file's primary frame, upright and in sRGB.
+
+**M14a is DONE too**: the build is ejected and ours, the encode-only archives are vendored under
+`third_party/` and link into both the exe and the test artifact, and `src/imageio_tests.zig` runs
+under `native test` for the first time. **No encoder is called yet** — the app still spawns
+`avifenc`/`cwebp` with the pinned argv, so no output byte has moved and the Homebrew dependency is
+still there. M14b (decode + chroma) and M14c (the encode seams + parity) are what remove it.
+`native build`/`check`/`test`/`dev`/`package` all clean, zero `check` warnings.
+**PLAN.md is the source of truth** for what is done and what is next.
 
 Two standing rules from that round, still load-bearing for any future work:
 - **Never automate a native file dialog** (open or save panel). The app runs as a bare executable

@@ -7,15 +7,13 @@
 //! every claim below against the whole fixture set. Read that file's
 //! header before changing anything here.
 //!
-//! `extern fn` rather than `@cImport`: `@cImport` would need framework
-//! include paths threaded through a build we do not own yet (`native
-//! build` links whatever the global CLI carries), and every type here is
-//! an opaque pointer or a plain scalar, so declaring them by hand costs
-//! less than wiring the header search. ImageIO, CoreGraphics and
-//! CoreFoundation are already in the binary's load commands — AppKit
-//! pulls them in, confirmed with `otool -L zig-out/bin/smoosh`, not
-//! assumed. M14 owns `build.zig` and should add an explicit
-//! `linkFramework("ImageIO")` rather than keep relying on that.
+//! `extern fn` rather than `@cImport`: every type here is an opaque
+//! pointer or a plain scalar, so declaring them by hand costs less than
+//! wiring a header search. ImageIO, CoreGraphics and CoreFoundation are
+//! now linked EXPLICITLY — `build.zig` states all three on both the exe
+//! and the test module, as of M14a. Before that the app relied on AppKit
+//! pulling them in transitively (confirmed with `otool -L`, not assumed),
+//! and the test artifact got them not at all.
 //!
 //! TWO commands live here, deliberately separate because they have
 //! opposite cost profiles:
@@ -24,25 +22,25 @@
 //!                 megapixel guard can run BEFORE anything is decoded.
 //!   `thumbnail` — <=160px preview, orientation baked by ImageIO itself.
 //!
-//! THIS FILE'S TESTS LIVE IN `src/imageio_tests.zig`, AND `native test`
-//! DOES NOT RUN THEM. Its test artifact is a separate Debug module
-//! (`build/app.zig`'s `test_app_mod`, which diverges from the app module
-//! because `app_optimize` is ReleaseFast) and `linkPlatform` never runs on
-//! it, so the test binary links no frameworks — any test reaching the
-//! declarations below fails at LINK time with
-//! `undefined symbol: _CFRelease`. That is also why the tests are a file
-//! nothing imports rather than a `test` block down here: everything
-//! reachable from `main.zig` is compiled into the test artifact, tests
-//! included. Run them by hand, from the repo root:
+//! THIS FILE'S TESTS LIVE IN `src/imageio_tests.zig`, and **`native test`
+//! RUNS THEM** — `main.zig`'s `test` block imports that file. They stay in
+//! their own file rather than moving into `src/tests.zig` only because
+//! they are a coherent set about one seam; nothing forces the split any
+//! more.
 //!
-//!     zig test src/imageio_tests.zig -lc \
-//!       -framework ImageIO -framework CoreGraphics -framework CoreFoundation
+//! It used to. The SDK builds its test artifact from a separate Debug
+//! module (`build/app.zig`'s `test_app_mod`, which diverges from the app
+//! module because `app_optimize` is ReleaseFast) and `linkPlatform` never
+//! runs over it, so the test binary linked no frameworks and any test
+//! reaching the declarations below died at LINK time on
+//! `undefined symbol: _CFRelease`. M14a ejected `build.zig` and states the
+//! frameworks on `artifacts.tests.root_module` directly, which is what
+//! closed it.
 //!
 //! They need no fixtures — the PNGs are embedded there — so they work on a
-//! fresh clone. Fold them into `src/tests.zig` once M14 owns `build.zig`
-//! and can link the test module.
+//! fresh clone.
 //!
-//! The third command, a full-resolution decode for the encoders, lands with M14:
+//! The third command, a full-resolution decode for the encoders, lands with M14c:
 //! it has no consumer until the vendored encoders exist, and unlike the
 //! two above it needs the EXIF transform applied by hand (the full-decode
 //! path does not rotate — measured in the spike, where the same 4000x3000

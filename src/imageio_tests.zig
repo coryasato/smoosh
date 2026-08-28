@@ -1,9 +1,16 @@
-//! Standalone tests for `src/imageio.zig`. NOTHING IMPORTS THIS FILE, on
-//! purpose — see that file's header: everything reachable from `main.zig`
-//! is compiled into `native test`'s artifact, and that artifact links no
-//! frameworks, so a test touching ImageIO fails at link time. Run them by
-//! hand, from the repo root:
+//! Tests for `src/imageio.zig`. **These run under `native test` like
+//! everything else** — `main.zig`'s `test` block imports this file.
 //!
+//! That is true only since M14a. Before it, `native test`'s artifact
+//! linked no frameworks (the SDK builds it from a fresh Debug module that
+//! `linkPlatform` never runs over), so any test touching ImageIO died at
+//! link time on `undefined symbol: _CFRelease` — and these tests
+//! therefore had to live in a file NOTHING imported and be run by hand.
+//! M14a ejected `build.zig`, which can state the frameworks on
+//! `artifacts.tests.root_module` itself. If you find that command in an
+//! old note, it is stale:
+//!
+//!     # NO LONGER NEEDED — `native test` runs these now.
 //!     zig test src/imageio_tests.zig -lc \
 //!       -framework ImageIO -framework CoreGraphics -framework CoreFoundation
 //!
