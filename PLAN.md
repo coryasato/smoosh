@@ -19,9 +19,12 @@ warnings, `native build` clean.
 `sips` spawns, `fx.loadImage`, `parseDimensions`, the preview temp file and the drawn-size clamp
 are gone. `native test` 108/108, `native check` zero warnings, `native build` clean at 5.5 MB.
 Steps 1-3 (the two prerequisite spikes and the Phase A baseline) were done 2026-08-27.
-**Step 5 (the link-path spike) is DONE** (2026-08-28) — `docs/spikes/static-archive-link-spike.zig`.
-`addAppArtifacts` is real in CLI 0.10.1 and M14's build shape is settled; nothing is ejected or
-vendored yet.
+**Steps 5 and 6 (both M14 gates) are DONE** (2026-08-28). The link path is proven
+(`docs/spikes/static-archive-link-spike.zig`; `addAppArtifacts` is real in CLI 0.10.1), and so are
+the artifacts: encode-only `libwebp.a` + `libsharpyuv.a`, `libavif.a` and `libaom.a` are built for
+arm64-macos and link into both a running ReleaseFast exe and the Debug test artifact, at a measured
+cost of +5.20 MiB. Written up in `docs/phase-b-baseline.md` under "Phase B step 6". Nothing in
+THIS tree is ejected or vendored yet — that is M14.
 
 **The encoders are untouched, exactly as M13 promised** — `avifenc`/`cwebp` still read the source
 file with the pinned argv, so no output byte moved. What changed is everything upstream of them:
@@ -225,23 +228,24 @@ Vendor under `third_party/`, encode-only in every case:
   build), because libaom is what `avifenc` itself uses and so is what reproduces today's output.
   No dav1d — decoding AVIF is ImageIO's job.
 
-**libaom is the hard vendor, not libwebp — budget for it separately.** libwebp is plain C and
-will compile through `addCSourceFiles` with some pain. libaom will not: its build deps are
-cmake + ninja + meson + python, and its per-architecture `rtcd` dispatch headers
-(`aom_config.h`, `aom_dsp_rtcd.h`, ...) are GENERATED at configure time. That generation, not
-assembly, is the real obstacle — on arm64-macOS libaom uses NEON intrinsics in C and needs no
-external assembler (nasm is x86-only), so this is a configure problem, not a toolchain one. The
-pragmatic path is to PREBUILD `libaom.a`, `libavif.a` and `libwebp.a` for arm64-macos once and
-link the artifacts, rather than reproducing CMake's configure step inside `build.zig`. Prove
-that before writing any encoder Zig.
+**The prebuild path is settled and the artifacts exist** (step 6, 2026-08-28). PLAN.md budgeted
+libaom as the hard vendor because its `rtcd` dispatch headers (`aom_config.h`, `aom_dsp_rtcd.h`,
+...) are GENERATED at configure time. That worry was correct about the mechanism and wrong about
+the cost: CMake generates them itself using macOS's own `/usr/bin/perl`, so with cmake + ninja
+installed the whole encode-only build is 22s. No meson (that is dav1d's build system and we vendor
+no decoder) and no nasm (arm64 libaom is NEON intrinsics in plain C). Reproducing CMake's configure
+step inside `build.zig` remains the thing NOT to attempt — M14 links the prebuilt archives.
+Exact invocations, encode-only verification and the size numbers: `docs/phase-b-baseline.md`,
+"Phase B step 6".
 
 Both encoders consume `image.decode`'s FULL-RESOLUTION 8-bit RGBA (never `image.thumbnail`'s
 160px buffer), so the HEIC staging hop disappears rather than being ported. Each encode also
 needs `image.probe`'s source UTI to pick `yuvFormat` per the chroma table in "Correctness
-requirements". Expect the encoder stack, not the Zig, to dominate binary size: roughly +5 MB
-against today's 5.8 MB — still an estimate, and specifically a claim about CALLING the encoders.
-Linking pulls only referenced archive members: step 5 added libwebp.a + libsharpyuv.a for +608
-bytes with nothing but `WebPGetEncoderVersion` called. All BSD-licensed and compatible with a local tool.
+requirements". The encoder stack, not the Zig, dominates binary size, and it is now MEASURED
+rather than estimated: **+5.20 MiB** for a build referencing the real encoder entry points, landing
+Smoosh around 10.7 MB. Linking pulls only referenced archive members, which is why the same
+archives cost +1,424 bytes when only the version symbols are called — the 8.1 MB libaom.a is not
+the price. All BSD-licensed and compatible with a local tool.
 
 Deletes: both encoder spawns, the HEIC staging step in full (`isHeicSource`, `heic_convert_key`,
 `convert_result`, `convert_failed`, `converted_path`, `resolveAppTempPath`), `resolveSpawnEnviron`,
@@ -582,8 +586,9 @@ them. Each entry says which half it is in.
   destination directly. Fixed by Phase B's atomic write.
 
 ## Next up
-Phase B, in order. M13 and M14 are separately shippable. **Steps 1-4 are DONE** (2026-08-27/28),
-and so is **step 5**; the remaining spike (step 6) is a hard gate for M14 specifically.
+Phase B, in order. M13 and M14 are separately shippable. **Steps 1-6 are DONE** (2026-08-27/28) —
+every spike is behind us and both M14 gates (the link path and the encoder artifacts) are passed.
+**M14 is next and is unblocked.**
 
 1. ~~**Spike the threaded host command.**~~ **DONE** — `docs/spikes/threaded-host-call-spike.zig`.
    Verdict: works, but NOT the way this plan assumed. `feedHostResult` is loop-thread-only; the
@@ -617,16 +622,24 @@ and so is **step 5**; the remaining spike (step 6) is a hard gate for M14 specif
    needs an explicit `addFrameworkPath` — which together mean M14 can bring `imageio_tests.zig`
    back into `native test`. Also measured: libsharpyuv is mandatory. Full findings and the
    untested edges (vendoring, `native dev`/`package`, x86_64) in the spike's header.
-6. **Spike the encoder artifacts** — produce `libwebp.a`, `libavif.a` and `libaom.a` for
-   arm64-macos, encode-only, and record the exact configure invocations in
-   `docs/phase-b-baseline.md`. Separate from step 5 because it is a build-system problem, not a
-   linking one, and libaom's generated `rtcd` headers are where it will bite.
-   **Verify each artifact in `~/Code/zig/smoosh-linkspike`** — step 5's spike app, kept outside
-   this repo with a warm cache (no-op build ~0.3s vs ~50s cold). Its README has the procedure and
-   the version symbol to call per library. Run BOTH `native build` and `native test` against every
-   archive: libsharpyuv proved one can link clean in the ReleaseFast exe and fail in the Debug
-   test artifact. Note Homebrew ships static `libwebp.a`/`libsharpyuv.a`/`libaom.a` but **libavif
-   as a dylib only**, so libavif must be built from source regardless.
+6. ~~**Spike the encoder artifacts.**~~ **DONE** (2026-08-28) — all three archives built
+   encode-only for arm64-macos under `~/Code/zig/smoosh-vendor`, verified in the linkspike, and
+   fully written up in `docs/phase-b-baseline.md` under "Phase B step 6". Verdict: works, and
+   **libaom was not the hard vendor PLAN.md budgeted for** — CMake generates the `rtcd` headers
+   itself using macOS's own `/usr/bin/perl`, no nasm and no meson, and the whole build is 22s.
+   `brew install cmake ninja` was the only prerequisite. Four things beyond the plan:
+   - **The +5 MB estimate is confirmed at +5.20 MiB**, measured three ways (no archives / version
+     symbols only / real encoder entry points referenced). Smoosh lands around 10.7 MB. The
+     version-only row is +1,424 bytes — the 8.1 MB archive is not the cost, the referenced members
+     are.
+   - **`AVIF_LIBYUV=OFF` and `AVIF_LIBSHARPYUV=OFF` are output-parity requirements.** `AVIF_LIBYUV`
+     defaults to `SYSTEM` and would silently swap in different RGB->YUV math than the baseline's
+     `avifenc` used. Getting these wrong moves output bytes and nothing in the build says so.
+   - **libavif.a must precede libaom.a in the link order** — it leaves all 15 `aom_codec_*`
+     symbols undefined.
+   - **Output parity is NOT yet proven.** Our libaom is `-O3` (upstream Release) where Homebrew's
+     is `-Os`, and libaom's rate control carries floating-point math, so M14 must re-encode the
+     fixture set against the Phase A table rather than assume the bitstream is unchanged.
 7. **M14 (v0.3)** — vendored libwebp + libavif/libaom; zero dependencies.
 
 UI polishing remains unplanned and now sits behind Phase B.

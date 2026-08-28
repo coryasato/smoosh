@@ -69,7 +69,8 @@
 //! - Linking an archive costs only what is REFERENCED: 6,466,408 ->
 //!   6,467,016 bytes (+608) for libwebp.a + libsharpyuv.a with nothing
 //!   but `WebPGetEncoderVersion` called. PLAN.md's "+5 MB" budget is a
-//!   claim about calling the ENCODERS, and remains unmeasured.
+//!   claim about calling the ENCODERS — measured in step 6 at +5.20 MiB,
+//!   see the STEP 6 UPDATE below.
 //!
 //! - No `@cImport`, no header, no include path: a hand-written
 //!   `extern fn WebPGetEncoderVersion() c_int;` links against the
@@ -124,15 +125,46 @@
 //!     }
 //!
 //! Both passed (7/7) once the modules below were wired.
+//!
+//! ============================ STEP 6 UPDATE ============================
+//!
+//! 2026-08-28. Step 6 closed the "nothing about VENDORING" gap above: all
+//! three encode-only archives now exist, built from source for arm64-macos
+//! under `~/Code/zig/smoosh-vendor`, and the body below links all three
+//! instead of Homebrew's libwebp. The full recipe (configure invocations,
+//! source hashes, encode-only verification) is in
+//! `docs/phase-b-baseline.md` under "Phase B step 6"; only what changes
+//! THIS FILE is repeated here:
+//!
+//! - LINK ORDER MATTERS. `libavif.a` carries its own object files only and
+//!   leaves all 15 `aom_codec_*` symbols undefined, so it must be added
+//!   BEFORE `libaom.a`.
+//! - The size question this spike left open is answered: +1,424 bytes for
+//!   all three archives with only their version symbols called, and
+//!   +5,451,472 (+5.20 MiB) once the real encoder entry points are
+//!   referenced. Same ReleaseFast app, three builds.
+//! - `native build` and `native test` (9/9) are both green against the
+//!   three archives, and `otool -L` on the exe shows no new dylibs.
+//!
+//! Still not proven, and inherited unchanged from above: `native dev`,
+//! `native package`, x86_64/universal, and calling an encoder for real.
+//! Output parity is ALSO still open — our libaom is `-O3` where
+//! Homebrew's is `-Os`, so M14 must re-encode the fixture set rather than
+//! assume the bitstream is unchanged.
+//!
+//! The paths below are still absolute and outside the repo, which is
+//! still deliberate: the real build will use `b.path("third_party/...")`.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 
-// Homebrew's arm64 archives stand in for the vendored ones step 6
-// produces. libwebp.a alone does not link: picture_csp_enc.c.o calls
-// into libsharpyuv.
-const libwebp_a = "/opt/homebrew/opt/webp/lib/libwebp.a";
-const libsharpyuv_a = "/opt/homebrew/opt/webp/lib/libsharpyuv.a";
+// Step 6's encode-only archives, built from source. libwebp.a alone does
+// not link: picture_csp_enc.c.o calls into libsharpyuv.
+const vendor = "/Users/coryasato/Code/zig/smoosh-vendor/out";
+const libavif_a = vendor ++ "/libavif/lib/libavif.a";
+const libaom_a = vendor ++ "/libaom/lib/libaom.a";
+const libwebp_a = vendor ++ "/libwebp/lib/libwebp.a";
+const libsharpyuv_a = vendor ++ "/libwebp/lib/libsharpyuv.a";
 
 pub fn build(b: *std.Build) void {
     const artifacts = native_sdk.addAppArtifacts(b, b.dependency("native_sdk", .{}), .{
@@ -144,6 +176,10 @@ pub fn build(b: *std.Build) void {
     // analysis object and the model-contract exe, but the test artifact
     // gets its own Debug module and inherits none of this.
     for ([_]*std.Build.Module{ artifacts.exe.root_module, artifacts.tests.root_module }) |mod| {
+        // libavif before libaom: libavif.a leaves every aom_codec_*
+        // symbol undefined for the archive under it to satisfy.
+        mod.addObjectFile(.{ .cwd_relative = libavif_a });
+        mod.addObjectFile(.{ .cwd_relative = libaom_a });
         mod.addObjectFile(.{ .cwd_relative = libwebp_a });
         mod.addObjectFile(.{ .cwd_relative = libsharpyuv_a });
 
