@@ -19,6 +19,9 @@ warnings, `native build` clean.
 `sips` spawns, `fx.loadImage`, `parseDimensions`, the preview temp file and the drawn-size clamp
 are gone. `native test` 108/108, `native check` zero warnings, `native build` clean at 5.5 MB.
 Steps 1-3 (the two prerequisite spikes and the Phase A baseline) were done 2026-08-27.
+**Step 5 (the link-path spike) is DONE** (2026-08-28) — `docs/spikes/static-archive-link-spike.zig`.
+`addAppArtifacts` is real in CLI 0.10.1 and M14's build shape is settled; nothing is ejected or
+vendored yet.
 
 **The encoders are untouched, exactly as M13 promised** — `avifenc`/`cwebp` still read the source
 file with the pinned argv, so no output byte moved. What changed is everything upstream of them:
@@ -190,13 +193,32 @@ M14 deletes outright.
 **M14 (v0.3) — vendored encoders, zero dependencies.** One build round for both formats.
 `native eject` to own `build.zig`, then swap `addApp` for `addAppArtifacts` so
 `artifacts.exe.root_module` is reachable — `AppOptions` has no link passthrough, so owning the
-build is the only route. Treat `eject`/`addAppArtifacts` as a SPIKE GATE, not a given: both are
-CLI-version-specific (the tree pins no SDK version, so `native build` links whatever the global
-CLI carries). If `eject`'s output is unusable, the fallback is to hand-write a `build.zig` calling
-the same public `addAppArtifacts` — NOT "pass linker flags", since without an owned build there is
-nowhere to pass them; Zig has no source-level link pragma. Vendor under `third_party/`, encode-only in every case:
-- **libwebp** + libsharpyuv. No libwebpmux (animation is a non-goal), no libpng/libjpeg (those
-  serve libwebp's tools, not the library).
+build is the only route. **That gate is now PASSED** (step 5, 2026-08-28): `addAppArtifacts` is
+public in CLI 0.10.1 and returns `AppArtifacts{ exe, tests, install, run }`, `eject`'s output
+builds, and a prebuilt `libwebp.a` links into the executable and runs. The hand-written-`build.zig`
+fallback is not needed. Four things the spike settled that M14 must carry
+(`docs/spikes/static-archive-link-spike.zig` has the evidence):
+- **Wire BOTH `exe.root_module` and `tests.root_module`.** The exe's module is shared with the
+  hidden `-analysis` object and `-model-contract` exe; the test artifact's is a separate Debug
+  module that inherits nothing. Miss it and a test touching the archive dies on
+  `undefined symbol: _WebPGetEncoderVersion` — CLAUDE.md's `_CFRelease` failure in a new coat.
+- **`linkFramework` needs `addFrameworkPath`** on those same modules
+  (`b.sysroot ++ "/System/Library/Frameworks"`; `addAppArtifacts` has already resolved
+  `b.sysroot`), or the link fails with `searched paths:  none`.
+- **Therefore M14 can fold `src/imageio_tests.zig` back into `native test`** — proven with a test
+  calling `CGImageSourceGetTypeID()`. When that lands, CLAUDE.md's "`native test` links no
+  frameworks" note and the run-by-hand instruction in `src/imageio_tests.zig` both stop being true
+  and must be rewritten in the same commit.
+- **`native eject` is one-shot and refuses if `build.zig`/`build.zig.zon` already exist.**
+  `build`, `test` and `check` all keep working afterwards (`check` still validates markup against
+  the model contract).
+
+Vendor under `third_party/`, encode-only in every case:
+- **libwebp** + libsharpyuv — the second is MANDATORY, not a nicety: `picture_csp_enc.c.o` calls
+  `SharpYuvConvert`/`SharpYuvInit`/`SharpYuvGetConversionMatrix` (measured in step 5, where the
+  ReleaseFast exe linked clean without it and only the Debug test artifact failed — a missing
+  companion archive can hide until the other artifact is built). No libwebpmux (animation is a
+  non-goal), no libpng/libjpeg (those serve libwebp's tools, not the library).
 - **libavif** (mux/encode API only) + **libaom** built `CONFIG_AV1_DECODER=0` (and
   `CONFIG_TUNE_VMAF=0` — Homebrew treats libvmaf as required, and we do not need it). libaom
   rather than SVT-AV1 (faster but much larger) or rav1e (pulls a Rust toolchain into a Zig
@@ -217,7 +239,9 @@ Both encoders consume `image.decode`'s FULL-RESOLUTION 8-bit RGBA (never `image.
 160px buffer), so the HEIC staging hop disappears rather than being ported. Each encode also
 needs `image.probe`'s source UTI to pick `yuvFormat` per the chroma table in "Correctness
 requirements". Expect the encoder stack, not the Zig, to dominate binary size: roughly +5 MB
-against today's 5.8 MB. All BSD-licensed and compatible with a local tool.
+against today's 5.8 MB — still an estimate, and specifically a claim about CALLING the encoders.
+Linking pulls only referenced archive members: step 5 added libwebp.a + libsharpyuv.a for +608
+bytes with nothing but `WebPGetEncoderVersion` called. All BSD-licensed and compatible with a local tool.
 
 Deletes: both encoder spawns, the HEIC staging step in full (`isHeicSource`, `heic_convert_key`,
 `convert_result`, `convert_failed`, `converted_path`, `resolveAppTempPath`), `resolveSpawnEnviron`,
@@ -558,8 +582,8 @@ them. Each entry says which half it is in.
   destination directly. Fixed by Phase B's atomic write.
 
 ## Next up
-Phase B, in order. M13 and M14 are separately shippable. **Steps 1-3 are DONE** (2026-08-27); the
-two remaining spikes are hard gates for M14 specifically.
+Phase B, in order. M13 and M14 are separately shippable. **Steps 1-4 are DONE** (2026-08-27/28),
+and so is **step 5**; the remaining spike (step 6) is a hard gate for M14 specifically.
 
 1. ~~**Spike the threaded host command.**~~ **DONE** — `docs/spikes/threaded-host-call-spike.zig`.
    Verdict: works, but NOT the way this plan assumed. `feedHostResult` is loop-thread-only; the
@@ -584,10 +608,15 @@ two remaining spikes are hard gates for M14 specifically.
    consumer); the preview pixels ride the host result rather than a descriptor, behind a comptime
    assert; the worker carrier ships with an `abandoned` flag the spike did not need. Full account
    in the M13 entry above; live verification in "Verification strategy".
-5. **Spike the link path** — the M14 gate, and the one the SDK actively fights. `native eject`,
-   swap `addApp` for `addAppArtifacts`, and link ONE prebuilt `.a` (libwebp is the smaller
-   target) into `artifacts.exe.root_module`; call `WebPGetEncoderVersion` from Zig and print it.
-   Only once that links and runs is vendoring anything else worth starting.
+5. ~~**Spike the link path** — the M14 gate.~~ **DONE** (2026-08-28) —
+   `docs/spikes/static-archive-link-spike.zig`, run against a throwaway `zig-core` app on CLI
+   0.10.1 / Zig 0.16.0. Verdict: works, and the SDK fights it less than expected.
+   `addAppArtifacts` is public and `native eject`'s output builds; Homebrew's `libwebp.a` links
+   into the exe and `WebPGetEncoderVersion` returns 1.6.0 from the running app. Two things beyond
+   the plan: `tests.root_module` is a SEPARATE module that must be wired too, and `linkFramework`
+   needs an explicit `addFrameworkPath` — which together mean M14 can bring `imageio_tests.zig`
+   back into `native test`. Also measured: libsharpyuv is mandatory. Full findings and the
+   untested edges (vendoring, `native dev`/`package`, x86_64) in the spike's header.
 6. **Spike the encoder artifacts** — produce `libwebp.a`, `libavif.a` and `libaom.a` for
    arm64-macos, encode-only, and record the exact configure invocations in
    `docs/phase-b-baseline.md`. Separate from step 5 because it is a build-system problem, not a

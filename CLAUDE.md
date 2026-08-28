@@ -79,6 +79,10 @@ zig test src/imageio_tests.zig -lc \
   -framework ImageIO -framework CoreGraphics -framework CoreFoundation
 ```
 
+This is a consequence of the CLI owning the build graph, not a law: step 5's spike showed that an
+ejected `build.zig` can state the frameworks on `artifacts.tests.root_module` itself and link them.
+M14 ejects, so this note and the run-by-hand instruction both expire then — see PLAN.md's M14.
+
 ### Repo layout
 - `src/main.zig` — the app. Hand-authored root: builds its own platform + Runtime.
 - `src/app.native` — markup view.
@@ -95,7 +99,9 @@ zig test src/imageio_tests.zig -lc \
   file's header records what it proved AND what it did not; read that before transplanting.
   `dialog-open-file-spike.zig` (file acquisition), `threaded-host-call-spike.zig` (long work off
   the loop thread), `imageio-decode-spike.zig` (the ImageIO C-ABI seam; builds standalone with
-  `zig build-exe … -framework ImageIO -framework CoreGraphics -framework CoreFoundation`).
+  `zig build-exe … -framework ImageIO -framework CoreGraphics -framework CoreFoundation`),
+  `static-archive-link-spike.zig` (M14's ejected `build.zig` — this one IS a build.zig: copy it,
+  do not `@import` it).
 - `docs/plan-v0.1-archive.md` — full v0.1 development history (see PLAN.md's header).
 - `docs/phase-b-baseline.md` — the pre-Phase-B measurement of the shipping app (size, PSNR, AVIF
   `yuvFormat`, metadata) plus the fixture-set inventory and how to regenerate it. Append-only: it
