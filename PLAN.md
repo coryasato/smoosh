@@ -13,14 +13,21 @@ auto-saves next to the source; each landed result row carries its own save icon 
 file elsewhere, packaged as an ad-hoc-signed `.app`. `native test` 100/100, `native check` zero
 warnings, `native build` clean.
 
-**Phase B is UNDER WAY.** Its first three steps are done (2026-08-27): both prerequisite spikes
-are validated (`docs/spikes/threaded-host-call-spike.zig`,
-`docs/spikes/imageio-decode-spike.zig`) and the Phase A baseline is recorded against a fixture set
-grown from 8 files to 16 (`docs/phase-b-baseline.md`). No app code has changed yet; M13 is next.
+**Phase B is UNDER WAY. M13 (v0.2) is DONE** (2026-08-28). The load chain runs on ImageIO: a new
+`src/imageio.zig` holds the whole C-ABI seam, two new host commands (`image.probe`,
+`image.thumbnail`) answer off the loop thread through `HostBridge`'s worker carrier, and both
+`sips` spawns, `fx.loadImage`, `parseDimensions`, the preview temp file and the drawn-size clamp
+are gone. `native test` 108/108, `native check` zero warnings, `native build` clean at 5.5 MB.
+Steps 1-3 (the two prerequisite spikes and the Phase A baseline) were done 2026-08-27.
+
+**The encoders are untouched, exactly as M13 promised** — `avifenc`/`cwebp` still read the source
+file with the pinned argv, so no output byte moved. What changed is everything upstream of them:
+the preview and the megapixel guard now read the file's PRIMARY frame, with EXIF orientation baked
+and the profile converted to sRGB.
 
 The limitation driving the round is unchanged — Smoosh requires `brew install libavif webp` to do
-anything — but measuring the baseline turned up four more shipping bugs Phase B fixes for free.
-See "Known limitations" and Phase B below.
+anything — and M14 is what removes it. See "Known limitations" for what M13 fixed, what it fixed
+only halfway, and what is still waiting on the encoders.
 
 ## Success criteria for v0.1 (MVP) — all shipped
 - [x] App launches to a clean drop-zone UI that becomes a file card once a file lands
@@ -109,61 +116,76 @@ The split is DECODE vs ENCODE, because the two have opposite answers:
   forward" for the measurements that settled this. Matching today's output on ALL content
   requires the same encoders Phase A shells out to.
 
-**M13 (v0.2) — ImageIO decode, preview and probe.** No build-graph change and no encoder change:
-the `avifenc`/`cwebp` spawns stay exactly as they are. This rests on ImageIO already being linked,
-which is confirmed from the shipped binary's own load commands rather than inferred —
+**M13 (v0.2) — ImageIO decode, preview and probe. DONE (2026-08-28).** No build-graph change and
+no encoder change: the `avifenc`/`cwebp` spawns are exactly as they were. This rested on ImageIO
+already being linked, confirmed from the shipped binary's own load commands rather than inferred —
 `otool -L zig-out/bin/smoosh` lists ImageIO, CoreGraphics and CoreFoundation directly. M14's eject
 should still add an explicit `linkFramework("ImageIO")` rather than keep depending on that.
 
-New C-ABI surface lives in `src/imageio.zig` as plain `extern fn` declarations (not `@cImport`,
-which would need include paths; CoreFoundation types are opaque pointers and declare cleanly).
-Proven standalone by `docs/spikes/imageio-decode-spike.zig` — that file is the transplant
-reference, and about 90 lines of declarations already cover all three commands below. **Keep the
-surface tiny** — `CGImageSourceCreateWithURL`, `GetPrimaryImageIndex`, `CopyPropertiesAtIndex`,
-`CreateImageAtIndex`, `CreateThumbnailAtIndex`, plus only the CF/CG calls actually used. Do not
-redeclare half of ImageIO. Three new host commands, each answering
-off-thread. They are deliberately separate because they have different cost profiles — conflating
-the preview and encode paths is how a 160px thumbnail ends up as the encoder's input:
-- `image.probe` — properties only: primary-frame index, pixel dimensions, source UTI and
-  orientation, via `CGImageSourceCopyPropertiesAtIndex`. Decodes NOTHING. Replaces the `sips -g`
-  spawn and feeds the existing megapixel guard, which today runs only after a decode has already
-  happened. The UTI it returns is what M14's chroma table keys on.
-- `image.thumbnail` — preview only, <=160px, 8-bit sRGB RGBA with orientation baked, for
-  `fx.registerImage`. Use `CGImageSourceCreateThumbnailAtIndex` with
-  `kCGImageSourceThumbnailMaxPixelSize`, `kCGImageSourceCreateThumbnailFromImageAlways` and
-  `kCGImageSourceCreateThumbnailWithTransform` (which applies orientation for us) — NOT a full
-  `CGImageSourceCreateImageAtIndex`. Smoosh accepts up to 50 MP; decoding all of it to draw a
-  160px card would be absurd. Replaces the `sips` thumbnail spawn AND `fx.loadImage` AND its temp
-  file.
-- `image.decode` — FULL-RESOLUTION primary frame, 8-bit sRGB RGBA, orientation baked, profile
-  converted. This is the encoder's input, and the only one that needs
-  `CGImageSourceCreateImageAtIndex` drawn into an 8-bit sRGB bitmap context. The bitmap context
-  handles the sRGB conversion by itself, but it does NOT rotate — unlike `image.thumbnail`,
-  measured — so this is the one place orientation must be applied by hand (transform the context
-  before drawing, per `kCGImagePropertyOrientation`). It has no consumer
-  until M14, so it may land here or with the encoders — but it must exist and must never be
-  confused with `image.thumbnail`.
+The C-ABI surface is `src/imageio.zig`: plain `extern fn` declarations (not `@cImport`, which would
+need include paths), transplanted from `docs/spikes/imageio-decode-spike.zig`. 100 lines of
+declarations cover both commands; CoreFoundation types are opaque pointers and declare cleanly.
 
-**PIXELS CANNOT RIDE THE HOST RESULT.** `max_effect_host_result_bytes` is 256 KiB and an over-cap
-answer is silently rewritten to the err route with the bytes `"host result over budget"` (verified
-by unit test in the threaded spike). A 160x160 RGBA thumbnail is 100 KiB and fits; 256x256 is
-exactly the cap; a full-resolution decode is never close (`oversized.jpg` is 205 MB of RGBA). So
-`image.thumbnail` may return bytes only while the preview stays <=160px, and `image.decode` must
-answer with a small DESCRIPTOR (`"<w> <h> <len>"`) while the pixels stay in a bridge-owned
-`pub var` buffer that `update` reads — the same shape `pub var thumbnail_path` already has today.
-Note the registered-image cap is a separate, larger 1 MiB
-(`max_registered_canvas_image_pixel_bytes`, raisable to 8 MiB), so the host-result cap is the
-binding constraint, not the image registry. Prefer the descriptor shape for BOTH commands: it costs
-one extra global and removes a silent cliff at 256x256.
+TWO host commands landed, not three, and both answer off the loop thread:
+- `image.probe` — properties only, via `CGImageSourceCopyPropertiesAtIndex`. Decodes NOTHING.
+  Replaced the `sips -g` spawn and now feeds the megapixel guard BEFORE any decode has happened,
+  which the old ordering could not offer. Returns `"<w> <h> <orientation> <uti>"`; the dimensions
+  are DISPLAY dimensions (orientation already applied) and the UTI is what M14's chroma table will
+  key on.
+- `image.thumbnail` — preview only, <=160px, 8-bit sRGB, straight alpha, orientation baked by
+  `kCGImageSourceCreateThumbnailWithTransform`. Replaced the `sips` thumbnail spawn AND
+  `fx.loadImage` AND its temp file; `update` now calls `fx.registerImage` directly.
+- `image.decode` — DEFERRED TO M14, deliberately. It has no consumer until the vendored encoders
+  exist, and wiring a host command with no Msg arm would have meant shipping an unreachable code
+  path. The seam it would use and the module it lands in are both proven by the two above; what it
+  still needs of its own is the EXIF transform applied BY HAND, since the full-decode path does not
+  rotate (measured: the same 4000x3000 Orientation 6 source comes back 120x160 as a thumbnail and
+  4000x3000 unrotated as a full decode).
 
-Deletes: the two `sips` spawns, `parseDimensions`, `thumbnail_path` and its two buffers, and the
-`fx.loadImage`/`thumbnail_result` hop. `Model` gains the source UTI alongside `source_width`/
-`source_height`, since M14 needs it and `image.probe` is already returning it.
+**THE PIXELS RIDE THE HOST RESULT, and PLAN.md's earlier "prefer the descriptor shape for BOTH
+commands" was the wrong call for the thumbnail.** `max_effect_host_result_bytes` is 256 KiB and an
+over-cap answer is silently rewritten to the err route; 160x160 RGBA is 100 KiB and fits with room.
+The descriptor's advantage was said to be removing a silent cliff at 256x256 — but a
+`comptime` assert removes that cliff outright, as a COMPILE error rather than a runtime one, and
+riding the result costs nothing extra: `hostRequest` heap-allocates `payload.len + 256 KiB` per
+request whether or not the answer uses it. It also deletes a whole class of bug the descriptor
+shape would have introduced, since bytes fed for a key are copied into that key's own effect slot
+and a cancelled key drops them, while a `pub var` pixel buffer is shared by every in-flight worker.
+A full-resolution decode still cannot ride the result and M14 must use a descriptor there.
 
-Deliberately KEPT until M14, because the encoder spawns still need them: the HEIC->PNG staging
-step (`isHeicSource`, `heic_convert_key`, `convert_result`, `convert_failed`, `converted_path`) —
+The header is FIXED WIDTH (`"{d:0>5} {d:0>5}\n"`) so ImageIO decodes straight into the reply buffer
+past it, rather than the bridge moving 100 KiB of pixels to make room for a shorter number.
+
+**Long work goes off the loop thread through `HostBridge`'s worker carrier** — the seam
+`docs/spikes/threaded-host-call-spike.zig` proved, now shipping: `poll_fn`/`pending_fn`/
+`bind_services_fn`/`shutdown_fn`, three slots, each owning its own reply buffer. The dialogs,
+`file.stat` and `file.copy` still answer SYNCHRONOUSLY from `request_fn`, which is legal and right
+— a panel has to run on the main thread anyway. Slots carry an `abandoned` flag, which the spike
+did not need and the real app does: a reset or a second drop mid-load leaves the old worker
+running, and `feedHostResult` matches on key alone, so without it a superseded worker's pixels
+would be delivered as the NEW file's preview.
+
+Deleted, as planned: both `sips` spawns, `parseDimensions`, `thumbnail_path` and its two buffers,
+and the `fx.loadImage`/`image_loaded` hop. Deleted beyond the plan: `Model.previewWidth`/
+`previewHeight`. Those clamped the drawn size to the source because `sips -Z 160` UPSCALED anything
+smaller (an 8x8 icon rendered as a 160x160 blur); ImageIO CAPS instead, measured across the fixture
+set, so the registered size is already honest and the markup binds `preview_width`/`preview_height`
+directly.
+
+`Model` gained the source UTI beside `source_width`/`source_height`, as planned. Nothing in v0.2
+reads it — it is there because M14 needs it and `image.probe` already returns it.
+
+**One deliberate behavior change beyond the fixes: a probe that cannot be parsed now FAILS the
+load.** Phase A tolerated an unparseable `sips -g` answer and let the thumbnail spawn be the format
+gate. There is no second gate any more — the thumbnail is the same ImageIO read — so a probe that
+cannot name the image's size is a file the preview could not have drawn either.
+
+Deliberately KEPT until M14, because the encoder spawns still need them: the HEIC->PNG staging step
+(`isHeicSource`, `heic_convert_key`, `convert_result`, `convert_failed`, `converted_path`) —
 `avifenc`/`cwebp` still cannot read HEIC — plus `resolveSpawnEnviron`, the `which` probe and
-`resolveAppTempPath`.
+`resolveAppTempPath`. `isHeicSource` still sniffs the EXTENSION rather than the UTI now sitting in
+`Model`; switching it would be a behavior change (a mis-named HEIC would start staging) for a step
+M14 deletes outright.
 
 **M14 (v0.3) — vendored encoders, zero dependencies.** One build round for both formats.
 `native eject` to own `build.zig`, then swap `addApp` for `addAppArtifacts` so
@@ -209,20 +231,27 @@ orientation tag and its ICC profile rather than resolving either), and a raw
 `CGImageSourceCreateImageAtIndex` does none of it. Each item below is therefore behavior to
 IMPLEMENT — some preserving what Phase A does, some fixing what it does wrong. Measurements are in
 `docs/phase-b-baseline.md`.
-- **Primary frame, not index 0.** Use `CGImageSourceGetPrimaryImageIndex`. **This is a live bug,
+- **Primary frame, not index 0. LANDED IN M13 for the probe and the preview; the ENCODER INPUT is
+  still index 0 until M14** (a HEIC still reaches the encoders through the `sips` staging step,
+  which takes index 0). Use `CGImageSourceGetPrimaryImageIndex`. **This is a live bug,
   not a precaution:** on `multi-primary.heic` (two top-level images, `pitm` naming the second) all
   three of today's `sips` calls take index 0, so the megapixel guard measures the wrong image, the
   card previews the wrong image, and the user gets a compressed copy of an image that was never
   the primary — silently. Note a real iPhone still does NOT reach this path: an HDR capture's gain
   map is an AUXILIARY image and `CGImageSourceGetCount` reports `frames 1`, so the fixture had to
   be synthesized.
-- **Bake in EXIF orientation.** Read `kCGImagePropertyOrientation` and transform before encoding.
+- **Bake in EXIF orientation. LANDED IN M13 for the preview only** — `image.thumbnail` comes back
+  upright, so the card no longer shows a sideways photo. The OUTPUT files are unchanged and still
+  disagree with each other; that is M14's, because the encoders still read the source file.
+  Read `kCGImagePropertyOrientation` and transform before encoding.
   `CGImageSourceCreateThumbnailAtIndex` with `kCGImageSourceCreateThumbnailWithTransform` does
   this FOR the preview (verified: a 4000x3000 source with Orientation 6 yields a 120x160
   thumbnail), so only `image.decode` needs the transform by hand. This also fixes today's
   inconsistency, where the same rotated source produces an upright AVIF and a sideways WebP —
   and where `avifenc` itself only writes `irot` for a JPEG input, not for a staged PNG.
-- **Convert to sRGB and tag sRGB.** ImageIO passes the source profile through by default, so a
+- **Convert to sRGB and tag sRGB. LANDED IN M13 for the preview only**, where the bitmap context
+  does it for free; the outputs still carry whatever the encoders make of the source.
+  ImageIO passes the source profile through by default, so a
   Display P3 iPhone photo would emit P3. Web output is this tool's whole purpose, so convert:
   predictable rendering everywhere beats preserving a gamut most consumers mishandle. This is a
   deliberate, irreversible trade, recorded in "Key decisions carried forward." It is new for EVERY
@@ -272,7 +301,9 @@ IMPLEMENT — some preserving what Phase A does, some fixing what it does wrong.
   4:2:0, one component -> grayscale. About 20 lines; a prototype reproduces ImageMagick's reading
   of all three JPEG fixtures exactly. Do not assume JPEG means 4:2:0 — our own primary fixture is
   the exception.
-- **Decode to 8-bit RGBA — in `image.decode` and `image.thumbnail` only.** Pin those two bitmap
+- **Decode to 8-bit RGBA — in `image.decode` and `image.thumbnail` only. LANDED IN M13** for
+  `image.thumbnail` (`drawToRgba8` pins 8 bits per channel); `image.probe` allocates no bitmap at
+  all, as required. Pin those two bitmap
   contexts to 8 bits per channel rather than inheriting the source's depth. `image.probe`
   allocates no bitmap at all and must stay that way. A 16-bit source is otherwise carried into the encoder at higher
   depth for no benefit, and it is what triggers the ImageIO alpha bug recorded in "Key decisions
@@ -282,8 +313,13 @@ IMPLEMENT — some preserving what Phase A does, some fixing what it does wrong.
   layout is `kCGImageAlphaPremultipliedLast`, and row 0 of the backing store is the image's TOP row
   (both verified in the spike). No vertical flip is needed feeding an encoder that wants top-down
   rows, but an encoder wanting STRAIGHT alpha must un-premultiply — which matters for exactly one
-  fixture, `alpha16.png`.
-- **An undecodable file is detected by frame COUNT, not by a null source.**
+  fixture, `alpha16.png`. **M13 un-premultiplies in `drawToRgba8`, so `src/imageio.zig` returns
+  STRAIGHT alpha to every caller** — not an optimisation but a contract: `fx.registerImage`
+  documents its input as straight-alpha RGBA8, and libwebp/libavif want the same, so having one
+  convention leave the module beats two callers each remembering to convert.
+- **An undecodable file is detected by frame COUNT, not by a null source. LANDED IN M13** —
+  `imageio.probe` returns `error.NotAnImage` off the count, and that failure is the format gate the
+  thumbnail spawn used to be.
   `CGImageSourceCreateWithURL` SUCCEEDS on `not-an-image.jpg` (49 bytes of text) and returns a
   non-null source; `CGImageSourceGetCount() == 0` (and a null `GetType()`) is what says "not an
   image". Test the count, or the undecodable-input error arrives later and as the wrong message.
@@ -343,6 +379,14 @@ Every change should end with a check against the *running* app, not just a compi
 - Test fixtures live under `test-images/` (gitignored): a small PNG, a large JPEG, a HEIC, a WebP, an
   already-tiny PNG (negative-savings case), a non-image file renamed `.jpg`, and one file over the
   size limit.
+- **M13 was verified live, by hand, over six drops** (2026-08-28, `native dev`), since neither a
+  drop nor a dialog can be automated. `multi-primary.heic` previews 160x50 — the 640x200 primary,
+  where the shipping app draws the 400x300 image at index 0; `rotated-gps.jpg` previews 120x160
+  upright; `tiny.png` draws 8x8, not a 160x160 blur; `not-an-image.jpg` fails at the PROBE with the
+  supported-formats message and no preview widget in the tree; `oversized.jpg` fails at 51 MP
+  before anything is decoded. The regression check is the one that matters most: `large.jpg`
+  smooshed to **717,003 B AVIF and 671,054 B WebP — byte-identical to the recorded baseline**, not
+  merely inside the +/-15% gate. That is what "the encoders are untouched" has to mean.
 - **The Phase A baseline is RECORDED** — `docs/phase-b-baseline.md`, taken before any Phase B code,
   with size, PSNR, AVIF `yuvFormat`, decoded dimensions and metadata presence for every fixture.
   It is the +/-15% gate for M13/M14 and cannot be reconstructed afterwards, so treat it as
@@ -388,7 +432,17 @@ Two tiers, in this order. Reaching for the GUI to answer a question a unit test 
 the failure mode to avoid.
 
 **Tier 1 — `native test` (`src/tests.zig`).** Deterministic, no GUI, no processes, no network. This
-is where logic gets proven. The seam is the same dispatch path the runtime uses: build the markup
+is where logic gets proven.
+
+**`native test` LINKS NO FRAMEWORKS, so ImageIO is out of reach from tier 1.** Found in M13, from
+the SDK source: `build/app.zig` derives `test_app_mod` as a fresh Debug module whenever
+`app_optimize != optimize`, and `app_optimize` defaults to ReleaseFast — so `linkPlatform`, which
+is what adds `linkFramework("AppKit")` and everything ImageIO rides in on, never runs on it. Any
+test reaching `imageio.probe`/`thumbnail` fails at LINK time with `undefined symbol: _CFRelease`.
+Note this catches tests in ANY file reachable from `main.zig`, not just `src/tests.zig`, so the
+ImageIO tests live in `src/imageio_tests.zig`, which nothing imports; its header carries the
+standalone `zig test` command. They embed their own PNGs rather than reading `test-images/`, so
+they run on a fresh clone. Fold them in once M14 owns `build.zig` and can link the test module. The seam is the same dispatch path the runtime uses: build the markup
 against the real `Model`, find a widget, ask the tree for the `Msg`, feed it to `update`.
 - Effects-bearing paths drive `Effects` in fake-executor mode (`fx.executor = .fake`, via the
   `Harness` in `src/tests.zig`) — assert the *request* an arm made, then feed the answer and drain.
@@ -402,11 +456,13 @@ is ReleaseFast and has neither automation nor hot reload — verification runs a
 in a unit test uses in-repo bytes: `canvas.png.writeRgba8` to encode a raw RGBA fixture plus
 `harness.null_platform.image_decode = true` for the decode→register→draw path.
 
-**Phase B moves the tier-1 seam, in two steps.** Coverage in `src/tests.zig` drives fake SPAWNS
-today. M13 moves the LOAD chain (probe, thumbnail) to host requests; M14 moves the ENCODE chain.
-Both land on `pendingHostCount`/`pendingHostAt` + `feedHostResult` instead of the spawn
-assertions. This is a real migration across a 2,519-line suite, not a mechanical rename, and each
-half belongs to its own milestone rather than a follow-up.
+**Phase B moves the tier-1 seam, in two steps. M13 did the first.** The LOAD chain (probe,
+thumbnail) now drives `pendingHostAt`/`pendingHostCount` + `feedHostResult` instead of
+`pendingSpawnAt`/`feedExit`; the ENCODE chain still drives spawns and moves with M14. The
+migration also let three tests get SHARPER rather than merely ported: the reset-staleness tests now
+assert `error.EffectNotFound` from a post-reset `feedHostResult`, which proves the cancel really
+silences the answer rather than that a status guard happens to drop it — and that proof is why the
+load chain's status guards could go. Suite is 108 tests.
 
 ## Key decisions carried forward
 Quick reference; full rationale for each is in `docs/plan-v0.1-archive.md`.
@@ -467,7 +523,10 @@ Quick reference; full rationale for each is in `docs/plan-v0.1-archive.md`.
 
 ## Known limitations
 All five of the new entries below were measured while recording the Phase A baseline; the numbers
-are in `docs/phase-b-baseline.md`. Every one of them is fixed by Phase B.
+are in `docs/phase-b-baseline.md`. Every one of them is fixed by Phase B, and M13 has now fixed the
+INPUT side of three of them — what the app measures and shows. The OUTPUT side of all three is
+still Phase A's, because the encoders still read the source file themselves; M14 is what closes
+them. Each entry says which half it is in.
 - **Smoosh requires `brew install libavif webp`.** The app detects the missing tools and names the
   install command, but a zero-friction local tool should not need either. This is what Phase B
   exists to remove.
@@ -477,18 +536,24 @@ are in `docs/phase-b-baseline.md`. Every one of them is fixed by Phase B.
   while AVIF is skipped — leaving the whole run `.failed`. Both formats are in the open panel's
   filter list and both are accepted on drop, so this is reachable from the UI. The archive records
   the `same_path` decision but not that the OTHER format cannot be produced.
-- **An orientation-tagged source produces one upright file and one sideways one.** `avifenc`
+- **An orientation-tagged source produces one upright file and one sideways one.** OUTPUT SIDE,
+  still live. The PREVIEW is fixed as of M13 — the card shows the photo upright. `avifenc`
   translates EXIF Orientation into an AVIF `irot` transform; `cwebp` ignores orientation entirely.
   Worse, `avifenc` only does this for a JPEG input — the same tag arriving via the `sips`-staged
   PNG (any rotated HEIC) yields `Transformations: None` and a sideways AVIF too.
-- **A Display-P3 source produces a desaturated WebP.** `cwebp` strips the ICC profile, so P3 pixel
+- **A Display-P3 source produces a desaturated WebP.** OUTPUT SIDE, still live. The PREVIEW is
+  fixed as of M13 — it is converted to sRGB before it is registered. `cwebp` strips the ICC
+  profile, so P3 pixel
   numbers ship in an untagged (therefore sRGB) file. `avifenc` preserves the gamut correctly, via
   CICP primaries from a PNG input or an embedded ICC profile from a JPEG one — so the two outputs
   of one "Both" run do not match.
-- **A multi-image HEIC compresses the WRONG image, silently.** `sips` takes index 0 where the
-  file's `pitm` box names another item as primary, and Smoosh uses `sips` for all three of its
-  reads — so the megapixel guard, the preview card and the encoder input can every one of them be
-  a different image than the file's actual primary. No error is raised anywhere.
+- **A multi-image HEIC compresses the WRONG image, silently.** OUTPUT SIDE, still live — and this
+  one M13 fixed TWO of three ways. `sips` takes index 0 where the file's `pitm` box names another
+  item as primary; the megapixel guard and the preview card now go through
+  `CGImageSourceGetPrimaryImageIndex` and get the real one, but the ENCODER still reads the source
+  through the `sips` staging step and still gets index 0. So the card now shows a different image
+  than the file it writes, which is worse-looking but more honest: the discrepancy is visible
+  instead of silent. M14 deletes the staging step and closes it.
 - **A crash mid-encode can leave a truncated output** beside the source; the encoders write their
   destination directly. Fixed by Phase B's atomic write.
 
@@ -514,7 +579,11 @@ two remaining spikes are hard gates for M14 specifically.
    for 18 fixtures, ten of them new. It confirmed PLAN.md's chroma table empirically and surfaced
    five shipping bugs now recorded in "Known limitations". The fixture set has no gaps left; every
    requirement in "Correctness requirements" has a file that exercises it.
-4. **M13 (v0.2)** — ImageIO decode, preview and probe. Encoders untouched.
+4. ~~**M13 (v0.2)** — ImageIO decode, preview and probe. Encoders untouched.~~ **DONE**
+   (2026-08-28). Two host commands, not three (`image.decode` deferred to M14, which is its only
+   consumer); the preview pixels ride the host result rather than a descriptor, behind a comptime
+   assert; the worker carrier ships with an `abandoned` flag the spike did not need. Full account
+   in the M13 entry above; live verification in "Verification strategy".
 5. **Spike the link path** — the M14 gate, and the one the SDK actively fights. `native eject`,
    swap `addApp` for `addAppArtifacts`, and link ONE prebuilt `.a` (libwebp is the smaller
    target) into `artifacts.exe.root_module`; call `WebPGetEncoderVersion` from Zig and print it.

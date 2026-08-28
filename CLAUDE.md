@@ -12,8 +12,8 @@ Goal: replace the "upload to TinyPNG / Squoosh / browser tab" workflow with a ze
   - Pure `Model` / `Msg` / `update` architecture + effects channel (`fx`)
 - **Platform**: macOS only (for now)
 - **Image handling**:
-  - Phase A (current): system tools via `fx.spawn` (`avifenc`, `cwebp`)
-  - Phase B (future): Zig + Apple ImageIO for decode + statically linked libavif/libwebp for encode
+  - Decode/preview: Apple ImageIO, called from Zig (`src/imageio.zig`) — landed in M13.
+  - Encode: still system tools via `fx.spawn` (`avifenc`, `cwebp`); M14 vendors libavif/libwebp.
 
 ## Why Zig, not TS-core
 Originally planned as a TS-core app (`src/core.ts`, "no JS runtime in binary" — see git history). Reversed after spiking file acquisition: native open/save dialogs (`native-sdk.dialog.openFile`/`saveFile`) and file drops are gated behind `RunOptions.bridge`/`.builtin_bridge`, fields that only exist on hand-authored `main.zig`. Verified from source (`@native-sdk/cli@0.8.0`'s `build/app.zig`): `addApp`'s `AppOptions` has no passthrough for them, the CLI-generated TS-core `main.zig` hardcodes them off with no override, and the build hard-panics if a tree carries both `src/core.ts` and `src/main.zig` ("an app has exactly one core"). There is no partial-adoption path — TS-core categorically cannot reach these. Confirmed by building and `native check`-validating a throwaway spike app, not by reading docs alone.
@@ -68,9 +68,25 @@ native automate screenshot <view-label>        # gpu_surface views only
 `native dev --core` is TS-core only and does not apply here.
 Widget clicks take a **numeric id from `snapshot`**, not a label — snapshot first.
 
+**`native test` links no frameworks.** `build/app.zig` builds its test artifact from a fresh Debug
+module whenever `app_optimize != optimize` (and `app_optimize` defaults to ReleaseFast), so
+`linkPlatform` never runs on it. Anything reaching ImageIO — from any file reachable from
+`main.zig`, tests included — fails at link time with `undefined symbol: _CFRelease`. That is why
+`src/imageio_tests.zig` is imported by nothing and run by hand:
+
+```sh
+zig test src/imageio_tests.zig -lc \
+  -framework ImageIO -framework CoreGraphics -framework CoreFoundation
+```
+
 ### Repo layout
 - `src/main.zig` — the app. Hand-authored root: builds its own platform + Runtime.
 - `src/app.native` — markup view.
+- `src/imageio.zig` — the whole ImageIO C-ABI seam (`extern fn`, not `@cImport`): `probe` and
+  `thumbnail`, both callable from a worker thread and both returning straight-alpha 8-bit sRGB.
+- `src/imageio_tests.zig` — its tests, in a file NOTHING imports. `native test` links no
+  frameworks (see "Commands"), and it compiles every test reachable from `main.zig`, so this is
+  the only place they can live. Run them by hand; the file's header has the command.
 - `src/tests.zig` — unit tests, pulled in by a `test {}` block at the bottom of `main.zig` (the
   scaffold's convention). Run with `native test`. See PLAN.md's "Testing strategy" for the two
   tiers and what belongs in each.
@@ -104,14 +120,20 @@ For a hand-authored root, window geometry is stated three times and all three mu
 
 ## Native SDK surfaces this app uses
 - Native dialogs (`runtime.showOpenDialog`/`showSaveDialog`, wired through a custom `HostCallBinding` — see "File acquisition, honestly")
-- `fx.loadImage` + `<image>` for previews — **of a `sips` thumbnail, never the source image.** Registered
-  images cap at 1 MiB of *decoded* RGBA (512x512) and `fx.loadImage` refuses encoded sources past
-  1.25 MiB, so no real photo can be registered directly.
+- `fx.registerImage` + `<image>` for previews — **of an ImageIO thumbnail, never the source image.**
+  Registered images cap at 1 MiB of *decoded* RGBA (512x512), so no real photo can be registered
+  directly. The 160px cap is set tighter still by `max_effect_host_result_bytes` (256 KiB), which
+  the preview pixels ride; `main.zig` asserts that fit at comptime.
+- Two host commands of our own for ImageIO, `image.probe` and `image.thumbnail`, answered OFF the
+  loop thread through `HostCallBinding`'s worker-carrier trio (`poll_fn`/`pending_fn`/
+  `bind_services_fn`) plus `shutdown_fn`. `feedHostResult` is loop-thread-only — a worker parks its
+  answer in its own slot and calls `services.wake()`. The dialogs and the two file commands still
+  answer synchronously from `request_fn`, which is equally supported and right for them.
 - A second host command bound by hand, `file.stat` — `update` can never hold an `Io`, the bridge can.
   Reused for output sizes rather than adding a stat spawn.
 - A third, `file.copy` (`std.Io.Dir.copyFileAbsolute`) — Save As copies an already-produced output,
   which `fx.writeFile`'s 1 MiB cap can't hold.
-- `fx.spawn` (system tools: `sips`, `avifenc`, `cwebp`, `which`)
+- `fx.spawn` (system tools: `sips` for HEIC staging only, `avifenc`, `cwebp`, `which`)
 - Hot-reload on `.native` files (Debug builds, via `.markup.watch_path`)
 - `on_drop` (`UiApp.Options`, SDK 0.8.2+) for real window-wide file drops.
 - Manifest: `capabilities = .{ "native_views", "gpu_surfaces", "file_drops" }` — markup renders onto a
@@ -133,12 +155,13 @@ For a hand-authored root, window geometry is stated three times and all three mu
 ## Current status
 v0.1 shipped (M1-M12; full history in `docs/plan-v0.1-archive.md`): pick or drop an image, choose
 AVIF/WebP/Both, Smoosh auto-saves next to the source, optionally Save As to another location,
-packaged as an ad-hoc-signed `.app`. `native build`/`check`/`test` all clean, zero `check`
-warnings.
+packaged as an ad-hoc-signed `.app`.
 
-Phase B (M13/M14) is under way and has not yet touched app code: its two prerequisite spikes are
-validated and the Phase A baseline is recorded. **PLAN.md is the source of truth** for what is
-done and what is next.
+Phase B M13 (v0.2) is DONE: the load chain runs on ImageIO, both `sips` reads and `fx.loadImage`
+are gone, and the preview now shows the file's primary frame, upright and in sRGB. The encoders are
+untouched, so no output byte moved — M14 is what removes the Homebrew dependency.
+`native build`/`check`/`test` all clean, zero `check` warnings. **PLAN.md is the source of truth**
+for what is done and what is next.
 
 Two standing rules from that round, still load-bearing for any future work:
 - **Never automate a native file dialog** (open or save panel). The app runs as a bare executable

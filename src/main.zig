@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const native_sdk = @import("native_sdk");
+const imageio = @import("imageio.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -148,15 +149,22 @@ pub const Model = struct {
     image_id: u64 = 0,
     preview_width: u32 = 0,
     preview_height: u32 = 0,
-    /// The SOURCE's real pixel dimensions, from the `sips -g` dimensions
-    /// hop (0 until it answers, and 0 forever if its output did not parse
-    /// — the same tolerance the megapixel check already takes). Needed
-    /// because `sips -Z 160` *upscales* a source smaller than 160px: `tiny.png`
-    /// (312 B) came back a blurry 160x160. The registered pixels are
-    /// whatever `sips` produced; the DRAWN size clamps to the source, so a
-    /// small image renders small and sharp instead of stretched.
+    /// The SOURCE's DISPLAY dimensions, from `image.probe` — orientation
+    /// already applied, so a portrait photo stored landscape with EXIF
+    /// Orientation 6 reports 3000x4000, not 4000x3000. 0 until the probe
+    /// answers; a probe that cannot read them fails the load outright,
+    /// which is the change M13 makes here (the `sips -g` hop this replaces
+    /// tolerated an unparseable answer and let the preview decide).
     source_width: u32 = 0,
     source_height: u32 = 0,
+    /// The source's Uniform Type Identifier as ImageIO names it
+    /// ("public.jpeg", "public.heic", "org.webmproject.webp") — the
+    /// container, decided by sniffing the file rather than by trusting its
+    /// extension. Recorded here because M14's chroma table keys on it (a
+    /// JPEG keeps its own subsampling, everything else goes 4:4:4) and
+    /// `image.probe` is already returning it; nothing in v0.2 reads it.
+    source_uti_buffer: [imageio.max_uti_bytes]u8 = undefined,
+    source_uti_len: usize = 0,
     // result — per format, because the two encodes succeed or fail
     // independently (see `EncodeOutcome`). No `savings_percent` field:
     // the percentage is pure arithmetic over `original_size` and each
@@ -230,10 +238,10 @@ pub const Model = struct {
         "path_buffer",
         "path_len",
         "original_size",
-        "preview_width",
-        "preview_height",
         "source_width",
         "source_height",
+        "source_uti_buffer",
+        "source_uti_len",
         "avif_path_buffer",
         "avif_path_len",
         "avif_size",
@@ -253,6 +261,7 @@ pub const Model = struct {
         "save_message_buffer",
         "save_message_len",
         "path",
+        "sourceUti",
         "errorMessage",
         "warningMessage",
         "saveMessage",
@@ -270,6 +279,9 @@ pub const Model = struct {
     pub fn saveMessage(model: *const Model) []const u8 {
         return model.save_message_buffer[0..model.save_message_len];
     }
+    pub fn sourceUti(model: *const Model) []const u8 {
+        return model.source_uti_buffer[0..model.source_uti_len];
+    }
 
     /// The picked file's last path component — what the UI names, and
     /// what every error message interpolates. Empty until a pick lands.
@@ -279,7 +291,7 @@ pub const Model = struct {
         return full;
     }
 
-    /// True once `image_loaded` registered preview pixels — the `<if>`
+    /// True once `thumbnail_result` registered preview pixels — the `<if>`
     /// gate on the `<image>` leaf, since id 0 draws nothing anyway but
     /// the surrounding chrome shouldn't reserve space for it.
     pub fn hasPreview(model: *const Model) bool {
@@ -336,19 +348,6 @@ pub const Model = struct {
     pub fn originalSize(model: *const Model, arena: std.mem.Allocator) []const u8 {
         if (!model.hasFile()) return "";
         return formatBytes(arena, model.original_size);
-    }
-
-    /// The preview's DRAWN size, clamped to the source's real dimensions
-    /// so `sips -Z`'s upscaling of a tiny source never renders as a blurry
-    /// 160x160. Falls back to the registered size when the source
-    /// dimensions never parsed.
-    pub fn previewWidth(model: *const Model) u32 {
-        if (model.source_width == 0) return model.preview_width;
-        return @min(model.preview_width, model.source_width);
-    }
-    pub fn previewHeight(model: *const Model) u32 {
-        if (model.source_height == 0) return model.preview_height;
-        return @min(model.preview_height, model.source_height);
     }
 
     // ---------------------------------------------------------- results
@@ -442,6 +441,7 @@ pub const Model = struct {
         model.preview_height = 0;
         model.source_width = 0;
         model.source_height = 0;
+        model.source_uti_len = 0;
     }
 
     /// Wipes the previous run's outputs. Called when a new run starts and
@@ -493,9 +493,8 @@ pub const Msg = union(enum) {
     dialog_result: native_sdk.EffectHostResult, // host open-dialog callback
     dropped_file: []const u8, // on_drop callback — a file dragged onto the window
     stat_result: native_sdk.EffectHostResult, // host file-size callback -> original_size
-    dimensions_result: native_sdk.EffectExit, // `sips -g` source pixel dimensions -> megapixel limit check
-    thumbnail_result: native_sdk.EffectExit, // `sips` downscale for the preview
-    image_loaded: native_sdk.EffectImageResult, // fx.loadImage callback (registers the preview pixels)
+    probe_result: native_sdk.EffectHostResult, // host ImageIO properties callback -> dimensions, UTI, megapixel check
+    thumbnail_result: native_sdk.EffectHostResult, // host ImageIO thumbnail callback -> the preview pixels
     set_format: Format, // format chip pressed
     smoosh, // "Smoosh" clicked
     convert_result: native_sdk.EffectExit, // `sips` HEIC->PNG staging callback, shared by both formats
@@ -520,9 +519,8 @@ pub const Msg = union(enum) {
         "dialog_result",
         "dropped_file",
         "stat_result",
-        "dimensions_result",
+        "probe_result",
         "thumbnail_result",
-        "image_loaded",
         "convert_result",
         "encode_result",
         "encode_size_result",
@@ -568,17 +566,19 @@ pub const Effects = native_sdk.Effects(Msg);
 
 // ------------------------------------------------------------- effect keys
 //
-// One key space across spawns, fetches, files, host requests, and image
-// loads (`max_effects` = 16 slots). `preview_image_id` is BOTH the
-// loadImage effect key and the ImageId the `<image>` leaf draws — that
-// is the SDK's design, not a shortcut, so it must stay distinct from the
-// others.
+// One key space across spawns, fetches, files and host requests
+// (`max_effects` = 16 slots).
 
 const dialog_key: u64 = 1;
 const stat_key: u64 = 2;
 const thumbnail_key: u64 = 3;
+/// NOT an effect key: the only thing `preview_image_id` names now is the
+/// registry slot `fx.registerImage` fills and the `<image>` leaf draws.
+/// It was both until M13 retired `fx.loadImage`, which is why it sits in
+/// this list — the two namespaces are separate, but keeping it distinct
+/// costs nothing and a reader looking for "id 4" finds it here.
 const preview_image_id: u64 = 4;
-const dimensions_key: u64 = 5;
+const probe_key: u64 = 5;
 const avifenc_check_key: u64 = 6;
 const cwebp_check_key: u64 = 7;
 const avif_encode_key: u64 = 8;
@@ -595,6 +595,11 @@ const host_open_file = "dialog.openFile";
 const host_file_size = "file.stat";
 const host_save_file = "dialog.saveFile";
 const host_file_copy = "file.copy";
+/// The two ImageIO reads, answered OFF the loop thread (see `HostBridge`'s
+/// worker carrier). Split because their costs are nothing alike: `probe`
+/// allocates no bitmap at all, `thumbnail` decodes.
+const host_image_probe = "image.probe";
+const host_image_thumbnail = "image.thumbnail";
 
 /// Absolute so the check does not depend on the inherited PATH — but
 /// `which`'s OWN job is to search that PATH for `avifenc`/`cwebp`, which is
@@ -602,16 +607,11 @@ const host_file_copy = "file.copy";
 /// way, so the check is honest about what it is proving.
 const which_path = "/usr/bin/which";
 
-/// Where `sips` writes the downscaled preview, resolved once in `main`
-/// (see the "Preview is a thumbnail" note there). `pub var` so tests can
-/// point it somewhere harmless; `update` only ever reads it.
-pub var thumbnail_path: []const u8 = "";
-
 /// Where `sips` stages a HEIC/HEIF source as a PNG before encoding —
 /// `avifenc`/`cwebp` reject HEIC as an INPUT format outright (see
-/// `isHeicSource`), even though `sips` decodes it fine for the preview
-/// above. Resolved once in `main`, same as `thumbnail_path`; `pub var` for
-/// the same test reason.
+/// `isHeicSource`), even though ImageIO decodes it fine for the
+/// preview. Resolved once in `main`; `pub var` so tests can point it
+/// somewhere harmless, and `update` only ever reads it.
 pub var converted_path: []const u8 = "";
 
 /// The environment every `fx.spawn` child inherits (bound once, at launch,
@@ -651,11 +651,6 @@ pub fn resolveSpawnEnviron(gpa: std.mem.Allocator, base: std.process.Environ) !s
     return .{ .block = try map.createPosixBlock(gpa, .{}) };
 }
 
-/// Longest edge of the generated preview, in pixels. The registered-image
-/// budget is 1 MiB of DECODED RGBA (`max_registered_canvas_image_pixel_bytes`),
-/// i.e. 512x512 exactly — 160x160x4 = 100 KB leaves real headroom.
-const thumbnail_max_edge = "160";
-
 // ----------------------------------------------------------- input limits
 //
 // 100 MB / 50 megapixels, whichever comes first — the top of the
@@ -670,28 +665,82 @@ fn bytesToMb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
 }
 
-const Dimensions = struct { width: u32, height: u32 };
+// -------------------------------------------------------- host replies
+//
+// `image.probe` and `image.thumbnail` answer as BYTES on the host result,
+// so both wire shapes are parsed here rather than in the bridge — the
+// bridge writes them on a worker thread and `update` is the only reader.
+// Both parsers are `pub` for the same reason `formatBytes` is: a pure
+// function worth pinning directly instead of only through the full
+// dispatch path.
 
-/// Parses `sips -g pixelWidth -g pixelHeight -1 <path>`'s one-line output:
-/// `<path>|pixelWidth: <n>|pixelHeight: <n>|`. Returns null for anything
-/// that doesn't parse — in particular `sips` prints literal `<nil>` (and
-/// still exits 0) for a non-image or a missing file, which is fine: an
-/// unparseable result just means "dimensions unknown," and the thumbnail
-/// spawn right after is the real format gate.
-fn parseDimensions(output: []const u8) ?Dimensions {
-    var width: ?u32 = null;
-    var height: ?u32 = null;
-    var it = std.mem.splitScalar(u8, output, '|');
-    while (it.next()) |segment| {
-        const colon = std.mem.indexOfScalar(u8, segment, ':') orelse continue;
-        const key = std.mem.trim(u8, segment[0..colon], " \t\r\n");
-        const value_text = std.mem.trim(u8, segment[colon + 1 ..], " \t\r\n");
-        const value = std.fmt.parseInt(u32, value_text, 10) catch continue;
-        if (std.mem.eql(u8, key, "pixelWidth")) width = value;
-        if (std.mem.eql(u8, key, "pixelHeight")) height = value;
-    }
-    if (width == null or height == null) return null;
-    return .{ .width = width.?, .height = height.? };
+/// `image.probe`'s answer: `"<width> <height> <orientation> <uti>"`.
+/// Dimensions are DISPLAY dimensions (`imageio.probe` has already applied
+/// the EXIF transform); orientation is the raw 1-8 tag, or 0 for a source
+/// carrying none.
+pub const SourceInfo = struct {
+    width: u32,
+    height: u32,
+    orientation: u8,
+    uti: []const u8,
+};
+
+pub fn parseProbeReply(reply: []const u8) ?SourceInfo {
+    var it = std.mem.splitScalar(u8, reply, ' ');
+    const width = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const height = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const orientation = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+    // Everything after the third space is the UTI, which never contains
+    // one — but taking the remainder rather than the next field means a
+    // type ImageIO names oddly arrives whole instead of truncated.
+    const uti = it.rest();
+    if (width == 0 or height == 0) return null;
+    return .{ .width = width, .height = height, .orientation = orientation, .uti = uti };
+}
+
+/// `image.thumbnail`'s answer: a fixed-width `"<width> <height>\n"` header
+/// (see `thumbnail_reply_header`) followed by exactly `width * height * 4`
+/// bytes of straight-alpha 8-bit sRGB RGBA.
+///
+/// The pixels RIDE THE RESULT rather than sitting in a bridge-owned
+/// global. That is safe only because the preview is capped at 160px —
+/// `max_effect_host_result_bytes` is 256 KiB and an over-cap answer is
+/// silently rewritten to the err route — so the fit is asserted at
+/// COMPTIME below rather than left as a comment for someone raising the
+/// preview size to trip over. A full-resolution decode (M14) can never
+/// ride the result and must use a descriptor.
+pub const Preview = struct {
+    width: u32,
+    height: u32,
+    pixels: []const u8,
+};
+
+comptime {
+    const max_pixel_bytes = imageio.max_thumbnail_edge * imageio.max_thumbnail_edge * 4;
+    std.debug.assert(thumbnail_reply_header + max_pixel_bytes <= native_sdk.max_effect_host_result_bytes);
+}
+
+/// `"<width> <height>\n"` with both numbers zero-padded to five digits —
+/// FIXED WIDTH so the bridge can decode the pixels straight into the rest
+/// of the buffer instead of moving them afterwards. Five digits is far
+/// more than `max_thumbnail_edge` needs; the assert is what keeps the two
+/// honest if that ever grows.
+const thumbnail_reply_header: usize = 12;
+
+comptime {
+    std.debug.assert(imageio.max_thumbnail_edge < 100_000);
+}
+
+pub fn parsePreviewReply(reply: []const u8) ?Preview {
+    const newline = std.mem.indexOfScalar(u8, reply, '\n') orelse return null;
+    var it = std.mem.splitScalar(u8, reply[0..newline], ' ');
+    const width = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const height = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    if (it.next() != null) return null;
+    const pixels = reply[newline + 1 ..];
+    if (width == 0 or height == 0) return null;
+    if (pixels.len != @as(usize, width) * height * 4) return null;
+    return .{ .width = width, .height = height, .pixels = pixels };
 }
 
 // ---------------------------------------------------------- encoder check
@@ -1015,8 +1064,8 @@ pub fn onDrop(drop: platform.FileDropEvent) ?Msg {
 /// Starts the load chain for a path that just arrived — from the open
 /// panel (`.dialog_result`'s ok branch) or a real window drop
 /// (`.dropped_file`). Both land here because the chain itself doesn't
-/// care where the path came from: `stat_result` -> `dimensions_result` ->
-/// `thumbnail_result` -> `image_loaded` -> `.ready` is the same either way.
+/// care where the path came from: `stat_result` -> `probe_result` ->
+/// `thumbnail_result` -> `.ready` is the same either way.
 fn beginLoad(model: *Model, fx: *Effects, path: []const u8) void {
     model.status = .loading;
     model.setPath(path);
@@ -1076,102 +1125,101 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     .{ bytesToMb(model.original_size), bytesToMb(max_original_bytes) },
                 );
             }
-            // The megapixel check needs the SOURCE's real dimensions, and
-            // `sips` refuses to combine `-g` (query) with `-s`/`-Z` (modify)
-            // in one invocation ("cannot get properties and modify file in
-            // the same invocation", confirmed against a real fixture) — so
-            // this is a second, separate `sips` call, not a free read off
-            // the thumbnail spawn's own output.
-            fx.spawn(.{
-                .key = dimensions_key,
-                .argv = &.{ "/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", "-1", model.path() },
-                .output = .collect,
-                .on_exit = Effects.exitMsg(.dimensions_result),
+            // The megapixel check needs the source's real dimensions, and
+            // `image.probe` reads them out of ImageIO's property
+            // dictionary WITHOUT decoding anything. That ordering is the
+            // point: the `sips -g` hop this replaces could only report
+            // dimensions a decode had already paid for.
+            fx.hostRequest(.{
+                .key = probe_key,
+                .name = host_image_probe,
+                .payload = model.path(),
+                .on_result = Effects.hostMsg(.probe_result),
             });
         },
 
-        .dimensions_result => |exit| {
-            // Same staleness hazard as `thumbnail_result` below: `.reset`
-            // cancels this spawn too, and the cancellation is an ordinary
-            // terminal indistinguishable from a real (if useless) result.
-            if (model.status != .loading) return;
-            over_limit: {
-                if (exit.reason != .exited or exit.code != 0) break :over_limit;
-                const dims = parseDimensions(exit.output) orelse break :over_limit;
-                // Kept for the preview's drawn size (see `previewWidth`),
-                // not just the limit check below.
-                model.source_width = dims.width;
-                model.source_height = dims.height;
-                const megapixels = @as(f64, @floatFromInt(dims.width)) *
-                    @as(f64, @floatFromInt(dims.height)) / 1_000_000.0;
-                if (megapixels > max_source_megapixels) {
-                    // Input exceeds the megapixel limit.
-                    return model.fail(
-                        "That image is {d:.0} megapixels — the limit is {d:.0} MP.",
-                        .{ megapixels, max_source_megapixels },
-                    );
-                }
-            }
-            // Phase A's system-tools rule applies to the PREVIEW too, and
-            // `sips` ships with macOS — no detection, no brew install.
-            // Absolute path so it does not depend on the inherited PATH.
-            fx.spawn(.{
-                .key = thumbnail_key,
-                .argv = &.{
-                    "/usr/bin/sips",
-                    "-s",         "format", "png",
-                    "-Z",         thumbnail_max_edge,
-                    model.path(), "--out",  thumbnail_path,
-                },
-                .output = .collect,
-                .on_exit = Effects.exitMsg(.thumbnail_result),
-            });
-        },
-
-        .thumbnail_result => |exit| {
-            // The two arms below are the only ones that can hear a STALE
-            // result. `dialog.openFile`/`file.stat` are answered
-            // synchronously by our own `HostBridge` inside `hostRequest`,
-            // and cancelling a host request delivers no Msg at all — but
-            // the spawn and the image load are real async effects whose
-            // cancellation (from `.reset`) arrives as an ordinary
-            // terminal, indistinguishable from a genuine failure.
-            if (model.status != .loading) return;
-            if (exit.reason != .exited or exit.code != 0) {
+        // The FORMAT GATE, and the megapixel gate, both before a single
+        // pixel is decoded. A failure here is the undecodable-input state:
+        // `imageio.probe` reports it off the frame COUNT rather than off a
+        // null source, because `CGImageSourceCreateWithURL` succeeds on 49
+        // bytes of text named `.jpg`.
+        //
+        // Unlike the `sips -g` hop this replaces, an unparseable answer is
+        // NOT tolerated. There is no longer a later gate to defer to — the
+        // thumbnail is the same ImageIO read, so a probe that could not
+        // name the image's size is a file the preview cannot draw either.
+        .probe_result => |result| {
+            if (!result.ok) {
                 // Unsupported or undecodable input.
                 return model.fail(
                     "Not an image Smoosh can read. Try JPEG, PNG, HEIC or WebP.",
                     .{},
                 );
             }
-            fx.loadImage(.{
-                .id = preview_image_id,
-                .path = thumbnail_path,
-                .on_result = Effects.imageMsg(.image_loaded),
+            const info = parseProbeReply(result.bytes) orelse return model.fail(
+                "Not an image Smoosh can read. Try JPEG, PNG, HEIC or WebP.",
+                .{},
+            );
+            model.source_width = info.width;
+            model.source_height = info.height;
+            const uti_len = @min(info.uti.len, model.source_uti_buffer.len);
+            @memcpy(model.source_uti_buffer[0..uti_len], info.uti[0..uti_len]);
+            model.source_uti_len = uti_len;
+
+            const megapixels = @as(f64, @floatFromInt(info.width)) *
+                @as(f64, @floatFromInt(info.height)) / 1_000_000.0;
+            if (megapixels > max_source_megapixels) {
+                // Input exceeds the megapixel limit.
+                return model.fail(
+                    "That image is {d:.0} megapixels — the limit is {d:.0} MP.",
+                    .{ megapixels, max_source_megapixels },
+                );
+            }
+            fx.hostRequest(.{
+                .key = thumbnail_key,
+                .name = host_image_thumbnail,
+                .payload = model.path(),
+                .on_result = Effects.hostMsg(.thumbnail_result),
             });
         },
 
-        .image_loaded => |result| {
-            if (model.status != .loading) return;
-            if (result.outcome != .loaded) {
+        // No staleness guard on this arm or `.probe_result` above, and
+        // none is needed: every hop of the load chain is now a HOST
+        // request, and a cancelled one delivers no Msg at all — a queued
+        // answer dies by generation mismatch at drain (`cancelHostRequest`).
+        // A second pick mid-load replaces the in-flight request on the same
+        // key and drops its answer the same way. The encode chain below
+        // still guards, because those are real spawns whose cancellation
+        // arrives as an ordinary nonzero terminal.
+        .thumbnail_result => |result| {
+            if (!result.ok) {
                 return model.fail("Couldn't build a preview for that file.", .{});
             }
-            model.image_id = result.id;
-            model.preview_width = @intCast(result.width);
-            model.preview_height = @intCast(result.height);
+            const preview = parsePreviewReply(result.bytes) orelse {
+                return model.fail("Couldn't build a preview for that file.", .{});
+            };
+            // Synchronous — the pixels are copied before this returns, so
+            // `result.bytes` outliving the dispatch is not a concern.
+            fx.registerImage(preview_image_id, preview.width, preview.height, preview.pixels) catch {
+                return model.fail("Couldn't build a preview for that file.", .{});
+            };
+            model.image_id = preview_image_id;
+            model.preview_width = preview.width;
+            model.preview_height = preview.height;
             model.status = .ready;
         },
 
         .reset => {
-            // Nothing in flight may land on the next model: the status
-            // guard above already drops late results, and cancelling
-            // frees the keys so an immediate re-pick is not rejected as
-            // a duplicate. `cancel` on an idle key is a no-op.
+            // Nothing in flight may land on the next model. For the load
+            // chain the cancels ARE the guard (a cancelled host request
+            // delivers nothing); for the encode spawns they pair with the
+            // `status` checks in those arms. Either way cancelling frees
+            // the keys, so an immediate re-pick is not rejected as a
+            // duplicate. `cancel` on an idle key is a no-op.
             fx.cancel(dialog_key);
             fx.cancel(stat_key);
-            fx.cancel(dimensions_key);
+            fx.cancel(probe_key);
             fx.cancel(thumbnail_key);
-            fx.cancel(preview_image_id);
             fx.cancel(heic_convert_key);
             fx.cancel(avif_encode_key);
             fx.cancel(webp_encode_key);
@@ -1381,21 +1429,228 @@ const App = native_sdk.UiApp(Model, Msg);
 /// The host side of the seams `update` reaches through `fx.hostRequest`.
 /// It closes over the `*Runtime` we build by hand — the whole reason
 /// `main.zig` is hand-authored (CLAUDE.md, "File acquisition, honestly")
-/// — plus the `std.Io` `update` can never hold. `request_fn` runs on the
-/// loop thread, synchronously from `fx.hostRequest`, and answers through
-/// `effects.feedHostResult`, so the result comes back as an ordinary Msg.
+/// — plus the `std.Io` `update` can never hold.
+///
+/// TWO ANSWERING DISCIPLINES live here, and the split is deliberate:
+///
+///  - The dialogs and the two file operations answer SYNCHRONOUSLY from
+///    `request_fn`, on the loop thread, through `effects.feedHostResult`.
+///    A panel has to run on the main thread anyway, and a stat or a copy
+///    is far too cheap to deserve a worker.
+///  - `image.probe` and `image.thumbnail` answer from a WORKER THREAD
+///    through the carrier mailbox below. `feedHostResult` is
+///    loop-thread-only (`HostCallBinding`'s own doc comment says so, and
+///    `docs/spikes/threaded-host-call-spike.zig` proved the supported
+///    seam is the `poll_fn`/`pending_fn`/`bind_services_fn` trio plus
+///    `shutdown_fn`), so a worker never calls it — it parks its answer and
+///    nudges the loop, which drains and feeds on the right thread.
 const HostBridge = struct {
     runtime: *native_sdk.Runtime,
     app_state: *App,
     io: std.Io,
+    /// The platform's thread-safe wake handle, handed over by
+    /// `bind_services_fn` after `UiApp` binds it. `null` until then, which
+    /// is only a window before the first frame.
+    services: ?*const platform.PlatformServices = null,
+    slots: [worker_slot_count]Slot = @splat(.{}),
 
     var dialog_path_buf: [platform.max_dialog_paths_bytes]u8 = undefined;
     var save_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
     var reply_buf: [128]u8 = undefined;
 
+    // ------------------------------------------------------ worker carrier
+
+    /// The app's load chain is strictly sequential — one probe, then one
+    /// thumbnail — so a single slot would do in the happy case. Three
+    /// exist for the unhappy one: a reset (or a second drop) mid-load
+    /// leaves the previous worker running, and it must have somewhere to
+    /// finish writing that the new request cannot be handed.
+    const worker_slot_count = 3;
+
+    const Job = enum { probe, thumbnail };
+
+    /// A worker's whole world. Its result buffer is sized for the largest
+    /// answer either job can produce — a full 160x160 preview — because
+    /// the thumbnail's pixels RIDE the host result rather than sitting in
+    /// a shared global (see `parsePreviewReply`). Per-slot rather than
+    /// shared is what makes an abandoned worker harmless.
+    const Slot = struct {
+        key: u64 = 0,
+        job: Job = .probe,
+        /// Loop thread owns this: claimed on request, released on poll.
+        busy: bool = false,
+        /// A NEWER request for the same key arrived while this worker was
+        /// still running. Its answer is dropped at poll rather than fed —
+        /// otherwise `feedHostResult` would find the new request's slot
+        /// (it matches on key alone) and deliver the OLD file's pixels as
+        /// the new one's preview.
+        abandoned: bool = false,
+        thread: ?std.Thread = null,
+        path_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
+        path_len: usize = 0,
+        result: [thumbnail_reply_header + imageio.max_thumbnail_edge * imageio.max_thumbnail_edge * 4]u8 = undefined,
+        result_len: usize = 0,
+        ok: bool = false,
+        /// Worker -> loop: the answer is parked and ready to adopt. The
+        /// release store publishes every write above it to whichever
+        /// loop-thread poll acquires it.
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn path(slot: *const Slot) []const u8 {
+            return slot.path_buffer[0..slot.path_len];
+        }
+    };
+
+    /// No lock anywhere in this carrier, deliberately: `claim`, `abandon`,
+    /// `pollFn` and `pendingFn` all run on the LOOP thread, and a slot's
+    /// result bytes are written by exactly one worker and read by the loop
+    /// only after `done` publishes them. Single-producer, single-consumer,
+    /// one flag — the handoff a mutex would only decorate.
+    fn claim(self: *HostBridge, key: u64, job: Job, path: []const u8) ?*Slot {
+        for (&self.slots) |*slot| {
+            if (slot.busy) continue;
+            if (slot.thread) |thread| {
+                // A retired-but-unjoined worker: reap it before reuse.
+                thread.join();
+                slot.thread = null;
+            }
+            slot.* = .{ .key = key, .job = job, .busy = true };
+            const len = @min(path.len, slot.path_buffer.len);
+            @memcpy(slot.path_buffer[0..len], path[0..len]);
+            slot.path_len = len;
+            return slot;
+        }
+        return null;
+    }
+
+    /// Retire any live worker still answering for `key`, because a newer
+    /// request has taken that key over. The thread keeps running and keeps
+    /// writing its own slot — which is exactly why slots are not shared —
+    /// and `pollFn` throws its answer away.
+    fn abandon(self: *HostBridge, key: u64) void {
+        for (&self.slots) |*slot| {
+            if (slot.busy and slot.key == key) slot.abandoned = true;
+        }
+    }
+
+    fn startWorker(self: *HostBridge, key: u64, job: Job, path: []const u8) void {
+        self.abandon(key);
+        const slot = self.claim(key, job, path) orelse
+            return self.reply(key, false, "no worker slot");
+        slot.thread = std.Thread.spawn(.{}, workerMain, .{ self, slot }) catch {
+            slot.busy = false;
+            return self.reply(key, false, "thread spawn failed");
+        };
+        // Returns WITHOUT answering: the mailbox is the only route out.
+    }
+
+    /// Worker thread. Both jobs are pure `imageio` calls over a path —
+    /// no SDK, no Model, no allocator — which is what makes running them
+    /// here safe at all.
+    fn workerMain(self: *HostBridge, slot: *Slot) void {
+        switch (slot.job) {
+            .probe => {
+                const info = imageio.probe(slot.path()) catch |err| {
+                    return self.finish(slot, false, @errorName(err));
+                };
+                const text = std.fmt.bufPrint(&slot.result, "{d} {d} {d} {s}", .{
+                    info.width, info.height, info.orientation, info.uti(),
+                }) catch return self.finish(slot, false, "probe reply too long");
+                slot.result_len = text.len;
+                slot.ok = true;
+                slot.done.store(true, .release);
+                self.wake();
+            },
+            .thumbnail => {
+                // ImageIO decodes STRAIGHT INTO the reply buffer, past the
+                // header — that is why the header is fixed width. A
+                // variable-length one would mean either moving 100 KiB of
+                // pixels afterwards or decoding into scratch and copying,
+                // and neither buys anything a zero-padded number does not.
+                const preview = imageio.thumbnail(
+                    slot.path(),
+                    slot.result[thumbnail_reply_header..],
+                ) catch |err| {
+                    return self.finish(slot, false, @errorName(err));
+                };
+                _ = std.fmt.bufPrint(slot.result[0..thumbnail_reply_header], "{d:0>5} {d:0>5}\n", .{
+                    preview.width, preview.height,
+                }) catch return self.finish(slot, false, "preview header too long");
+                slot.result_len = thumbnail_reply_header + preview.pixels.len;
+                slot.ok = true;
+                slot.done.store(true, .release);
+                self.wake();
+            },
+        }
+    }
+
+    /// WORKER THREAD: park a short answer and nudge the loop. The two
+    /// failure paths in `startWorker` do not come through here — they run
+    /// on the loop thread and answer synchronously, the way every other
+    /// command in this bridge does.
+    fn finish(self: *HostBridge, slot: *Slot, ok: bool, bytes: []const u8) void {
+        const len = @min(bytes.len, slot.result.len);
+        @memcpy(slot.result[0..len], bytes[0..len]);
+        slot.result_len = len;
+        slot.ok = ok;
+        slot.done.store(true, .release);
+        self.wake();
+    }
+
+    fn wake(self: *HostBridge) void {
+        const services = self.services orelse return;
+        services.wake() catch {};
+    }
+
+    /// Loop thread, via `Effects.hasPending`.
+    fn pendingFn(context: *anyopaque) bool {
+        const self: *HostBridge = @ptrCast(@alignCast(context));
+        for (&self.slots) |*slot| {
+            if (slot.busy and slot.done.load(.acquire)) return true;
+        }
+        return false;
+    }
+
+    /// Loop thread, via `Effects.adoptHostCompletions`, which calls
+    /// `feedHostResult` for us. `bytes` need only stay valid until the
+    /// next poll — Effects copies immediately — but the slot owns them for
+    /// its whole life anyway.
+    fn pollFn(context: *anyopaque) ?native_sdk.HostCallCompletion {
+        const self: *HostBridge = @ptrCast(@alignCast(context));
+        for (&self.slots) |*slot| {
+            if (!slot.busy or !slot.done.load(.acquire)) continue;
+            slot.busy = false;
+            slot.done.store(false, .release);
+            // A superseded worker's answer is dropped here, not fed.
+            if (slot.abandoned) continue;
+            return .{ .key = slot.key, .ok = slot.ok, .bytes = slot.result[0..slot.result_len] };
+        }
+        return null;
+    }
+
+    fn bindServicesFn(context: *anyopaque, services: *const platform.PlatformServices) void {
+        const self: *HostBridge = @ptrCast(@alignCast(context));
+        self.services = services;
+    }
+
+    /// Called from `Effects.deinit` while the platform wake binding is
+    /// still live, before `PlatformServices` is severed — the one window
+    /// in which joining a worker that might still call `wake()` is safe.
+    /// Not optional: `UiApp.destroy` reaches it, and a still-decoding
+    /// worker at quit would otherwise outlive the services it nudges.
+    fn shutdownFn(context: *anyopaque) void {
+        const self: *HostBridge = @ptrCast(@alignCast(context));
+        for (&self.slots) |*slot| {
+            if (slot.thread) |thread| {
+                thread.join();
+                slot.thread = null;
+            }
+        }
+    }
+
     /// What the open panel offers. Everything macOS ImageIO decodes that
-    /// we would plausibly be handed; `sips` is the real gate, and its
-    /// failure is a named error state, so this list only has to be
+    /// we would plausibly be handed; `image.probe` is the real gate, and
+    /// its failure is a named error state, so this list only has to be
     /// convenient, not exhaustive.
     const image_filters = [_]platform.FileFilter{.{
         .name = "Images",
@@ -1408,6 +1663,10 @@ const HostBridge = struct {
         if (std.mem.eql(u8, name, host_file_size)) return self.fileSize(key, payload);
         if (std.mem.eql(u8, name, host_save_file)) return self.saveFile(key, payload);
         if (std.mem.eql(u8, name, host_file_copy)) return self.copyFile(key, payload);
+        // The two ImageIO reads return without answering — see the worker
+        // carrier above.
+        if (std.mem.eql(u8, name, host_image_probe)) return self.startWorker(key, .probe, payload);
+        if (std.mem.eql(u8, name, host_image_thumbnail)) return self.startWorker(key, .thumbnail, payload);
         self.reply(key, false, "unknown host command");
     }
 
@@ -1481,18 +1740,15 @@ const HostBridge = struct {
     }
 };
 
-/// Preview is a THUMBNAIL, not the source image — and that is a hard SDK
-/// constraint, not a shortcut. Registered images are capped at 1 MiB of
-/// DECODED RGBA (`max_registered_canvas_image_pixel_bytes`, i.e. 512x512)
-/// and `fx.loadImage` refuses encoded sources past 1.25 MiB, so no real
-/// photo can ever be registered directly. `sips -Z 160` downscales into
-/// this path first; `fx.loadImage` then reads THAT.
+/// Resolves `converted_path`, the app-temp file `sips` stages a HEIC
+/// source into before the encoders read it. Only one caller remains: M13
+/// retired the preview's own temp file (ImageIO hands back pixels, so
+/// there is nothing to write), and M14 retires this one with the staging
+/// step itself.
 ///
-/// Shared by `thumbnail_path` and `converted_path` — same app-temp-dir
-/// resolution, different filename. `dir_buf`/`path_buf` are caller-owned
-/// (not function-local statics) on purpose: this runs twice at startup, and
-/// both resolved paths must stay valid simultaneously, so they cannot share
-/// backing storage the way a function-local `var` would force them to.
+/// `dir_buf`/`path_buf` stay caller-owned rather than function-local
+/// statics so a second resolved path could coexist with this one — which
+/// is how it was used until the preview stopped needing a file.
 fn resolveAppTempPath(
     io: std.Io,
     environ: std.process.Environ,
@@ -1519,8 +1775,6 @@ fn resolveAppTempPath(
     return app_dirs.join(app_dirs.currentPlatform(), path_buf, &.{ dir, filename });
 }
 
-var thumbnail_dir_buf: [platform.max_dialog_path_bytes]u8 = undefined;
-var thumbnail_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
 var converted_dir_buf: [platform.max_dialog_path_bytes]u8 = undefined;
 var converted_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
 
@@ -1548,6 +1802,15 @@ pub fn main(init: std.process.Init) !void {
         app_info,
     );
     defer mac_platform.destroy();
+
+    // Allocated BEFORE the app, so its `defer` runs AFTER `app_state.destroy()`
+    // — defers unwind in reverse. `Effects.deinit` calls `shutdown_fn` with
+    // this pointer to join a worker that may still be decoding, so freeing
+    // the bridge first would be a use-after-free at quit. Heap rather than
+    // `main`'s stack because it carries three worker slots with a 100 KiB
+    // reply buffer each, and a worker holds a `*Slot` into it while it runs.
+    const bridge = try std.heap.page_allocator.create(HostBridge);
+    defer std.heap.page_allocator.destroy(bridge);
 
     const app_state = try App.create(std.heap.page_allocator, .{
         .name = "smoosh",
@@ -1583,14 +1846,19 @@ pub fn main(init: std.process.Init) !void {
         .environ = spawn_environ,
     });
 
-    thumbnail_path = try resolveAppTempPath(init.io, spawn_environ, "preview.png", &thumbnail_dir_buf, &thumbnail_path_buf);
     converted_path = try resolveAppTempPath(init.io, spawn_environ, "converted.png", &converted_dir_buf, &converted_path_buf);
 
-    var bridge = HostBridge{ .runtime = runtime, .app_state = app_state, .io = init.io };
+    bridge.* = .{ .runtime = runtime, .app_state = app_state, .io = init.io };
     app_state.effects.bindHostCalls(.{
-        .context = &bridge,
+        .context = bridge,
         .request_fn = HostBridge.requestFn,
         .send_fn = HostBridge.sendFn,
+        // The worker carrier: without these four, `image.probe` and
+        // `image.thumbnail` would park answers nobody ever drains.
+        .poll_fn = HostBridge.pollFn,
+        .pending_fn = HostBridge.pendingFn,
+        .bind_services_fn = HostBridge.bindServicesFn,
+        .shutdown_fn = HostBridge.shutdownFn,
     });
 
     try runtime.run(app_state.app());

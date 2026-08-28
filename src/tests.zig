@@ -15,6 +15,7 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const main = @import("main.zig");
+const imageio = @import("imageio.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -577,23 +578,35 @@ test "resolveSpawnEnviron sets PATH from scratch when the base environ has none"
 
 // ==================================================================== effects
 //
-// The dialog -> stat -> thumbnail -> preview chain, driven through the fake
+// The dialog -> stat -> probe -> thumbnail chain, driven through the fake
 // executor: assert the REQUEST each arm made, feed the answer, drain
 // through the same `.wake` path live platforms use, then assert the
-// model. No GUI, no NSOpenPanel, no `sips`.
+// model. No GUI, no NSOpenPanel, no ImageIO.
+//
+// M13 moved this whole chain off spawns and onto HOST REQUESTS, so the
+// load-side helpers below drive `pendingHostAt`/`feedHostResult` where
+// they used to drive `pendingSpawnAt`/`feedExit`. The encode side still
+// drives spawns; M14 moves that half.
 
 const App = native_sdk.UiApp(Model, Msg);
 
-/// Where `main.thumbnail_path` points during tests. Never written to — the
-/// spawn is faked and `feedImageResult` delivers a recorded terminal — but
-/// it has to be non-empty, since `fx.loadImage` rejects an empty source
-/// outright and the rejection would mask what the test is checking.
-const test_thumbnail_path = "/tmp/smoosh-tests/preview.png";
-
-/// `test_thumbnail_path`'s counterpart — where `main.converted_path`
-/// points during tests. Same reasoning: the staging spawn is faked, but the
-/// path still flows into a real encode spawn's argv, which tests assert on.
+/// Where `main.converted_path` points during tests. The staging spawn is
+/// faked, but the path still flows into a real encode spawn's argv, which
+/// tests assert on.
 const test_converted_path = "/tmp/smoosh-tests/converted.png";
+
+/// A synthetic `image.thumbnail` answer: the same fixed-width header the
+/// bridge writes, then `width * height * 4` bytes of opaque grey. Sized
+/// for the largest preview the 160px cap allows, which is also what the
+/// bridge's own slot holds.
+var preview_reply_buffer: [16 + 160 * 160 * 4]u8 = undefined;
+
+fn previewReply(width: u32, height: u32) []const u8 {
+    const header = std.fmt.bufPrint(&preview_reply_buffer, "{d:0>5} {d:0>5}\n", .{ width, height }) catch unreachable;
+    const pixels = preview_reply_buffer[header.len..][0 .. @as(usize, width) * height * 4];
+    @memset(pixels, 0x80);
+    return preview_reply_buffer[0 .. header.len + pixels.len];
+}
 
 const Harness = struct {
     harness: *native_sdk.TestHarness(),
@@ -615,7 +628,6 @@ const Harness = struct {
     /// spawns are still pending. Only the encoder-detection tests call
     /// this directly; everything else goes through `create`.
     fn createBare() !Harness {
-        main.thumbnail_path = test_thumbnail_path;
         main.converted_path = test_converted_path;
 
         const size = geometry.SizeF.init(main.window_width, main.window_height);
@@ -720,33 +732,32 @@ const Harness = struct {
         try self.drain();
     }
 
-    /// The dimension query, fed as the standard happy-path result: well
-    /// under the 50 MP limit, so the chain proceeds to the thumbnail spawn.
-    fn dimensions(self: *Harness, width: u64, height: u64) !void {
+    /// `image.probe`'s answer, in the standard happy-path shape: a JPEG,
+    /// upright, well under the 50 MP limit, so the chain proceeds to the
+    /// thumbnail request.
+    fn probe(self: *Harness, width: u64, height: u64) !void {
         var buf: [64]u8 = undefined;
-        const output = std.fmt.bufPrint(&buf, "pixelWidth: {d}|pixelHeight: {d}|", .{ width, height }) catch unreachable;
-        try self.dimensionsRaw(output, 0);
+        const reply = std.fmt.bufPrint(&buf, "{d} {d} 0 public.jpeg", .{ width, height }) catch unreachable;
+        try self.probeRaw(true, reply);
     }
 
-    /// The general form, for tests that need control over the raw `sips -g`
-    /// output or a nonzero exit — e.g. the `<nil>` shape `sips` prints for
-    /// a non-image file, or a genuinely failed query.
-    fn dimensionsRaw(self: *Harness, output: []const u8, code: i32) !void {
-        const request = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-        try self.fx().feedOutput(request.key, output);
-        try self.fx().feedExit(request.key, code);
+    /// The general form, for tests that need a failed probe (an
+    /// undecodable file) or a malformed answer.
+    fn probeRaw(self: *Harness, ok: bool, reply: []const u8) !void {
+        const request = self.pendingHostNamed("image.probe") orelse return error.NoHostRequest;
+        try self.fx().feedHostResult(request.key, ok, reply);
         try self.drain();
     }
 
-    fn thumbnail(self: *Harness, code: i32) !void {
-        const request = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-        try self.fx().feedExit(request.key, code);
-        try self.drain();
+    /// `image.thumbnail`'s answer: a real, well-formed preview reply at
+    /// the given size, which `update` registers as the preview pixels.
+    fn thumbnail(self: *Harness, width: u32, height: u32) !void {
+        try self.thumbnailRaw(true, previewReply(width, height));
     }
 
-    fn preview(self: *Harness, outcome: native_sdk.EffectImageOutcome, w: u64, h: u64) !void {
-        const request = self.fx().pendingImageLoadAt(0) orelse return error.NoImageLoad;
-        try self.fx().feedImageResult(request.id, outcome, w, h, 0, "");
+    fn thumbnailRaw(self: *Harness, ok: bool, reply: []const u8) !void {
+        const request = self.pendingHostNamed("image.thumbnail") orelse return error.NoHostRequest;
+        try self.fx().feedHostResult(request.key, ok, reply);
         try self.drain();
     }
 
@@ -762,9 +773,8 @@ const Harness = struct {
     fn load(self: *Harness, path: []const u8, size: []const u8) !void {
         try self.pick(path);
         try self.stat(size);
-        try self.dimensions(4000, 3000);
-        try self.thumbnail(0);
-        try self.preview(.loaded, 160, 120);
+        try self.probe(4000, 3000);
+        try self.thumbnail(160, 120);
     }
 
     /// The pending encode spawn whose argv[0] is `program`, or null.
@@ -871,41 +881,37 @@ test "picking a file lands the real path, its size, and a preview" {
     try h.stat("2516582");
     try testing.expectEqual(@as(u64, 2516582), h.model().original_size);
 
-    // The dimension query is a SEPARATE `sips` call (can't combine `-g`
-    // with `-s`/`-Z` in one invocation) that runs before the thumbnail spawn.
-    const dims_spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-    const expected_dims_argv = [_][]const u8{
-        "/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", "-1", path,
-    };
-    try testing.expectEqual(expected_dims_argv.len, dims_spawn.argv.len);
-    for (expected_dims_argv, dims_spawn.argv) |expected, actual| {
-        try testing.expectEqualStrings(expected, actual);
-    }
-    try h.dimensions(4000, 3000);
+    // `image.probe` reads ImageIO's property dictionary and decodes
+    // NOTHING, which is what lets the megapixel guard run before any
+    // pixels exist. It carries the same path as its payload.
+    const probe_request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("image.probe", probe_request.name);
+    try testing.expectEqualStrings(path, probe_request.payload);
+    // Nothing is spawned anywhere in the load chain any more — the two
+    // `sips` calls M13 replaced were the last of it.
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
 
-    // The preview is a downscaled copy: `sips` reads the source and writes
-    // the thumbnail `fx.loadImage` then reads. Pin the whole argv — a
-    // silently reordered flag would still exit 0 on some other file.
-    const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-    try testing.expectEqual(@as(usize, 9), spawn.argv.len);
-    const expected_argv = [_][]const u8{
-        "/usr/bin/sips", "-s", "format", "png", "-Z", "160", path, "--out", test_thumbnail_path,
-    };
-    for (expected_argv, spawn.argv) |expected, actual| {
-        try testing.expectEqualStrings(expected, actual);
-    }
+    // A rotated source: the probe reports DISPLAY dimensions, so 3000x4000
+    // is what the model records for a 4000x3000 file tagged Orientation 6.
+    try h.probeRaw(true, "3000 4000 6 public.jpeg");
+    try testing.expectEqual(@as(u32, 3000), h.model().source_width);
+    try testing.expectEqual(@as(u32, 4000), h.model().source_height);
+    // The container, sniffed by ImageIO rather than read off the
+    // extension — M14's chroma table keys on this.
+    try testing.expectEqualStrings("public.jpeg", h.model().sourceUti());
 
-    try h.thumbnail(0);
+    const thumb_request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("image.thumbnail", thumb_request.name);
+    try testing.expectEqualStrings(path, thumb_request.payload);
 
-    const load = h.fx().pendingImageLoadAt(0) orelse return error.NoImageLoad;
-    try testing.expectEqualStrings(test_thumbnail_path, load.path);
-
-    try h.preview(.loaded, 160, 120);
+    // The pixels ride the result, so this lands as a registered image
+    // with no temp file and no second decode.
+    try h.thumbnail(120, 160);
     try testing.expectEqual(Status.ready, h.model().status);
     try testing.expect(h.model().image_id != 0);
     try testing.expect(h.model().hasPreview());
-    try testing.expectEqual(@as(u32, 160), h.model().preview_width);
-    try testing.expectEqual(@as(u32, 120), h.model().preview_height);
+    try testing.expectEqual(@as(u32, 120), h.model().preview_width);
+    try testing.expectEqual(@as(u32, 160), h.model().preview_height);
     try testing.expectEqualStrings("", h.model().errorMessage());
 }
 
@@ -928,11 +934,7 @@ test "cancelling a re-pick keeps the image already loaded" {
     var h = try Harness.create();
     defer h.destroy();
 
-    try h.pick("/Users/someone/Pictures/photo.jpg");
-    try h.stat("2516582");
-    try h.dimensions(4000, 3000);
-    try h.thumbnail(0);
-    try h.preview(.loaded, 160, 120);
+    try h.load("/Users/someone/Pictures/photo.jpg", "2516582");
 
     try h.send(.pick_file);
     const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
@@ -972,15 +974,15 @@ test "a non-image input fails with the supported-formats message" {
 
     try h.pick("/Users/someone/Pictures/not-an-image.jpg");
     try h.stat("128");
-    // `sips -g` still exits 0 on a non-image, printing literal `<nil>` for
-    // both properties — confirmed against a real fixture. That must not
-    // itself be treated as an error; `sips` doing the real format check at
-    // the thumbnail step (next) is what should fail.
-    try h.dimensionsRaw("pixelWidth: <nil>|pixelHeight: <nil>|", 0);
-    // `sips` is the real format gate — a text file renamed .jpg exits nonzero.
-    try h.thumbnail(1);
+    // THE PROBE is the format gate now, one hop earlier than `sips` was.
+    // `imageio.probe` reports `NotAnImage` off the frame count, because
+    // `CGImageSourceCreateWithURL` succeeds on 49 bytes of text named
+    // `.jpg` and hands back a perfectly non-null source.
+    try h.probeRaw(false, "NotAnImage");
 
     try testing.expectEqual(Status.failed, h.model().status);
+    // Nothing was decoded: the thumbnail request is never issued.
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingHostCount());
     const message = h.model().errorMessage();
     // The message does not name the file — the card above it does: the
     // status bar is one elided line, and a quoted name would crowd out
@@ -1007,10 +1009,10 @@ test "a new pick drops the previous file's preview before it can load" {
 
     try h.pick("/Users/someone/Pictures/not-an-image.jpg");
     // Gone at the PICK, not at the failure: the whole load chain (stat,
-    // dimensions, thumbnail) runs with the card already showing the new
+    // probe, thumbnail) runs with the card already showing the new
     // file's name, and any of those hops can fail or simply take time.
     try testing.expect(!h.model().hasPreview());
-    try testing.expectEqual(@as(u32, 0), h.model().previewWidth());
+    try testing.expectEqual(@as(u32, 0), h.model().preview_width);
 
     const tree = try buildTree(arena, h.model());
     _ = try expectByText(tree.root, .text, "not-an-image.jpg");
@@ -1023,12 +1025,32 @@ test "a preview that will not decode fails instead of silently showing nothing" 
 
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
-    try h.dimensions(4000, 3000);
-    try h.thumbnail(0);
-    try h.preview(.decode_failed, 0, 0);
+    try h.probe(4000, 3000);
+    // A file whose properties read fine but whose pixels will not come
+    // back — ImageIO declining to build a thumbnail from a source it
+    // opened. Distinct from the probe failure above, and a different
+    // sentence to the user.
+    try h.thumbnailRaw(false, "NoThumbnail");
 
     try testing.expectEqual(Status.failed, h.model().status);
     try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "preview") != null);
+    try testing.expect(!h.model().hasPreview());
+}
+
+test "a preview answer that is not a well-formed reply fails rather than registering junk" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("2516582");
+    try h.probe(4000, 3000);
+    // The header says 160x120, the pixel run is one byte short. Registering
+    // this would hand the canvas a buffer smaller than the dimensions it
+    // was told to draw.
+    const truncated = previewReply(160, 120);
+    try h.thumbnailRaw(true, truncated[0 .. truncated.len - 1]);
+
+    try testing.expectEqual(Status.failed, h.model().status);
     try testing.expect(!h.model().hasPreview());
 }
 
@@ -1044,7 +1066,8 @@ test "a stat result that is not a number fails rather than reporting 0 bytes" {
     try testing.expectEqual(Status.failed, h.model().status);
     try testing.expectEqual(@as(u64, 0), h.model().original_size);
     // A "0 B" original would make the savings % nonsense, so this must
-    // never reach the encode path.
+    // never reach the probe, let alone the encode path.
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingHostCount());
     try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
 }
 
@@ -1053,11 +1076,7 @@ test "reset clears the file but keeps the chosen format" {
     defer h.destroy();
 
     h.model().format = .both;
-    try h.pick("/Users/someone/Pictures/photo.jpg");
-    try h.stat("2516582");
-    try h.dimensions(4000, 3000);
-    try h.thumbnail(0);
-    try h.preview(.loaded, 160, 120);
+    try h.load("/Users/someone/Pictures/photo.jpg", "2516582");
 
     try h.send(.reset);
 
@@ -1069,23 +1088,29 @@ test "reset clears the file but keeps the chosen format" {
     try testing.expectEqual(Format.both, h.model().format);
 }
 
-test "an effect result that lands after reset is ignored" {
+test "a probe in flight at reset is cancelled outright, not merely ignored" {
     var h = try Harness.create();
     defer h.destroy();
 
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
+    const request = h.pendingHostNamed("image.probe") orelse return error.NoHostRequest;
 
-    // Reset while the dimensions spawn is still in flight. Its cancel
-    // delivers a terminal exit, and a later real exit could too — neither
-    // may resurrect a file the user just cleared.
     try h.send(.reset);
     try h.drain();
 
     try testing.expectEqual(Status.idle, h.model().status);
     try testing.expectEqualStrings("", h.model().path());
     try testing.expect(!h.model().hasPreview());
-    try testing.expectEqual(@as(usize, 0), h.fx().pendingImageLoadCount());
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingHostCount());
+
+    // This is WHY the load chain needs no status guard: a worker that
+    // finishes after the reset cannot deliver at all. `cancelHostRequest`
+    // released the slot, so the answer has nowhere to land.
+    try testing.expectError(error.EffectNotFound, h.fx().feedHostResult(request.key, true, "4000 3000 0 public.jpeg"));
+    try h.drain();
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqualStrings("", h.model().errorMessage());
 }
 
 test "a preview cancelled by reset is not reported as a broken image" {
@@ -1094,16 +1119,15 @@ test "a preview cancelled by reset is not reported as a broken image" {
 
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
-    try h.dimensions(4000, 3000);
-    try h.thumbnail(0);
-    try testing.expect(h.fx().pendingImageLoadAt(0) != null);
+    try h.probe(4000, 3000);
+    const request = h.pendingHostNamed("image.thumbnail") orelse return error.NoHostRequest;
 
-    // Reset with the image load in flight. Cancelling it delivers a
-    // terminal whose outcome is `.cancelled`, not `.loaded` — which is
-    // exactly the shape of a real decode failure. Only the status guard
-    // tells them apart, so without it the user gets "Couldn't build a
-    // preview for photo.jpg" for pressing Reset.
+    // Reset with the ImageIO thumbnail still decoding on its worker
+    // thread. Its eventual answer must not read as "Couldn't build a
+    // preview" for a file the user already cleared.
     try h.send(.reset);
+    try h.drain();
+    try testing.expectError(error.EffectNotFound, h.fx().feedHostResult(request.key, false, "NoThumbnail"));
     try h.drain();
 
     try testing.expectEqual(Status.idle, h.model().status);
@@ -1124,9 +1148,8 @@ test "reset frees the effect keys so the next pick is not rejected" {
     // pick would fail here rather than round-trip.
     try h.pick("/Users/someone/Pictures/second.jpg");
     try h.stat("200");
-    try h.dimensions(4000, 3000);
-    try h.thumbnail(0);
-    try h.preview(.loaded, 160, 90);
+    try h.probe(4000, 3000);
+    try h.thumbnail(160, 90);
 
     try testing.expectEqual(Status.ready, h.model().status);
     try testing.expectEqualStrings("/Users/someone/Pictures/second.jpg", h.model().path());
@@ -1139,7 +1162,7 @@ test "reset frees the effect keys so the next pick is not rejected" {
 // fixture that separates the two branches — 51.2 MP but only ~5.7 MB — so
 // both need their own test, over numbers rather than a real 51 MP decode.
 
-test "a file over the byte limit fails before any dimension query" {
+test "a file over the byte limit fails before the file is even probed" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -1151,10 +1174,9 @@ test "a file over the byte limit fails before any dimension query" {
     const message = h.model().errorMessage();
     try testing.expect(std.mem.indexOf(u8, message, "132.0 MB") != null);
     try testing.expect(std.mem.indexOf(u8, message, "100 MB") != null);
-    // The byte check must short-circuit before spawning anything else —
-    // an oversized file has no business being decoded even for a dimension
-    // query.
-    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
+    // The byte check must short-circuit before anything else is asked
+    // for — an oversized file has no business reaching ImageIO at all.
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingHostCount());
 }
 
 test "a file exactly at the byte limit is not rejected" {
@@ -1164,7 +1186,7 @@ test "a file exactly at the byte limit is not rejected" {
     try h.pick("/Users/someone/Pictures/exactly-100mb.jpg");
     try h.stat("104857600"); // exactly 100 MB
     try testing.expectEqual(Status.loading, h.model().status);
-    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+    try testing.expect(h.pendingHostNamed("image.probe") != null);
 }
 
 test "a file under the byte limit but over the megapixel limit fails, naming the file" {
@@ -1177,14 +1199,16 @@ test "a file under the byte limit but over the megapixel limit fails, naming the
     try h.pick("/Users/someone/Pictures/oversized.jpg");
     try h.stat("5955395");
     try testing.expectEqual(Status.loading, h.model().status);
-    try h.dimensions(8000, 6400);
+    try h.probe(8000, 6400);
 
     try testing.expectEqual(Status.failed, h.model().status);
     const message = h.model().errorMessage();
     try testing.expect(std.mem.indexOf(u8, message, "51") != null);
     try testing.expect(std.mem.indexOf(u8, message, "50 MP") != null);
-    // No thumbnail may be spawned for a file that already failed the limit.
-    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
+    // No decode may be asked for on a file that already failed the limit —
+    // and unlike Phase A, none has happened yet either: the probe read
+    // properties only.
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingHostCount());
     try testing.expect(!h.model().hasPreview());
 }
 
@@ -1195,44 +1219,56 @@ test "a file exactly at the megapixel limit is not rejected" {
     try h.pick("/Users/someone/Pictures/exactly-50mp.jpg");
     try h.stat("5000000");
     // 10000 x 5000 = 50,000,000 px = exactly 50.0 MP.
-    try h.dimensions(10000, 5000);
+    try h.probe(10000, 5000);
 
     try testing.expectEqual(Status.loading, h.model().status);
-    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+    try testing.expect(h.pendingHostNamed("image.thumbnail") != null);
 }
 
-test "unparseable dimensions do not block the chain — the thumbnail spawn is the real gate" {
+test "the megapixel guard measures DISPLAY dimensions, not stored ones" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // Same pixel count either way, so this is not about the limit passing
+    // — it is about which numbers the card then reports. A 4000x3000 file
+    // tagged Orientation 6 is a 3000x4000 image, and `imageio.probe` has
+    // already applied the transform by the time `update` sees it.
+    try h.pick("/Users/someone/Pictures/rotated.jpg");
+    try h.stat("5000000");
+    try h.probeRaw(true, "3000 4000 6 public.jpeg");
+
+    try testing.expectEqual(@as(u32, 3000), h.model().source_width);
+    try testing.expectEqual(@as(u32, 4000), h.model().source_height);
+    try testing.expectEqual(Status.loading, h.model().status);
+}
+
+test "a garbled probe answer fails the load rather than proceeding blind" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // A DELIBERATE CHANGE from Phase A, where an unparseable `sips -g`
+    // answer was tolerated and the thumbnail spawn was left to decide.
+    // There is no second gate any more — the thumbnail is the same ImageIO
+    // read — so a probe that cannot name the image's size is a file the
+    // preview could not have drawn either.
+    try h.pick("/Users/someone/Pictures/weird.jpg");
+    try h.stat("5000000");
+    try h.probeRaw(true, "");
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "JPEG") != null);
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingHostCount());
+}
+
+test "a zero-dimension probe answer is treated as garbled, not as a 0 MP image" {
     var h = try Harness.create();
     defer h.destroy();
 
     try h.pick("/Users/someone/Pictures/weird.jpg");
     try h.stat("5000000");
-    // A failed or garbled dimension query is not itself an error — proceed
-    // to the thumbnail spawn and let `sips`'s real conversion decide.
-    try h.dimensionsRaw("", 1);
+    try h.probeRaw(true, "0 0 0 public.jpeg");
 
-    try testing.expectEqual(Status.loading, h.model().status);
-    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
-    try h.thumbnail(0);
-    try testing.expectEqual(@as(usize, 1), h.fx().pendingImageLoadCount());
-}
-
-test "a dimension query cancelled by reset is not reported as a broken image" {
-    var h = try Harness.create();
-    defer h.destroy();
-
-    try h.pick("/Users/someone/Pictures/photo.jpg");
-    try h.stat("2516582");
-    try testing.expect(h.fx().pendingSpawnAt(0) != null);
-
-    // Same hazard as the thumbnail/image-load cancel tests above: cancelling
-    // the in-flight dimensions spawn delivers an ordinary failed exit, which
-    // must not be mistaken for a real megapixel-limit failure.
-    try h.send(.reset);
-    try h.drain();
-
-    try testing.expectEqual(Status.idle, h.model().status);
-    try testing.expectEqualStrings("", h.model().errorMessage());
+    try testing.expectEqual(Status.failed, h.model().status);
     try testing.expect(!h.model().hasPreview());
 }
 
@@ -1361,9 +1397,8 @@ test "format survives picking a file, unlike the rest of the model" {
     try h.send(.{ .set_format = .webp });
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
-    try h.dimensions(4000, 3000);
-    try h.thumbnail(0);
-    try h.preview(.loaded, 160, 120);
+    try h.probe(4000, 3000);
+    try h.thumbnail(160, 120);
 
     // The pick chain touches file/preview state only; format is a
     // standing preference, not something a load can clobber.
@@ -1969,9 +2004,8 @@ test "picking a new file clears the previous file's results" {
     try testing.expectEqual(@as(u64, 0), h.model().avif_size);
 
     try h.stat("204800");
-    try h.dimensions(4000, 3000);
-    try h.thumbnail(0);
-    try h.preview(.loaded, 160, 120);
+    try h.probe(4000, 3000);
+    try h.thumbnail(160, 120);
     try testing.expectEqual(Status.ready, h.model().status);
 }
 
@@ -2387,37 +2421,31 @@ test "the file card names the file and its original size" {
     _ = try expectByText(tree.root, .text, "Original 5.6 MB");
 }
 
-test "the preview clamps to the source, so sips' upscaling never shows" {
+test "a small source draws at its own size, with no clamp left to do it" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // `sips -Z 160` UPSCALES anything smaller than 160px — `tiny.png` came
-    // back a 160x160 blur. The registered pixels are whatever sips
-    // produced; the drawn size is the source's.
-    var model = readyModel();
-    model.preview_width = 160;
-    model.preview_height = 160;
-    model.source_width = 12;
-    model.source_height = 12;
-    try testing.expectEqual(@as(u32, 12), model.previewWidth());
-    try testing.expectEqual(@as(u32, 12), model.previewHeight());
-    const tiny = try buildTree(arena, &model);
-    const drawn = findByKind(tiny.root, .image) orelse return error.WidgetNotFound;
-    try testing.expectEqual(@as(f32, 12), drawn.layout.max_size.width);
+    // Phase A needed a clamp here: `sips -Z 160` UPSCALED anything smaller
+    // than 160px, so `tiny.png` (8x8) came back a 160x160 blur and the
+    // drawn size had to be pulled back to the source's. ImageIO CAPS
+    // instead of upscaling — measured over the whole fixture set, where
+    // `tiny.png` returns 8x8 and `small.png` returns 64x64 — so the
+    // registered size is already honest and the markup binds it directly.
+    var h = try Harness.create();
+    defer h.destroy();
 
-    // A source larger than the thumbnail is left alone — the clamp is a
-    // floor on upscaling, not a resize.
-    model.source_width = 4000;
-    model.source_height = 3000;
-    try testing.expectEqual(@as(u32, 160), model.previewWidth());
+    try h.pick("/Users/someone/Pictures/tiny.png");
+    try h.stat("312");
+    try h.probe(8, 8);
+    try h.thumbnail(8, 8);
 
-    // And an unparsed `sips -g` (dimensions still 0) falls back to the
-    // registered size rather than collapsing the preview to nothing.
-    model.source_width = 0;
-    model.source_height = 0;
-    try testing.expectEqual(@as(u32, 160), model.previewWidth());
-    try testing.expectEqual(@as(u32, 160), model.previewHeight());
+    try testing.expectEqual(@as(u32, 8), h.model().preview_width);
+    try testing.expectEqual(@as(u32, 8), h.model().preview_height);
+    const tree = try buildTree(arena, h.model());
+    const drawn = findByKind(tree.root, .image) orelse return error.WidgetNotFound;
+    try testing.expectEqual(@as(f32, 8), drawn.layout.max_size.width);
+    try testing.expectEqual(@as(f32, 8), drawn.layout.max_size.height);
 }
 
 test "the preview renders only once an image is registered" {
@@ -2442,6 +2470,98 @@ test "the preview renders only once an image is registered" {
     // The declared definite size is what the markup actually states.)
     try testing.expectEqual(@as(f32, 160), image.layout.max_size.width);
     try testing.expectEqual(@as(f32, 120), image.layout.max_size.height);
+}
+
+// ================================================================ imageio
+//
+// The pure half of `src/imageio.zig`, plus the wire parsers that carry its
+// answers back to `update`. Both are ordinary functions over bytes, so
+// they are pinned here rather than only through the dispatch path.
+//
+// THE IMAGEIO-CALLING HALF IS NOT HERE, and cannot be: `native test`
+// builds its own Debug module (`build/app.zig`'s `test_app_mod`, which
+// diverges from the app module because `app_optimize` is ReleaseFast) and
+// `linkPlatform` never runs on it — so the test binary links no
+// frameworks at all, and any test touching `imageio.probe`/`thumbnail`
+// fails at LINK time with `undefined symbol: _CFRelease`. Those tests live
+// in `src/imageio.zig` itself, which `native test` does not import; its
+// header carries the standalone `zig test` command that runs them. Fold
+// them in here once M14 owns `build.zig` and can link the test module too.
+
+test "parseProbeReply reads dimensions, orientation and the UTI" {
+    const info = main.parseProbeReply("3000 4000 6 public.jpeg") orelse return error.NotParsed;
+    try testing.expectEqual(@as(u32, 3000), info.width);
+    try testing.expectEqual(@as(u32, 4000), info.height);
+    try testing.expectEqual(@as(u8, 6), info.orientation);
+    try testing.expectEqualStrings("public.jpeg", info.uti);
+
+    // A source with no orientation tag reports 0, which is upright.
+    const untagged = main.parseProbeReply("640 200 0 public.heic") orelse return error.NotParsed;
+    try testing.expectEqual(@as(u8, 0), untagged.orientation);
+    try testing.expectEqualStrings("public.heic", untagged.uti);
+}
+
+test "parseProbeReply rejects every shape that is not a probe answer" {
+    try testing.expect(main.parseProbeReply("") == null);
+    try testing.expect(main.parseProbeReply("4000") == null);
+    try testing.expect(main.parseProbeReply("4000 3000") == null);
+    try testing.expect(main.parseProbeReply("wide tall 0 public.jpeg") == null);
+    // Zero dimensions would sail through the megapixel guard and then
+    // collapse the preview — a garbled answer, not a 0 MP image.
+    try testing.expect(main.parseProbeReply("0 3000 0 public.jpeg") == null);
+    try testing.expect(main.parseProbeReply("4000 0 0 public.jpeg") == null);
+    // A missing UTI is tolerated: nothing in v0.2 reads it, and losing it
+    // is not worth failing a load the user can otherwise complete.
+    const bare = main.parseProbeReply("64 64 0 ") orelse return error.NotParsed;
+    try testing.expectEqualStrings("", bare.uti);
+}
+
+test "parsePreviewReply splits the fixed-width header from the pixels" {
+    const reply = previewReply(160, 120);
+    const preview = main.parsePreviewReply(reply) orelse return error.NotParsed;
+    try testing.expectEqual(@as(u32, 160), preview.width);
+    try testing.expectEqual(@as(u32, 120), preview.height);
+    try testing.expectEqual(@as(usize, 160 * 120 * 4), preview.pixels.len);
+    try testing.expectEqual(@as(u8, 0x80), preview.pixels[0]);
+}
+
+test "parsePreviewReply rejects a pixel run that does not match its header" {
+    const reply = previewReply(64, 64);
+    // One byte short, and one byte long: both would hand the canvas a
+    // buffer that disagrees with the dimensions it was told to draw.
+    try testing.expect(main.parsePreviewReply(reply[0 .. reply.len - 1]) == null);
+    try testing.expect(main.parsePreviewReply(reply) != null);
+    try testing.expect(main.parsePreviewReply("00064 00064") == null);
+    try testing.expect(main.parsePreviewReply("") == null);
+    try testing.expect(main.parsePreviewReply("00000 00000\n") == null);
+}
+
+test "swapsAxes covers exactly the four transposing EXIF orientations" {
+    // 0 is "no tag at all", which is upright.
+    for ([_]u8{ 0, 1, 2, 3, 4, 9, 255 }) |upright| {
+        try testing.expect(!imageio.swapsAxes(upright));
+    }
+    for ([_]u8{ 5, 6, 7, 8 }) |transposed| {
+        try testing.expect(imageio.swapsAxes(transposed));
+    }
+}
+
+test "unpremultiply restores straight alpha and leaves the trivial cases alone" {
+    // Opaque and fully transparent pixels are already correct in both
+    // conventions — the whole fixture set bar `alpha16.png`.
+    var pixels = [_]u8{
+        200, 100, 50,  255, // opaque: untouched
+        9,   9,   9,   0, // transparent: untouched
+        100, 50,  25,  128, // half-alpha: scaled back up
+        255, 255, 255, 1, // extreme: must clamp, not wrap
+    };
+    imageio.unpremultiply(&pixels);
+
+    try testing.expectEqualSlices(u8, &.{ 200, 100, 50, 255 }, pixels[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 9, 9, 9, 0 }, pixels[4..8]);
+    // (100 * 255 + 64) / 128 = 199
+    try testing.expectEqualSlices(u8, &.{ 199, 100, 50, 128 }, pixels[8..12]);
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 1 }, pixels[12..16]);
 }
 
 // ------------------------------------------------------------------ drops
@@ -2494,9 +2614,8 @@ test "a real drop lands the real path, its size, and a preview" {
     try testing.expectEqual(Status.loading, h.model().status);
 
     try h.stat("1024");
-    try h.dimensions(800, 600);
-    try h.thumbnail(0);
-    try h.preview(.loaded, 160, 120);
+    try h.probe(800, 600);
+    try h.thumbnail(160, 120);
 
     try testing.expectEqual(Status.ready, h.model().status);
     try testing.expect(h.model().hasPreview());

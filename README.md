@@ -9,6 +9,12 @@ something local and instant.
 
 ## Status
 
+**v0.2 — decoding is native; encoding is not yet.** Everything that reads your image now goes
+through Apple's ImageIO, in-process: the preview, its dimensions and the size limits. It shows the
+file's primary frame, the right way up, converted to sRGB. Compression still shells out to
+`avifenc` and `cwebp`, so the Homebrew requirement below is still real — removing it is the next
+milestone.
+
 **v0.1 — feature-complete and packaged.** Smoosh launches to a drop zone — pick an
 image or drag one onto the window — see a preview and its size, choose AVIF / WebP
 / Both, and press Smoosh — the compressed files land next to the original and the
@@ -33,21 +39,24 @@ the binary.
 
 Encoding is phased:
 
-- **Phase A (MVP)** — shell out to `avifenc` and `cwebp` through the effects
-  channel's `fx.spawn`. Fast to build, fast to iterate on the UI.
-- **Phase B (later)** — decode through Apple's ImageIO, encode through
-  statically linked libavif/libwebp. One self-contained binary.
+- **Phase A (v0.1)** — shell out to `sips`, `avifenc` and `cwebp` through the
+  effects channel's `fx.spawn`. Fast to build, fast to iterate on the UI.
+- **Phase B, half done (v0.2)** — decoding moved to Apple's ImageIO, called
+  directly from Zig (`src/imageio.zig`). No subprocess reads your image any
+  more, and the decode runs on a worker thread so the window keeps painting.
+- **Phase B, the rest (v0.3)** — encode through statically linked
+  libavif/libwebp. One self-contained binary, no Homebrew.
 
-The Native SDK ships no image encoder, so Phase A depends on tools you install
-yourself. Smoosh detects them at launch and tells you what is missing — it never
-installs anything on your behalf.
+The Native SDK ships no image encoder, so encoding still depends on tools you
+install yourself. Smoosh detects them at launch and tells you what is missing —
+it never installs anything on your behalf.
 
 ## Requirements
 
 - macOS (Apple Silicon targeted; no Linux or Windows in v0.1)
 - [`native`](https://native-sdk.dev) CLI **0.10.1**
 - Zig **0.16.0**
-- Encoders, for Phase A:
+- Encoders, until v0.3 lands:
   ```sh
   brew install libavif   # provides avifenc
   brew install webp      # provides cwebp
@@ -87,6 +96,7 @@ verified against the running app.
 ```
 src/main.zig      the app: Model, Msg, update, effects        (added in M1)
 src/app.native    the view                                    (added in M2)
+src/imageio.zig   the ImageIO seam: probe + thumbnail         (added in M13)
 app.zon           identity, window, permissions, capabilities
 docs/spikes/      proven reference implementations; not built as part of the app
 PLAN.md           milestones and decisions
