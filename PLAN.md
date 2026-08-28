@@ -621,6 +621,12 @@ and so is **step 5**; the remaining spike (step 6) is a hard gate for M14 specif
    arm64-macos, encode-only, and record the exact configure invocations in
    `docs/phase-b-baseline.md`. Separate from step 5 because it is a build-system problem, not a
    linking one, and libaom's generated `rtcd` headers are where it will bite.
+   **Verify each artifact in `~/Code/zig/smoosh-linkspike`** — step 5's spike app, kept outside
+   this repo with a warm cache (no-op build ~0.3s vs ~50s cold). Its README has the procedure and
+   the version symbol to call per library. Run BOTH `native build` and `native test` against every
+   archive: libsharpyuv proved one can link clean in the ReleaseFast exe and fail in the Debug
+   test artifact. Note Homebrew ships static `libwebp.a`/`libsharpyuv.a`/`libaom.a` but **libavif
+   as a dylib only**, so libavif must be built from source regardless.
 7. **M14 (v0.3)** — vendored libwebp + libavif/libaom; zero dependencies.
 
 UI polishing remains unplanned and now sits behind Phase B.
