@@ -41,7 +41,7 @@ added in this round; the reason each exists is in the last column.
 | `rotated-gps.jpg` | jpeg | 4000x3000 | **6** | 8 | 4:4:4 | sRGB | orientation baking + metadata stripping (EXIF Make/Model + GPS) (new) |
 | `photo.webp` / `large.webp` | webp | 4000x3000 | — | 8 | n/a | none | the WebP-source path (`same_path` for WebP output) |
 | `photo.avif` / `large.avif` | avif | 4000x3000 | 1 | 8 | n/a | sRGB | the AVIF-source path (`same_path` for AVIF output) |
-| `oversized.jpg` | jpeg | 8000x6400 | — | 8 | 4:4:4 | sRGB | the 50 MP guard (51.2 MP) — no encode baseline |
+| `oversized.jpg` | jpeg | 8000x6400 | — | 8 | **4:2:0** (was recorded 4:4:4 — see M14b note) | sRGB | the 50 MP guard (51.2 MP) — no encode baseline |
 | `not-an-image.jpg` | — | — | — | — | — | — | the undecodable-input guard (49 bytes of text) — no encode baseline |
 
 **Nothing is missing any more**, but the way the last gap closed is worth recording, because the
@@ -407,3 +407,34 @@ Smoosh's current 5.5 MB binary that lands around **10.7 MB**, and the +1,424-byt
 reminder of why: the link pulls only what is referenced, so the 8.1 MB archive is not the cost.
 If that number ever needs to come down, Homebrew's `-Os` libaom is the knob — at an encode-speed
 cost, and only after re-verifying output against the Phase A table.
+
+
+## M14b (2026-08-29) — the chroma table and the decode path, checked against the above
+
+M14b landed `imageio.decode` and `src/chroma.zig` and ran both over the whole fixture set. Nothing
+in the encode table above moved — no encoder is called yet — so this section is a CHECK of the
+gate, not a re-measurement of it.
+
+**`chroma.forSource` reproduces the `AVIF yuv` column exactly**, on all fourteen fixtures that have
+one: `large.jpg` and `rotated-gps.jpg` 444, `photo-420.jpg` and `ui.jpg` 420, `ui.png` 444,
+`gray.jpg` 400, every PNG 444, every HEIC 444. The four fixtures with no row (`photo.webp`,
+`large.webp`, `photo.avif`, `large.avif`, all **fail** above because `avifenc` cannot read them)
+come out 444, which is the only answer the table can give and is a strict improvement — after M14c
+they encode instead of failing.
+
+**One inventory cell above was wrong and is corrected in place: `oversized.jpg` is 4:2:0, not
+4:4:4.** `magick identify -format '%[jpeg:sampling-factor]'` reports `2x2,1x1,1x1`, and the hand
+parser agrees. Nothing depended on it — the fixture is blocked by the 50 MP guard and has no encode
+row — and it is a property of the source file rather than an encoder measurement, so correcting it
+does not touch the gate this document exists to be. The other five JPEGs match ImageMagick exactly:
+`large.jpg` and `rotated-gps.jpg` are `1x1,1x1,1x1`, `photo-420.jpg` and `ui.jpg` are
+`2x2,1x1,1x1`, `gray.jpg` is `1x1`.
+
+**The orientation bake is exact, not approximate.** `decode` on `rotated-gps.jpg` returns
+3000x4000 with every corner landing where a quarter turn clockwise puts `large.jpg`'s (the same
+image, untagged): TL<-BL, TR<-TL, BL<-BR, BR<-TR, byte for byte. Same on `rotated-p3.heic` against
+`p3.heic`. All eight EXIF orientations are covered by a test decoding a synthesized tagged PNG and
+asserting every pixel, and CoreGraphics' quarter turns come out as exact permutations — no
+resampling to account for. `decode` and `probe` agree on dimensions for every fixture, including
+`multi-primary.heic` (640x200, the primary frame) and the real `iphone-rotated-p3.heic`
+(3024x4032).

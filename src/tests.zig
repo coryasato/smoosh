@@ -17,6 +17,7 @@ const native_sdk = @import("native_sdk");
 const main = @import("main.zig");
 const imageio = @import("imageio.zig");
 const encoders = @import("encoders.zig");
+const chroma = @import("chroma.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -1430,8 +1431,8 @@ test "AVIF alone spawns the pinned avifenc argv and writes next to the source" {
 
     const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
     const expected_argv = [_][]const u8{
-        "avifenc",  "-q",  "58",
-        "--speed",  "6",   large_jpg,
+        "avifenc",                            "-q", "58",
+        "--speed",                            "6",  large_jpg,
         "/Users/someone/Pictures/large.avif",
     };
     try testing.expectEqual(expected_argv.len, spawn.argv.len);
@@ -1752,9 +1753,8 @@ test "a HEIC source stages a sips conversion before either encoder runs" {
     // file.
     const encode = h.encodeSpawn("avifenc") orelse return error.NoSpawn;
     const expected_encode_argv = [_][]const u8{
-        "avifenc",          "-q",     "58", "--speed",
-        "6",                 test_converted_path,
-        "/Users/someone/Pictures/photo.avif",
+        "avifenc", "-q",                "58",                                 "--speed",
+        "6",       test_converted_path, "/Users/someone/Pictures/photo.avif",
     };
     try testing.expectEqual(expected_encode_argv.len, encode.argv.len);
     for (expected_encode_argv, encode.argv) |expected, actual| {
@@ -2479,15 +2479,11 @@ test "the preview renders only once an image is registered" {
 // answers back to `update`. Both are ordinary functions over bytes, so
 // they are pinned here rather than only through the dispatch path.
 //
-// THE IMAGEIO-CALLING HALF IS NOT HERE, and cannot be: `native test`
-// builds its own Debug module (`build/app.zig`'s `test_app_mod`, which
-// diverges from the app module because `app_optimize` is ReleaseFast) and
-// `linkPlatform` never runs on it — so the test binary links no
-// frameworks at all, and any test touching `imageio.probe`/`thumbnail`
-// fails at LINK time with `undefined symbol: _CFRelease`. Those tests live
-// in `src/imageio.zig` itself, which `native test` does not import; its
-// header carries the standalone `zig test` command that runs them. Fold
-// them in here once M14 owns `build.zig` and can link the test module too.
+// THE IMAGEIO-CALLING HALF IS IN `src/imageio_tests.zig`, which `native
+// test` also runs since M14a — the split is now just tidiness, not the
+// link constraint it used to be (the test artifact linked no frameworks,
+// so anything touching `imageio.probe` died on `_CFRelease`). Read that
+// file's header before moving anything across.
 
 test "parseProbeReply reads dimensions, orientation and the UTI" {
     const info = main.parseProbeReply("3000 4000 6 public.jpeg") orelse return error.NotParsed;
@@ -2547,13 +2543,98 @@ test "swapsAxes covers exactly the four transposing EXIF orientations" {
     }
 }
 
+test "orientationTransform reproduces every EXIF orientation's pixel mapping" {
+    // An INDEPENDENT check of `imageio.orientationTransform`: rather than
+    // restating its table, this re-derives what the table has to mean and
+    // asserts the two agree.
+    //
+    // The derivation: with the image drawn into `(0, 0, w, h)` under the
+    // identity CTM, stored pixel (u, v) lands at user-space (u, h - v) —
+    // CoreGraphics is y-UP, the stored image is y-down. Applying the
+    // transform must then carry it to (X, H - Y), where (X, Y) is where
+    // the EXIF spec says that pixel belongs on screen.
+    //
+    // `src/imageio_tests.zig` proves the same eight mappings a third way,
+    // through real ImageIO decodes of tagged PNGs. This test is the one
+    // that runs without a decoder and localizes a sign error to the table.
+    const w = 7;
+    const h = 3;
+    for (1..9) |tag| {
+        const orientation: u8 = @intCast(tag);
+        const transform = imageio.orientationTransform(orientation, w, h);
+        try testing.expectEqual(imageio.swapsAxes(orientation), transform.quarter_turn);
+
+        const display_width: f64 = if (transform.quarter_turn) h else w;
+        const display_height: f64 = if (transform.quarter_turn) w else h;
+
+        for (0..h + 1) |v| {
+            for (0..w + 1) |u| {
+                // Where an identity draw would put this stored point.
+                const x: f64 = @floatFromInt(u);
+                const y: f64 = @as(f64, h) - @as(f64, @floatFromInt(v));
+
+                // The transform, applied in declaration order and so
+                // composed OUTERMOST-FIRST: translate . turn . scale.
+                var px = x * transform.scale_x;
+                var py = y * transform.scale_y;
+                if (transform.quarter_turn) {
+                    // +90 degrees: (x, y) -> (-y, x).
+                    const swapped = px;
+                    px = -py;
+                    py = swapped;
+                }
+                px += transform.translate_x;
+                py += transform.translate_y;
+
+                // Back into display coordinates, y-down from the top.
+                const display_x = px;
+                const display_y = display_height - py;
+
+                const fu: f64 = @floatFromInt(u);
+                const fv: f64 = @floatFromInt(v);
+                const expected: [2]f64 = switch (orientation) {
+                    1 => .{ fu, fv },
+                    2 => .{ w - fu, fv },
+                    3 => .{ w - fu, h - fv },
+                    4 => .{ fu, h - fv },
+                    5 => .{ fv, fu },
+                    6 => .{ h - fv, fu },
+                    7 => .{ h - fv, w - fu },
+                    8 => .{ fv, w - fu },
+                    else => unreachable,
+                };
+                try testing.expectApproxEqAbs(expected[0], display_x, 1e-9);
+                try testing.expectApproxEqAbs(expected[1], display_y, 1e-9);
+                // The transform must land inside the destination, never
+                // outside it — a sign error usually shows up here first.
+                try testing.expect(display_x >= -1e-9 and display_x <= display_width + 1e-9);
+                try testing.expect(display_y >= -1e-9 and display_y <= display_height + 1e-9);
+            }
+        }
+    }
+}
+
+test "orientationTransform treats a missing or bogus tag as upright" {
+    // 0 is "no EXIF at all", which is what `probe` reports for a PNG; the
+    // rest are values a corrupt tag could hold. All must be identity,
+    // never a rotation applied to a photo that did not ask for one.
+    for ([_]u8{ 0, 1, 9, 200, 255 }) |tag| {
+        const transform = imageio.orientationTransform(tag, 640, 480);
+        try testing.expectEqual(@as(f64, 0), transform.translate_x);
+        try testing.expectEqual(@as(f64, 0), transform.translate_y);
+        try testing.expectEqual(false, transform.quarter_turn);
+        try testing.expectEqual(@as(f64, 1), transform.scale_x);
+        try testing.expectEqual(@as(f64, 1), transform.scale_y);
+    }
+}
+
 test "unpremultiply restores straight alpha and leaves the trivial cases alone" {
     // Opaque and fully transparent pixels are already correct in both
     // conventions — the whole fixture set bar `alpha16.png`.
     var pixels = [_]u8{
-        200, 100, 50,  255, // opaque: untouched
-        9,   9,   9,   0, // transparent: untouched
-        100, 50,  25,  128, // half-alpha: scaled back up
+        200, 100, 50, 255, // opaque: untouched
+        9, 9, 9, 0, // transparent: untouched
+        100, 50, 25, 128, // half-alpha: scaled back up
         255, 255, 255, 1, // extreme: must clamp, not wrap
     };
     imageio.unpremultiply(&pixels);
@@ -2664,4 +2745,126 @@ test "libavif links, at the version the baseline was measured against" {
 
 test "libaom links, at the version the baseline was measured against" {
     try testing.expectEqualStrings(encoders.pinned.libaom, encoders.libaomVersion());
+}
+
+// ================================================================= chroma
+//
+// M14b: reproducing `avifenc --yuv auto` from the source container, which
+// is the one thing decoding to RGBA would otherwise destroy. The expected
+// values below are not invented — every one is the `AVIF yuv` column
+// `docs/phase-b-baseline.md` measured on the real fixture, so a change
+// here is a change against the shipped v0.1 output.
+//
+// The JPEG headers are synthesized rather than read from `test-images/`
+// (gitignored). Only the marker structure matters to the parser, so a
+// header with no scan data in it exercises exactly the same code the real
+// 5.8 MB fixture does.
+
+/// A JPEG up to and including its SOF0, with `components` components and
+/// the first one sampled `h` x `v`. Everything after SOF is scan data the
+/// parser never reaches.
+fn jpegHeader(buffer: []u8, components: u8, h: u4, v: u4) []const u8 {
+    var length: usize = 0;
+    const put = struct {
+        fn f(buf: []u8, at: *usize, bytes: []const u8) void {
+            @memcpy(buf[at.*..][0..bytes.len], bytes);
+            at.* += bytes.len;
+        }
+    }.f;
+
+    put(buffer, &length, "\xff\xd8"); // SOI
+    // An APP0/JFIF segment, so the parser has to skip a length-carrying
+    // marker to reach SOF rather than finding it immediately.
+    put(buffer, &length, "\xff\xe0\x00\x10JFIF\x00\x01\x02\x00\x00\x01\x00\x01\x00\x00");
+
+    const payload_len: u16 = 8 + 3 * @as(u16, components);
+    put(buffer, &length, "\xff\xc0");
+    std.mem.writeInt(u16, buffer[length..][0..2], payload_len, .big);
+    length += 2;
+    put(buffer, &length, &.{ 8, 0x00, 0x40, 0x00, 0x40, components }); // precision, 64x64
+    for (0..components) |index| {
+        const factors: u8 = if (index == 0) (@as(u8, h) << 4) | v else 0x11;
+        put(buffer, &length, &.{ @intCast(index + 1), factors, 0 });
+    }
+    put(buffer, &length, "\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"); // SOS
+    return buffer[0..length];
+}
+
+test "parseJpegSampling reads the chroma format Phase A measured, per fixture" {
+    var buffer: [64]u8 = undefined;
+
+    // `large.jpg` and `rotated-gps.jpg`: photographs, and 4:4:4 anyway
+    // because the JPEG itself is 1x1,1x1,1x1. THE fixture that proves the
+    // table reads the source instead of assuming 4:2:0.
+    try testing.expectEqual(chroma.Subsampling.yuv444, chroma.parseJpegSampling(jpegHeader(&buffer, 3, 1, 1)));
+    // `photo-420.jpg` and `ui.jpg`: the common JPEG path.
+    try testing.expectEqual(chroma.Subsampling.yuv420, chroma.parseJpegSampling(jpegHeader(&buffer, 3, 2, 2)));
+    // 4:2:2 — no fixture, but libavif reads it and so must we.
+    try testing.expectEqual(chroma.Subsampling.yuv422, chroma.parseJpegSampling(jpegHeader(&buffer, 3, 2, 1)));
+    // `gray.jpg`: one component is monochrome, measured as YUV400.
+    try testing.expectEqual(chroma.Subsampling.yuv400, chroma.parseJpegSampling(jpegHeader(&buffer, 1, 1, 1)));
+
+    // 4:4:0 (1x2) and 4:1:1 (4x1) have no AVIF equivalent. libavif's own
+    // reader falls through to the default for exactly these, and 4:4:4 is
+    // that default — the choice that cannot lose chroma detail.
+    try testing.expectEqual(chroma.Subsampling.yuv444, chroma.parseJpegSampling(jpegHeader(&buffer, 3, 1, 2)));
+    try testing.expectEqual(chroma.Subsampling.yuv444, chroma.parseJpegSampling(jpegHeader(&buffer, 3, 4, 1)));
+}
+
+test "parseJpegSampling refuses anything that is not a JPEG frame" {
+    try testing.expect(chroma.parseJpegSampling("") == null);
+    try testing.expect(chroma.parseJpegSampling("\x89PNG\r\n\x1a\n") == null);
+    // `not-an-image.jpg` in the fixture set: 49 bytes of text.
+    try testing.expect(chroma.parseJpegSampling("this is not an image, whatever the extension says") == null);
+
+    // SOI, then a segment whose length runs off the end of what we were
+    // given — a JPEG truncated inside its own EXIF, which is what reading
+    // only the head of a file can produce.
+    try testing.expect(chroma.parseJpegSampling("\xff\xd8\xff\xe1\x7f\xff\x00") == null);
+    // SOI straight into the scan: a JPEG with no frame header at all.
+    try testing.expect(chroma.parseJpegSampling("\xff\xd8\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00") == null);
+    // A DHT (0xC4) sits inside the SOFn range but is NOT a frame header.
+    // Reading it as one would take a Huffman table for sampling factors.
+    try testing.expect(chroma.parseJpegSampling("\xff\xd8\xff\xc4\x00\x04\x00\x00") == null);
+}
+
+test "parseJpegSampling walks past restart markers and fill bytes" {
+    // Both are legal between segments and neither carries a length: a
+    // parser that reads two length bytes after them desyncs and returns
+    // garbage rather than null, which is the worse failure.
+    var buffer: [64]u8 = undefined;
+    const header = jpegHeader(&buffer, 3, 2, 2);
+
+    var padded: [80]u8 = undefined;
+    @memcpy(padded[0..2], header[0..2]); // SOI
+    @memcpy(padded[2..5], "\xff\xd0\xff"); // RST0, then a fill byte
+    @memcpy(padded[5..][0 .. header.len - 2], header[2..]);
+    try testing.expectEqual(
+        chroma.Subsampling.yuv420,
+        chroma.parseJpegSampling(padded[0 .. 5 + header.len - 2]),
+    );
+}
+
+test "forSource keys on the UTI and reads the file only for a JPEG" {
+    var buffer: [64]u8 = undefined;
+    const jpeg_420 = jpegHeader(&buffer, 3, 2, 2);
+
+    // Every non-JPEG container is 4:4:4, and the bytes are not even looked
+    // at — `ui.png` is 4:4:4 while the SAME image as `ui.jpg` is 4:2:0,
+    // which is the whole point of keying on the container.
+    for ([_][]const u8{ "public.png", "public.heic", "public.tiff", "com.compuserve.gif", "org.webmproject.webp" }) |uti| {
+        try testing.expectEqual(chroma.Subsampling.yuv444, chroma.forSource(uti, ""));
+        try testing.expectEqual(chroma.Subsampling.yuv444, chroma.forSource(uti, jpeg_420));
+    }
+
+    try testing.expectEqual(chroma.Subsampling.yuv420, chroma.forSource("public.jpeg", jpeg_420));
+    try testing.expectEqual(
+        chroma.Subsampling.yuv444,
+        chroma.forSource("public.jpeg", jpegHeader(&buffer, 3, 1, 1)),
+    );
+
+    // An unparseable JPEG falls back to 4:4:4, not to 4:2:0: we cannot
+    // reproduce `avifenc` on it either way, and of the two guesses only
+    // one is incapable of losing chroma detail.
+    try testing.expectEqual(chroma.Subsampling.yuv444, chroma.forSource("public.jpeg", ""));
 }

@@ -12,7 +12,8 @@ Goal: replace the "upload to TinyPNG / Squoosh / browser tab" workflow with a ze
   - Pure `Model` / `Msg` / `update` architecture + effects channel (`fx`)
 - **Platform**: macOS only (for now)
 - **Image handling**:
-  - Decode/preview: Apple ImageIO, called from Zig (`src/imageio.zig`) — landed in M13.
+  - Decode/preview: Apple ImageIO, called from Zig (`src/imageio.zig`) — landed in M13, and the
+    full-resolution encoder-input decode landed in M14b.
   - Encode: still system tools via `fx.spawn` (`avifenc`, `cwebp`). The vendored libavif/libaom/
     libwebp archives are already linked in (M14a) but nothing calls them yet; M14c swaps the seam.
 
@@ -95,11 +96,20 @@ the failure appears solely in the test artifact. `linkFramework` also needs an e
 ### Repo layout
 - `src/main.zig` — the app. Hand-authored root: builds its own platform + Runtime.
 - `src/app.native` — markup view.
-- `src/imageio.zig` — the whole ImageIO C-ABI seam (`extern fn`, not `@cImport`): `probe` and
-  `thumbnail`, both callable from a worker thread and both returning straight-alpha 8-bit sRGB.
+- `src/imageio.zig` — the whole ImageIO C-ABI seam (`extern fn`, not `@cImport`): `probe`,
+  `thumbnail` and `decode`, all callable from a worker thread and all returning straight-alpha
+  8-bit sRGB. `probe` and `thumbnail` are host commands; **`decode` deliberately is not** — a
+  full-resolution buffer cannot ride the 256 KiB host result, and M14c's encode worker (its only
+  caller) is already off the loop thread. `decode` applies the EXIF orientation BY HAND, through
+  three scalar CTM calls rather than `CGContextConcatCTM`; the header says why.
+- `src/chroma.zig` — the source-container chroma table plus the hand-rolled JPEG SOF parser, which
+  is how `avifenc --yuv auto`'s behaviour survives decoding everything to RGBA. Pure over bytes.
+  **Nothing calls it yet** — M14c's libavif seam is its only consumer.
 - `src/imageio_tests.zig` — its tests. Imported by `main.zig`'s `test` block and run by
   `native test` like everything else, since M14a. (It used to be a file nothing imported, run by
-  hand — see "Commands" for why, and do not reintroduce that pattern.)
+  hand — see "Commands" for why, and do not reintroduce that pattern.) Its fixtures are PNGs
+  embedded as byte literals, because `test-images/` is gitignored; the orientation tests build
+  their own tagged PNGs in-process (ImageIO reads the PNG `eXIf` chunk).
 - `src/encoders.zig` — the Zig-to-encoder seam, the mirror of `imageio.zig`. **M14a wired the
   build but wrote no encoders**: right now this holds only the three version probes that prove the
   vendored archives link, and the app still spawns `avifenc`/`cwebp`. The encode functions land in
@@ -185,11 +195,14 @@ packaged as an ad-hoc-signed `.app`.
 Phase B M13 (v0.2) is DONE: the load chain runs on ImageIO, both `sips` reads and `fx.loadImage`
 are gone, and the preview now shows the file's primary frame, upright and in sRGB.
 
+**M14b is DONE**: `imageio.decode` and `src/chroma.zig` exist and are tested against the whole
+fixture set, but **neither has a caller** — that is what M14b is. No output byte has moved.
+
 **M14a is DONE too**: the build is ejected and ours, the encode-only archives are vendored under
 `third_party/` and link into both the exe and the test artifact, and `src/imageio_tests.zig` runs
 under `native test` for the first time. **No encoder is called yet** — the app still spawns
 `avifenc`/`cwebp` with the pinned argv, so no output byte has moved and the Homebrew dependency is
-still there. M14b (decode + chroma) and M14c (the encode seams + parity) are what remove it.
+still there. M14c (the encode seams + parity) is all that is left of M14, and is what removes it.
 `native build`/`check`/`test`/`dev`/`package` all clean, zero `check` warnings.
 **PLAN.md is the source of truth** for what is done and what is next.
 

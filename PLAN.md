@@ -26,6 +26,16 @@ arm64-macos and link into both a running ReleaseFast exe and the Debug test arti
 cost of +5.20 MiB. Written up in `docs/phase-b-baseline.md` under "Phase B step 6". Nothing in
 THIS tree is ejected or vendored yet — that is M14.
 
+**M14b is DONE** (2026-08-29): `src/imageio.zig` grew `decode` — full-resolution, primary frame,
+EXIF orientation baked in BY HAND, sRGB, 8-bit, straight alpha, no metadata — and `src/chroma.zig`
+is new, holding the JPEG SOF parser and the source-container chroma table. Both are pure over a
+path or over bytes; **neither has a caller yet**, which is what M14b is (PLAN.md's b/c split).
+Suite 116 -> 125, `check` zero warnings, exe 5,522,376 -> 5,522,488 bytes. Verified against the
+whole fixture set outside the suite as well: the chroma table reproduces
+`docs/phase-b-baseline.md`'s `AVIF yuv` column exactly, and the orientation bake is an exact
+permutation. Written up under the baseline doc's "M14b" heading. **M14c is next and is the last
+step of M14** — the two encode seams, atomic write, the deletions, and the parity investigation.
+
 **M14a is DONE** (2026-08-28): `native eject` ran, `build.zig` is ours and links the four vendored
 encode-only archives under `third_party/` into both the exe and the test artifact, `src/encoders.zig`
 exists holding version probes only, and `src/imageio_tests.zig` runs under `native test` at last
@@ -286,8 +296,9 @@ IMPLEMENT — some preserving what Phase A does, some fixing what it does wrong.
   thumbnail), so only `image.decode` needs the transform by hand. This also fixes today's
   inconsistency, where the same rotated source produces an upright AVIF and a sideways WebP —
   and where `avifenc` itself only writes `irot` for a JPEG input, not for a staged PNG.
-- **Convert to sRGB and tag sRGB. LANDED IN M13 for the preview only**, where the bitmap context
-  does it for free; the outputs still carry whatever the encoders make of the source.
+- **Convert to sRGB and tag sRGB. LANDED IN M13 for the preview and in M14b for
+  `imageio.decode`**, where the bitmap context does it for free; the outputs still carry whatever
+  the encoders make of the source, until M14c feeds them decoded pixels.
   ImageIO passes the source profile through by default, so a
   Display P3 iPhone photo would emit P3. Web output is this tool's whole purpose, so convert:
   predictable rendering everywhere beats preserving a gamut most consumers mishandle. This is a
@@ -308,7 +319,8 @@ IMPLEMENT — some preserving what Phase A does, some fixing what it does wrong.
 - **Atomic write.** Encode to `<name>.<ext>.tmp` in the DESTINATION directory (a temp dir would
   cross filesystems and defeat the rename), then rename. Phase A does not do this either — a
   crash mid-encode currently can leave a truncated file beside the source.
-- **Reproduce avifenc's chroma subsampling from the SOURCE CONTAINER (M14).** The single most
+- **Reproduce avifenc's chroma subsampling from the SOURCE CONTAINER. LANDED IN M14b** as
+  `src/chroma.zig`, checked against every fixture; M14c is what feeds it to libavif. The single most
   consequential encoder knob, and invisible on photos while catastrophic on graphics (7.7 dB on a
   UI fixture). `avifenc --yuv auto` is **not** a content detector — it never inspects the image.
   It reads the source, and after M14 decodes everything to RGBA the container is gone, so the
@@ -330,7 +342,9 @@ IMPLEMENT — some preserving what Phase A does, some fixing what it does wrong.
   YUV420. Hardcoding 420 would silently soften every high-quality JPEG, screenshots included.
   **Do NOT invent an "is this photographic?" heuristic.** That is new behavior and would disagree
   with v0.1 on exactly the files used to justify vendoring libaom.
-- **A JPEG source needs its chroma sampling parsed by hand (M14).** ImageIO does not expose it —
+- **A JPEG source needs its chroma sampling parsed by hand. LANDED IN M14b**
+  (`chroma.parseJpegSampling`, matching ImageMagick on all six real JPEG fixtures).
+  ImageIO does not expose it —
   re-checked in this round by dumping the FULL property dictionary for a 4:2:0 JPEG (`ui.jpg`) and
   a 4:4:4 one (`large.jpg`): the two are identical apart from dimensions (ColorModel, Depth,
   PixelWidth/Height, ProfileName, {JFIF}), with no sampling key of any kind. So "keep the JPEG's own chroma" requires scanning the source for its SOF marker
@@ -600,14 +614,15 @@ them. Each entry says which half it is in.
   destination directly. Fixed by Phase B's atomic write.
 
 ## Next up
-Phase B, in order. M13 and M14 are separately shippable. **Steps 1-7 are DONE** (2026-08-27/28) —
-every spike is behind us, both M14 gates are passed, and M14a has landed the build ownership and
-the vendored archives. **M14b is next and is unblocked.**
+Phase B, in order. M13 and M14 are separately shippable. **Steps 1-8 are DONE** (2026-08-27/29) —
+every spike is behind us, both M14 gates are passed, M14a landed the build ownership and the
+vendored archives, and M14b landed the decode path and the chroma table. **M14c is next, is
+unblocked, and is all that is left of M14.**
 
-M14 is split into three because it does not fit one sitting: M14a (build + vendor, done) was the
-fully de-risked half and moves no output byte; M14b is pure logic; M14c is the encoder swap plus an
-open-ended parity investigation. The a/b boundary is a true shippable seam. The b/c boundary is
-softer — M14b leaves `image.decode` with no consumer — so fold b into c if b goes quickly.
+M14 was split into three because it does not fit one sitting: M14a (build + vendor) was the fully
+de-risked half and moved no output byte; M14b was pure logic and moved none either; M14c is the
+encoder swap plus an open-ended parity investigation, and is the step where output bytes finally
+change.
 
 1. ~~**Spike the threaded host command.**~~ **DONE** — `docs/spikes/threaded-host-call-spike.zig`.
    Verdict: works, but NOT the way this plan assumed. `feedHostResult` is loop-thread-only; the
@@ -682,10 +697,35 @@ softer — M14b leaves `image.decode` with no consumer — so fold b into c if b
      change the encoder out from under `docs/phase-b-baseline.md` silently.
    - **`native eject` is one-shot and refuses if the files exist.** There is no re-ejecting to
      pick up CLI changes; `build.zig` is now a file we maintain.
-8. **M14b (v0.3)** — `image.decode` (full-res 8-bit RGBA, primary frame, EXIF transform applied by
-   hand, sRGB), the JPEG SOF chroma parser, and the chroma table from "Correctness requirements".
-   Pure logic plus one host command; all tier-1 testable. Note `image.decode` has no consumer until
-   M14c, so this step deliberately lands code the app does not call yet.
+8. ~~**M14b (v0.3)** — the decode path and the chroma table.~~ **DONE** (2026-08-29).
+   `imageio.decode` (full-res 8-bit sRGB RGBA, primary frame, EXIF transform by hand) and
+   `src/chroma.zig` (the JPEG SOF parser plus the source-container table). Neither has a caller;
+   M14c's encode seams are the only consumers. Four things worth carrying:
+   - **`decode` is NOT a host command, deliberately.** PLAN.md said "pure logic plus one host
+     command"; the host command is the wrong shape. A full-resolution buffer cannot ride a 256 KiB
+     host result (M13 already recorded this), and `decode`'s only caller will be M14c's encode
+     worker — which is already off the loop thread and can call it directly. Wiring a command with
+     no Msg arm would have shipped an unreachable path, which is exactly what M13 refused to do
+     for the same function.
+   - **The orientation bake goes through three SCALAR CTM calls, not `CGContextConcatCTM`.**
+     `CGAffineTransform` is six doubles: neither an HFA nor register-sized on arm64, so passing it
+     by value puts a C-ABI question between us and the one Phase B requirement whose failure mode
+     is a WRONG IMAGE rather than an error. Every EXIF orientation is `translate . (quarter turn?)
+     . scale`, so `imageio.orientationTransform` returns that decomposition and three scalar calls
+     apply it. Proven three independent ways: the table re-derived algebraically in
+     `src/tests.zig`, all eight orientations decoded from synthesized tagged PNGs in
+     `src/imageio_tests.zig`, and `rotated-gps.jpg`/`rotated-p3.heic` checked corner-by-corner
+     against their untagged twins. **CoreGraphics' quarter turns are EXACT permutations** — no
+     resampling, so the pixel assertions are equality rather than tolerance.
+   - **ImageIO reads PNG `eXIf` chunks**, which is what lets the eight-orientation test stay a
+     synthesized PNG built in-process instead of dragging a JPEG or TIFF fixture into a file that
+     has to work on a fresh clone (`test-images/` is gitignored).
+   - **The fixture inventory had `oversized.jpg` recorded as 4:4:4; it is 4:2:0.** Corrected in
+     `docs/phase-b-baseline.md` with a note. Nothing depended on it (the 50 MP guard blocks the
+     fixture, so it has no encode row) and it is a source property rather than an encoder
+     measurement, so it does not touch the gate. The chroma table matches ImageMagick on all six
+     real JPEGs and matches the baseline's `AVIF yuv` column on all fourteen fixtures that have
+     one.
 9. **M14c (v0.3)** — the two encode seams in `src/encoders.zig` (libwebp and libavif, written
    together so they share a shape), atomic write, then the deletions: both encoder spawns, the HEIC
    staging step in full, `resolveSpawnEnviron`, the launch probe, `missing_encoder`, the brew
