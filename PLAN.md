@@ -10,10 +10,15 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 ## Status
 **v0.1 shipped** (M1-M12, archived). Pick or drop an image, choose AVIF/WebP/Both, Smoosh
 auto-saves next to the source; each landed result row carries its own save icon to copy that one
-file elsewhere, packaged as an ad-hoc-signed `.app`. `native test` 100/100, `native check` zero
-warnings, `native build` clean.
+file elsewhere, packaged as an ad-hoc-signed `.app`.
 
-**Phase B is UNDER WAY. M13 (v0.2) is DONE** (2026-08-28). The load chain runs on ImageIO: a new
+**Phase B is COMPLETE (v0.3).** M13 moved decode/preview/probe onto ImageIO; M14 (a/b/c) moved
+encode onto vendored libavif/libaom/libwebp linked into the binary. **Smoosh now runs on a Mac
+where nothing is installed** — no `brew`, no subprocess of any kind. `native test` 114/114,
+`native check` zero warnings, `native build` clean at 10.94 MB. See the M14c entry below and
+`docs/phase-b-baseline.md` "M14c" for the parity re-measurement.
+
+**M13 (v0.2) was DONE** (2026-08-28). The load chain runs on ImageIO: a new
 `src/imageio.zig` holds the whole C-ABI seam, two new host commands (`image.probe`,
 `image.thumbnail`) answer off the loop thread through `HostBridge`'s worker carrier, and both
 `sips` spawns, `fx.loadImage`, `parseDimensions`, the preview temp file and the drawn-size clamp
@@ -26,30 +31,29 @@ arm64-macos and link into both a running ReleaseFast exe and the Debug test arti
 cost of +5.20 MiB. Written up in `docs/phase-b-baseline.md` under "Phase B step 6". Nothing in
 THIS tree is ejected or vendored yet — that is M14.
 
+**M14c is DONE** (2026-08-29) — **M14 is complete and Smoosh has zero dependencies.** The two
+encode seams (`encoders.encodeAvif`/`encodeWebp`, a C shim in `src/encode.c` over the vendored
+libavif/libaom/libwebp) run inside a new `image.encode` host command, answered off the loop thread
+by `HostBridge`'s worker carrier: the worker `imageio.decode`s the source at full resolution,
+encodes, and writes the output **atomically** (`createFileAtomic` -> `replace`). The whole
+subprocess apparatus is gone — both encoder spawns, the `sips` HEIC staging step in full, the
+launch-time `which` probe, `resolveSpawnEnviron`, `missing_encoder`/`convert_failed`, the three
+brew messages. **The app spawns nothing.** Suite 114 (launch-probe / HEIC-staging / env tests
+deleted, real-encode smoke tests added), `check` zero warnings, exe 5.52 MB -> 10.94 MB (+5.4 MB,
+the referenced encoder members — matches the step-6 estimate). Parity re-encode of the whole
+fixture set is under `docs/phase-b-baseline.md`, "M14c": every real photograph and both graphics
+fixtures land within ±15% of the Phase A sizes with matching chroma; two rows fall outside and
+neither is a regression (`multi-primary.heic` was the wrong-image bug, now fixed; `alpha16.png`
+AVIF is a 1.5 KB delta on a synthetic gradient — flagged, not tuned).
+
 **M14b is DONE** (2026-08-29): `src/imageio.zig` grew `decode` — full-resolution, primary frame,
 EXIF orientation baked in BY HAND, sRGB, 8-bit, straight alpha, no metadata — and `src/chroma.zig`
-is new, holding the JPEG SOF parser and the source-container chroma table. Both are pure over a
-path or over bytes; **neither has a caller yet**, which is what M14b is (PLAN.md's b/c split).
-Suite 116 -> 125, `check` zero warnings, exe 5,522,376 -> 5,522,488 bytes. Verified against the
-whole fixture set outside the suite as well: the chroma table reproduces
-`docs/phase-b-baseline.md`'s `AVIF yuv` column exactly, and the orientation bake is an exact
-permutation. Written up under the baseline doc's "M14b" heading. **M14c is next and is the last
-step of M14** — the two encode seams, atomic write, the deletions, and the parity investigation.
+holds the JPEG SOF parser and the source-container chroma table. Both pure; M14c's `image.encode`
+worker is the consumer of each.
 
 **M14a is DONE** (2026-08-28): `native eject` ran, `build.zig` is ours and links the four vendored
-encode-only archives under `third_party/` into both the exe and the test artifact, `src/encoders.zig`
-exists holding version probes only, and `src/imageio_tests.zig` runs under `native test` at last
-(108 -> 116 tests). The app calls no vendored encoder yet and still needs Homebrew; M14b and M14c
-are what change that. Exe grew 128 bytes.
-
-**The encoders are untouched, exactly as M13 promised and as M14a preserved** — `avifenc`/`cwebp`
-still read the source file with the pinned argv, so no output byte moved. What changed is everything upstream of them:
-the preview and the megapixel guard now read the file's PRIMARY frame, with EXIF orientation baked
-and the profile converted to sRGB.
-
-The limitation driving the round is unchanged — Smoosh requires `brew install libavif webp` to do
-anything — and M14 is what removes it. See "Known limitations" for what M13 fixed, what it fixed
-only halfway, and what is still waiting on the encoders.
+encode-only archives under `third_party/` into both the exe and the test artifact, and
+`src/imageio_tests.zig` runs under `native test`.
 
 ## Success criteria for v0.1 (MVP) — all shipped
 - [x] App launches to a clean drop-zone UI that becomes a file card once a file lands
@@ -578,51 +582,37 @@ Quick reference; full rationale for each is in `docs/plan-v0.1-archive.md`.
   INTRODUCES — today's subprocess encode never blocks the loop.
 
 ## Known limitations
-All five of the new entries below were measured while recording the Phase A baseline; the numbers
-are in `docs/phase-b-baseline.md`. Every one of them is fixed by Phase B, and M13 has now fixed the
-INPUT side of three of them — what the app measures and shows. The OUTPUT side of all three is
-still Phase A's, because the encoders still read the source file themselves; M14 is what closes
-them. Each entry says which half it is in.
-- **Smoosh requires `brew install libavif webp`.** The app detects the missing tools and names the
-  install command, but a zero-friction local tool should not need either. This is what Phase B
-  exists to remove.
-- **A WebP or AVIF source produces nothing at all.** `avifenc` cannot read either container
-  ("Unrecognized file format" / "Unsupported file format AVIF") and `cwebp` cannot read AVIF, so a
-  `.webp` source fails AVIF while WebP is skipped as `same_path` — and an `.avif` source fails WebP
-  while AVIF is skipped — leaving the whole run `.failed`. Both formats are in the open panel's
-  filter list and both are accepted on drop, so this is reachable from the UI. The archive records
-  the `same_path` decision but not that the OTHER format cannot be produced.
-- **An orientation-tagged source produces one upright file and one sideways one.** OUTPUT SIDE,
-  still live. The PREVIEW is fixed as of M13 — the card shows the photo upright. `avifenc`
-  translates EXIF Orientation into an AVIF `irot` transform; `cwebp` ignores orientation entirely.
-  Worse, `avifenc` only does this for a JPEG input — the same tag arriving via the `sips`-staged
-  PNG (any rotated HEIC) yields `Transformations: None` and a sideways AVIF too.
-- **A Display-P3 source produces a desaturated WebP.** OUTPUT SIDE, still live. The PREVIEW is
-  fixed as of M13 — it is converted to sRGB before it is registered. `cwebp` strips the ICC
-  profile, so P3 pixel
-  numbers ship in an untagged (therefore sRGB) file. `avifenc` preserves the gamut correctly, via
-  CICP primaries from a PNG input or an embedded ICC profile from a JPEG one — so the two outputs
-  of one "Both" run do not match.
-- **A multi-image HEIC compresses the WRONG image, silently.** OUTPUT SIDE, still live — and this
-  one M13 fixed TWO of three ways. `sips` takes index 0 where the file's `pitm` box names another
-  item as primary; the megapixel guard and the preview card now go through
-  `CGImageSourceGetPrimaryImageIndex` and get the real one, but the ENCODER still reads the source
-  through the `sips` staging step and still gets index 0. So the card now shows a different image
-  than the file it writes, which is worse-looking but more honest: the discrepancy is visible
-  instead of silent. M14 deletes the staging step and closes it.
-- **A crash mid-encode can leave a truncated output** beside the source; the encoders write their
-  destination directly. Fixed by Phase B's atomic write.
+All six entries below were measured while recording the Phase A baseline (`docs/phase-b-baseline.md`)
+and **all six are now closed by Phase B**. Kept here as the record of what the round fixed.
+- **~~Smoosh requires `brew install libavif webp`.~~ CLOSED by M14.** The encoders are vendored
+  static archives linked into the binary; the app spawns no subprocess and needs nothing installed.
+- **~~A WebP or AVIF source produces nothing at all.~~ CLOSED.** M13 gave ImageIO the decode (it
+  reads both containers); M14c encodes from those pixels, so a `.webp` source now produces a real
+  AVIF and an `.avif` source a real WebP. `same_path` still skips WebP->WebP / AVIF->AVIF, as
+  intended.
+- **~~An orientation-tagged source produces one upright file and one sideways one.~~ CLOSED.**
+  `imageio.decode` bakes the EXIF orientation into the pixels by hand (M14b), so both outputs are
+  upright and identical in geometry. Measured on `rotated-gps.jpg` / `rotated-p3.heic`.
+- **~~A Display-P3 source produces a desaturated WebP.~~ CLOSED.** The decode converts to sRGB in
+  the bitmap context and drops the ICC profile; the AVIF encoder re-tags sRGB via CICP. Both
+  outputs now carry the same, correct color.
+- **~~A multi-image HEIC compresses the WRONG image, silently.~~ CLOSED.** The encode worker
+  decodes through `CGImageSourceGetPrimaryImageIndex`, same as the guard and the preview since M13.
+  `multi-primary.heic` now compresses its 640x200 primary (the Phase A row shows the 400x300
+  index-0 image the `sips` staging step took — see `docs/phase-b-baseline.md` "M14c").
+- **~~A crash mid-encode can leave a truncated output.~~ CLOSED.** The worker writes
+  `<name>.<ext>` via `createFileAtomic` + `replace` — a temp sibling in the destination directory,
+  renamed into place. A crash leaves the temp, never a half-written output.
 
 ## Next up
-Phase B, in order. M13 and M14 are separately shippable. **Steps 1-8 are DONE** (2026-08-27/29) —
-every spike is behind us, both M14 gates are passed, M14a landed the build ownership and the
-vendored archives, and M14b landed the decode path and the chroma table. **M14c is next, is
-unblocked, and is all that is left of M14.**
+**Phase B is COMPLETE — steps 1-9 are all DONE** (2026-08-27/29). Every spike, both M14 gates,
+M13, and M14a/b/c. Smoosh has zero dependencies. What remains is unplanned UI polishing
+(see the end of this section).
 
-M14 was split into three because it does not fit one sitting: M14a (build + vendor) was the fully
-de-risked half and moved no output byte; M14b was pure logic and moved none either; M14c is the
-encoder swap plus an open-ended parity investigation, and is the step where output bytes finally
-change.
+M14 was split into three: M14a (build + vendor) moved no output byte; M14b (decode + chroma table)
+moved none either; M14c swapped the encoders in, wrote outputs atomically, deleted the subprocess
+apparatus, and re-measured parity — two rows outside ±15%, neither a regression
+(`docs/phase-b-baseline.md` "M14c").
 
 1. ~~**Spike the threaded host command.**~~ **DONE** — `docs/spikes/threaded-host-call-spike.zig`.
    Verdict: works, but NOT the way this plan assumed. `feedHostResult` is loop-thread-only; the
@@ -726,14 +716,35 @@ change.
      measurement, so it does not touch the gate. The chroma table matches ImageMagick on all six
      real JPEGs and matches the baseline's `AVIF yuv` column on all fourteen fixtures that have
      one.
-9. **M14c (v0.3)** — the two encode seams in `src/encoders.zig` (libwebp and libavif, written
-   together so they share a shape), atomic write, then the deletions: both encoder spawns, the HEIC
-   staging step in full, `resolveSpawnEnviron`, the launch probe, `missing_encoder`, the brew
-   messages. Then the tier-1 encode tests migrate off `pendingSpawnAt`/`feedExit` (23 call sites)
-   onto the new seam, and the fixture set is re-encoded against the Phase A table.
-   **Budget the parity investigation as real work, not a checkbox** — our libaom is `-O3` where
-   Homebrew's is `-Os` and rate control carries FP math, so the bitstream may legitimately differ.
-   Keep M14c in ONE session: the two seams should rhyme, and breaking mid-parity-investigation
-   loses the per-fixture state that makes it tractable.
+9. ~~**M14c (v0.3)** — the two encode seams, atomic write, the deletions, the test migration, and
+   the parity re-encode.~~ **DONE** (2026-08-29). Things worth carrying:
+   - **The encoder ABI is a C shim (`src/encode.c`), not hand-rolled `extern struct`s.** libavif's
+     `avifEncoder` (~30 caller-mutable fields) and `avifRGBImage` and libwebp's
+     `WebPConfig`/`WebPPicture` are struct-heavy and ABI-fragile to transcribe; the shim
+     `#include`s the vendored headers, does the struct work in C, and exposes three flat scalar
+     functions `encoders.zig` declares. `build.zig` compiles it with `link_libc` on the module.
+   - **`build.zig`'s module list must be de-duplicated.** For `native build` (ReleaseFast) the SDK
+     hands back the SAME `*Build.Module` for `exe` and `tests` (`app_optimize == optimize`), so
+     adding a compiled `.c` to both is a fatal `duplicate symbol`. Linking an `.a` twice was only
+     wasteful, which is why M14a's loop got away with it. `build.zig` now compares the pointers.
+   - **`image.encode` is a host command on the existing worker carrier**, one request per format.
+     The worker decodes + encodes + writes atomically (`createFileAtomic` -> `replace`) and replies
+     with just the output size. No `image.decode` host command was ever needed — the worker calls
+     `imageio.decode` directly, off the loop thread.
+   - **Parity: two rows outside ±15%, neither a regression.** `multi-primary.heic` (baseline
+     encoded the wrong index-0 image; M13's primary-frame fix changed which picture is compressed)
+     and `alpha16.png` AVIF (+1.5 KB on a synthetic gradient — flagged, not tuned). Every real
+     photograph and both graphics fixtures within ±15%, most within ±5%. Full table in
+     `docs/phase-b-baseline.md` "M14c".
+   - The decode is NOT shared between the two formats in Both mode — each `image.encode` worker
+     decodes independently. Simpler; a shared-decode optimization is possible later.
+   - **A `reset` cannot cancel a running encode worker** (`avifEncoderWrite` has no cancellation
+     token), so the worker runs to completion holding its slot; its stale answer is dropped three
+     ways (the `abandoned` flag, the cancel's generation bump, `.encode_result`'s status guard).
+     `worker_slot_count` is 8 so a person cannot pile up abandoned encodes faster than they drain
+     (reset -> drop -> smoosh is three actions, and neither the drop nor a dialog can be
+     automated); a full pool degrades to one `.encode_failed`, still better than v0.1's unbounded
+     `avifenc` spawn.
+   - The `image.encode` payload is **NUL-delimited**, not newline — a macOS path may contain `\n`.
 
-UI polishing remains unplanned and now sits behind Phase B.
+UI polishing remains unplanned and now sits after a complete Phase B.

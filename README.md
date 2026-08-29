@@ -9,11 +9,11 @@ something local and instant.
 
 ## Status
 
-**v0.2 — decoding is native; encoding is not yet.** Everything that reads your image now goes
-through Apple's ImageIO, in-process: the preview, its dimensions and the size limits. It shows the
-file's primary frame, the right way up, converted to sRGB. Compression still shells out to
-`avifenc` and `cwebp`, so the Homebrew requirement below is still real — removing it is the next
-milestone.
+**v0.3 — fully native, zero dependencies.** Both halves of the pipeline now run in-process:
+Apple's ImageIO reads your image (preview, dimensions, size limits, and the full-resolution
+decode), and statically linked libavif / libaom / libwebp encode it. The app spawns no
+subprocess and needs nothing installed — no Homebrew, no `avifenc`, no `cwebp`. Outputs are
+written atomically. The encode runs on a worker thread so the window keeps painting.
 
 **v0.1 — feature-complete and packaged.** Smoosh launches to a drop zone — pick an
 image or drag one onto the window — see a preview and its size, choose AVIF / WebP
@@ -37,30 +37,21 @@ markup (`src/app.native`), the logic is plain Zig on a `Model` / `Msg` / `update
 loop, and the SDK's own engine renders every pixel. No web view, no JS runtime in
 the binary.
 
-Encoding is phased:
+Encoding got there in phases:
 
-- **Phase A (v0.1)** — shell out to `sips`, `avifenc` and `cwebp` through the
+- **Phase A (v0.1)** — shelled out to `sips`, `avifenc` and `cwebp` through the
   effects channel's `fx.spawn`. Fast to build, fast to iterate on the UI.
-- **Phase B, half done (v0.2)** — decoding moved to Apple's ImageIO, called
-  directly from Zig (`src/imageio.zig`). No subprocess reads your image any
-  more, and the decode runs on a worker thread so the window keeps painting.
-- **Phase B, the rest (v0.3)** — encode through statically linked
-  libavif/libwebp. One self-contained binary, no Homebrew.
-
-The Native SDK ships no image encoder, so encoding still depends on tools you
-install yourself. Smoosh detects them at launch and tells you what is missing —
-it never installs anything on your behalf.
+- **Phase B (v0.2 / v0.3)** — decode moved to Apple's ImageIO
+  (`src/imageio.zig`), then encode to statically linked libavif / libaom /
+  libwebp via a small C shim (`src/encode.c`). Both run on a worker thread. No
+  subprocess touches your image, and the binary is self-contained.
 
 ## Requirements
 
-- macOS (Apple Silicon targeted; no Linux or Windows in v0.1)
+- macOS (Apple Silicon targeted; no Linux or Windows)
 - [`native`](https://native-sdk.dev) CLI **0.10.1**
 - Zig **0.16.0**
-- Encoders, until v0.3 lands:
-  ```sh
-  brew install libavif   # provides avifenc
-  brew install webp      # provides cwebp
-  ```
+- Nothing else — no Homebrew packages, no external encoders.
 
 ## Development
 

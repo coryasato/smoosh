@@ -8,9 +8,11 @@
 //! Msg-tag exhaustiveness is already a compile error via `update`'s switch,
 //! so it needs no test.
 //!
-//! Effects-bearing paths (the dialog chain, encoder detection, encoding)
-//! test through a fake executor (`fx.executor = .fake`, driven by the
-//! `Harness` below), never a real process or a real dialog.
+//! Effects-bearing paths (the load chain and the encode chain, both host
+//! requests now) test through a fake executor (`fx.executor = .fake`,
+//! driven by the `Harness` below), never a real process or a real dialog.
+//! The exception is the encode smoke tests, which run real
+//! libavif/libwebp in-process.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -520,82 +522,18 @@ test "statusLine names every Status, and .failed reports the error message" {
     try testing.expectEqualStrings(message, model.statusLine());
 }
 
-// ================================================================ packaging
-//
-// A packaged `.app` launched from `/Applications` fails the encoder
-// presence check even with avifenc/cwebp installed, because Finder/Dock-
-// launched processes inherit launchd's minimal PATH, not the
-// interactive-shell PATH `brew shellenv` adds — the exact opposite of every
-// `native dev`/`native build` run, which is always launched from a Terminal.
-// `resolveSpawnEnviron` is pure enough to test directly: build a fake
-// `Environ` with a chosen PATH, no process or spawn involved.
-
-fn testEnviron(gpa: std.mem.Allocator, path: ?[]const u8) !std.process.Environ {
-    var map: std.process.Environ.Map = .init(gpa);
-    defer map.deinit();
-    if (path) |value| try map.put("PATH", value);
-    return .{ .block = try map.createPosixBlock(gpa, .{}) };
-}
-
-test "resolveSpawnEnviron appends Homebrew's bin dirs when PATH lacks them" {
-    const gpa = testing.allocator;
-    const base = try testEnviron(gpa, "/usr/bin:/bin");
-    defer base.block.deinit(gpa);
-
-    const resolved = try main.resolveSpawnEnviron(gpa, base);
-    defer resolved.block.deinit(gpa);
-
-    const path = std.process.Environ.getPosix(resolved, "PATH").?;
-    try testing.expect(std.mem.indexOf(u8, path, "/opt/homebrew/bin") != null);
-    try testing.expect(std.mem.indexOf(u8, path, "/usr/bin:/bin") != null);
-}
-
-test "resolveSpawnEnviron leaves PATH untouched when Homebrew's bin is already present" {
-    const gpa = testing.allocator;
-    const base = try testEnviron(gpa, "/opt/homebrew/bin:/usr/bin");
-    defer base.block.deinit(gpa);
-
-    const resolved = try main.resolveSpawnEnviron(gpa, base);
-
-    // No new block was built — `resolveSpawnEnviron` returned `base` itself,
-    // proven by pointer identity, not just equal content (a mutation that
-    // always reallocates would still pass a content-only check).
-    try testing.expectEqual(base.block.slice.ptr, resolved.block.slice.ptr);
-}
-
-test "resolveSpawnEnviron sets PATH from scratch when the base environ has none" {
-    const gpa = testing.allocator;
-    const base = try testEnviron(gpa, null);
-    defer base.block.deinit(gpa);
-
-    const resolved = try main.resolveSpawnEnviron(gpa, base);
-    defer resolved.block.deinit(gpa);
-
-    const path = std.process.Environ.getPosix(resolved, "PATH").?;
-    try testing.expectEqualStrings(
-        "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin",
-        path,
-    );
-}
-
 // ==================================================================== effects
 //
-// The dialog -> stat -> probe -> thumbnail chain, driven through the fake
-// executor: assert the REQUEST each arm made, feed the answer, drain
-// through the same `.wake` path live platforms use, then assert the
-// model. No GUI, no NSOpenPanel, no ImageIO.
+// The dialog -> stat -> probe -> thumbnail -> encode chain, driven through
+// the fake executor: assert the REQUEST each arm made, feed the answer,
+// drain through the same `.wake` path live platforms use, then assert the
+// model. No GUI, no NSOpenPanel, no ImageIO, no libavif.
 //
-// M13 moved this whole chain off spawns and onto HOST REQUESTS, so the
-// load-side helpers below drive `pendingHostAt`/`feedHostResult` where
-// they used to drive `pendingSpawnAt`/`feedExit`. The encode side still
-// drives spawns; M14 moves that half.
+// M13 moved the load chain off spawns and onto HOST REQUESTS; M14c moved
+// the encode half the same way. Nothing in the app spawns a subprocess any
+// more, so every helper below drives `pendingHostAt`/`feedHostResult`.
 
 const App = native_sdk.UiApp(Model, Msg);
-
-/// Where `main.converted_path` points during tests. The staging spawn is
-/// faked, but the path still flows into a real encode spawn's argv, which
-/// tests assert on.
-const test_converted_path = "/tmp/smoosh-tests/converted.png";
 
 /// A synthetic `image.thumbnail` answer: the same fixed-width header the
 /// bridge writes, then `width * height * 4` bytes of opaque grey. Sized
@@ -615,43 +553,29 @@ const Harness = struct {
     app_state: *App,
     app: native_sdk.App,
 
-    /// Most tests' entry point: boots the app AND resolves the launch-time
-    /// encoder check to "both present" — the happy path — so
-    /// `avifenc`/`cwebp` presence never shows up as a stray pending spawn
-    /// in a test that has nothing to do with encoder detection.
+    /// Every test's entry point: boots the app and stops right after
+    /// install. There is no launch-time work to settle any more — the
+    /// encoder presence check went with the vendored encoders.
     fn create() !Harness {
-        var h = try Harness.createBare();
-        try h.resolveEncoders(true, true);
-        return h;
-    }
-
-    /// Boots the app and stops right after install, before the launch-time
-    /// encoder check is resolved — `avifenc`'s and `cwebp`'s presence
-    /// spawns are still pending. Only the encoder-detection tests call
-    /// this directly; everything else goes through `create`.
-    fn createBare() !Harness {
-        main.converted_path = test_converted_path;
-
         const size = geometry.SizeF.init(main.window_width, main.window_height);
         const harness = try native_sdk.TestHarness().create(testing.allocator, .{ .size = size });
         errdefer harness.destroy(testing.allocator);
         harness.null_platform.gpu_surfaces = true;
 
-        // `create`, not `init`: the Model carries three 4 KiB path buffers,
-        // and a by-value Model rides the stack (native-ui's Zig-0.16 idioms).
+        // `create`, not `init`: the Model carries several 4 KiB path
+        // buffers, and a by-value Model rides the stack (native-ui's
+        // Zig-0.16 idioms).
         const app_state = try App.create(std.heap.page_allocator, .{
             .name = "smoosh",
             .scene = main.shell_scene,
             .canvas_label = main.canvas_label,
             .update_fx = main.update,
-            .init_fx = main.initFx,
             .markup = .{ .source = main.app_markup, .io = testing.io },
         });
         errdefer app_state.destroy();
 
-        // Fake BEFORE the installing frame: `init_fx`'s boot spawns (the
-        // encoder presence check) must be RECORDED, not actually executed
-        // — the same ordering `native_sdk`'s own init_fx test uses.
+        // No spawns exist, but host requests still go through the fake
+        // completion queue this flips on.
         app_state.effects.executor = .fake;
 
         const app = app_state.app();
@@ -667,18 +591,6 @@ const Harness = struct {
         try testing.expect(app_state.installed);
 
         return .{ .harness = harness, .app_state = app_state, .app = app };
-    }
-
-    /// Feeds the two boot-time presence spawns, in the order `init_fx`
-    /// issued them (`avifenc` then `cwebp`), and drains once.
-    fn resolveEncoders(self: *Harness, avifenc_present: bool, cwebp_present: bool) !void {
-        const avifenc_req = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-        try testing.expectEqualStrings("avifenc", avifenc_req.argv[avifenc_req.argv.len - 1]);
-        try self.fx().feedExit(avifenc_req.key, if (avifenc_present) 0 else 1);
-        const cwebp_req = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-        try testing.expectEqualStrings("cwebp", cwebp_req.argv[cwebp_req.argv.len - 1]);
-        try self.fx().feedExit(cwebp_req.key, if (cwebp_present) 0 else 1);
-        try self.drain();
     }
 
     fn destroy(self: *Harness) void {
@@ -765,10 +677,11 @@ const Harness = struct {
 
     // ------------------------------------------------------------ encoding
     //
-    // These find their request by CONTENT (argv[0], the stat payload's
-    // extension) rather than by slot index, because the two encodes are
-    // independent: a test must be able to answer them in EITHER order
-    // without the helper caring.
+    // Each format is one `image.encode` host request, payload
+    // "<format>\n<source>\n<uti>\n<dest>" (see `main.encodePayload`). The
+    // helpers find a request by its format line, not by slot index,
+    // because the two encodes are independent and a test must be able to
+    // answer them in EITHER order.
 
     /// The full pick chain, landing in `.ready` with a preview — the state
     /// `smoosh` requires. Dimensions and thumbnail take their happy path.
@@ -779,46 +692,50 @@ const Harness = struct {
         try self.thumbnail(160, 120);
     }
 
-    /// The pending encode spawn whose argv[0] is `program`, or null.
-    fn encodeSpawn(self: *Harness, program: []const u8) ?@TypeOf(self.fx().pendingSpawnAt(0).?) {
+    fn encodeLabel(format: Format) []const u8 {
+        return switch (format) {
+            .avif => "AVIF",
+            .webp => "WebP",
+            .both => unreachable,
+        };
+    }
+
+    /// The pending `image.encode` request for `format`, or null. Payload is
+    /// NUL-delimited `"<format>\x00<source>\x00<uti>\x00<dest>"`.
+    fn encodeRequest(self: *Harness, format: Format) ?@TypeOf(self.fx().pendingHostAt(0).?) {
+        var buf: [8]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&buf, "{s}\x00", .{encodeLabel(format)}) catch unreachable;
         var index: usize = 0;
-        while (self.fx().pendingSpawnAt(index)) |request| : (index += 1) {
-            if (std.mem.eql(u8, request.argv[0], program)) return request;
+        while (self.fx().pendingHostAt(index)) |request| : (index += 1) {
+            if (std.mem.eql(u8, request.name, "image.encode") and
+                std.mem.startsWith(u8, request.payload, prefix)) return request;
         }
         return null;
     }
 
-    fn encodeExit(self: *Harness, program: []const u8, code: i32) !void {
-        const request = self.encodeSpawn(program) orelse return error.NoSpawn;
-        try self.fx().feedExit(request.key, code);
+    /// The destination field of `format`'s pending `image.encode` payload —
+    /// what the worker will write, and where the result line points.
+    fn encodeDest(self: *Harness, format: Format) ![]const u8 {
+        const request = self.encodeRequest(format) orelse return error.NoHostRequest;
+        var it = std.mem.splitScalar(u8, request.payload, 0);
+        _ = it.next(); // format
+        _ = it.next(); // source
+        _ = it.next(); // uti
+        return it.rest();
+    }
+
+    /// Answer one format's `image.encode`. On success `reply` is the output
+    /// size as decimal text (the worker has "written" the file); on failure
+    /// it is the short tag `update` reads — "write" or "encode".
+    fn encodeReply(self: *Harness, format: Format, ok: bool, reply: []const u8) !void {
+        const request = self.encodeRequest(format) orelse return error.NoHostRequest;
+        try self.fx().feedHostResult(request.key, ok, reply);
         try self.drain();
     }
 
-    /// Answers the output-size stat for whichever format's destination path
-    /// ends in `extension`.
-    fn encodeSize(self: *Harness, extension: []const u8, ok: bool, size: []const u8) !void {
-        var index: usize = 0;
-        while (self.fx().pendingHostAt(index)) |request| : (index += 1) {
-            if (std.mem.endsWith(u8, request.payload, extension)) {
-                try self.fx().feedHostResult(request.key, ok, size);
-                return self.drain();
-            }
-        }
-        return error.NoHostRequest;
-    }
-
-    /// One format's whole happy path: a clean exit, then its output size.
-    fn encodeOk(self: *Harness, program: []const u8, extension: []const u8, size: []const u8) !void {
-        try self.encodeExit(program, 0);
-        try self.encodeSize(extension, true, size);
-    }
-
-    /// The HEIC->PNG staging spawn — ONE per run regardless of how many
-    /// formats were requested, unlike the per-format encode spawns above.
-    fn convertExit(self: *Harness, code: i32) !void {
-        const request = self.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-        try self.fx().feedExit(request.key, code);
-        try self.drain();
+    /// One format's happy path: the worker wrote the file, here is its size.
+    fn encodeOk(self: *Harness, format: Format, size: []const u8) !void {
+        try self.encodeReply(format, true, size);
     }
 
     // ------------------------------------------------------------ Save As
@@ -1274,105 +1191,6 @@ test "a zero-dimension probe answer is treated as garbled, not as a 0 MP image" 
     try testing.expect(!h.model().hasPreview());
 }
 
-// ============================================================== encoder detection
-//
-// `init_fx` fires both presence checks on the installing frame, before
-// `create` resolves them via `resolveEncoders` — these tests go through
-// `createBare` instead, so the two spawns are still there to inspect and
-// feed directly.
-
-test "the launch-time presence check runs which against both encoders" {
-    var h = try Harness.createBare();
-    defer h.destroy();
-
-    const avifenc_req = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-    try testing.expectEqualStrings("/usr/bin/which", avifenc_req.argv[0]);
-    try testing.expectEqualStrings("avifenc", avifenc_req.argv[1]);
-    try testing.expectEqual(@as(usize, 2), avifenc_req.argv.len);
-    try h.fx().feedExit(avifenc_req.key, 0);
-
-    const cwebp_req = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-    try testing.expectEqualStrings("/usr/bin/which", cwebp_req.argv[0]);
-    try testing.expectEqualStrings("cwebp", cwebp_req.argv[1]);
-    try h.fx().feedExit(cwebp_req.key, 0);
-    try h.drain();
-
-    try testing.expectEqual(Status.idle, h.model().status);
-    try testing.expectEqualStrings("", h.model().errorMessage());
-}
-
-test "both encoders present at launch is not an error" {
-    var h = try Harness.createBare();
-    defer h.destroy();
-
-    try h.resolveEncoders(true, true);
-
-    try testing.expectEqual(Status.idle, h.model().status);
-    try testing.expectEqualStrings("", h.model().errorMessage());
-}
-
-test "avifenc missing at launch fails, naming avifenc's brew install" {
-    var h = try Harness.createBare();
-    defer h.destroy();
-
-    try h.resolveEncoders(false, true);
-
-    try testing.expectEqual(Status.failed, h.model().status);
-    const message = h.model().errorMessage();
-    try testing.expect(std.mem.indexOf(u8, message, "avifenc") != null);
-    try testing.expect(std.mem.indexOf(u8, message, "brew install libavif") != null);
-    // Only the missing tool's install command belongs here — cwebp is fine.
-    try testing.expect(std.mem.indexOf(u8, message, "webp") == null);
-    try testing.expectEqualStrings(h.model().errorMessage(), h.model().statusLine());
-}
-
-test "cwebp missing at launch fails, naming cwebp's brew install" {
-    var h = try Harness.createBare();
-    defer h.destroy();
-
-    try h.resolveEncoders(true, false);
-
-    try testing.expectEqual(Status.failed, h.model().status);
-    const message = h.model().errorMessage();
-    try testing.expect(std.mem.indexOf(u8, message, "cwebp") != null);
-    try testing.expect(std.mem.indexOf(u8, message, "brew install webp") != null);
-    try testing.expect(std.mem.indexOf(u8, message, "libavif") == null);
-}
-
-test "both encoders missing at launch names both brew installs" {
-    var h = try Harness.createBare();
-    defer h.destroy();
-
-    try h.resolveEncoders(false, false);
-
-    try testing.expectEqual(Status.failed, h.model().status);
-    const message = h.model().errorMessage();
-    try testing.expect(std.mem.indexOf(u8, message, "avifenc") != null);
-    try testing.expect(std.mem.indexOf(u8, message, "cwebp") != null);
-    try testing.expect(std.mem.indexOf(u8, message, "brew install libavif webp") != null);
-}
-
-test "the missing-encoder failure is decided only once both checks land, in either order" {
-    var h = try Harness.createBare();
-    defer h.destroy();
-
-    // cwebp answers FIRST this time — the join must not fire (or fail
-    // early) on a single result, regardless of which check lands first.
-    const cwebp_req = h.fx().pendingSpawnAt(1) orelse return error.NoSpawn;
-    try testing.expectEqualStrings("cwebp", cwebp_req.argv[1]);
-    try h.fx().feedExit(cwebp_req.key, 0);
-    try h.drain();
-    try testing.expectEqual(Status.idle, h.model().status);
-
-    const avifenc_req = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-    try testing.expectEqualStrings("avifenc", avifenc_req.argv[1]);
-    try h.fx().feedExit(avifenc_req.key, 1);
-    try h.drain();
-
-    try testing.expectEqual(Status.failed, h.model().status);
-    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "avifenc") != null);
-}
-
 // ========================================================== format selection
 //
 // The chip -> `set_format:{f}` payload coercion and the `selected="{f ==
@@ -1409,15 +1227,17 @@ test "format survives picking a file, unlike the rest of the model" {
 
 // =============================================================== encode pipeline
 //
-// The sizes below are REAL: recorded by running the pinned argv against
-// `test-images/`. `large.jpg` (5,846,465 B) -> AVIF 717,003 / WebP
-// 671,054; `tiny.png` (312 B) -> AVIF 315 (LARGER than the source) / WebP
-// 68.
+// The load chain lands in `.ready`; `smoosh` then issues one `image.encode`
+// host request per requested format, whose worker decodes + encodes +
+// writes atomically off the loop thread and replies with the output size.
+// The sizes fed below are the Phase A recorded ones (`large.jpg`
+// 5,846,465 B -> AVIF 717,003 / WebP 671,054), so a test asserting a size
+// is asserting the model plumbs the worker's answer through unchanged.
 
 const large_jpg = "/Users/someone/Pictures/large.jpg";
 const large_jpg_bytes = "5846465";
 
-test "AVIF alone spawns the pinned avifenc argv and writes next to the source" {
+test "AVIF alone issues one image.encode for the AVIF destination" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -1426,21 +1246,21 @@ test "AVIF alone spawns the pinned avifenc argv and writes next to the source" {
     try h.send(.smoosh);
 
     try testing.expectEqual(Status.compressing, h.model().status);
-    // Exactly one encode: selecting AVIF must not also run cwebp.
-    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
+    // Exactly one encode: selecting AVIF must not also encode WebP. And
+    // nothing spawns — there are no subprocesses left in the app.
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingHostCount());
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
+    try testing.expect(h.encodeRequest(.webp) == null);
 
-    const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-    const expected_argv = [_][]const u8{
-        "avifenc",                            "-q", "58",
-        "--speed",                            "6",  large_jpg,
-        "/Users/someone/Pictures/large.avif",
-    };
-    try testing.expectEqual(expected_argv.len, spawn.argv.len);
-    for (expected_argv, spawn.argv) |expected, actual| {
-        try testing.expectEqualStrings(expected, actual);
-    }
+    const request = h.encodeRequest(.avif) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("image.encode", request.name);
+    // Payload: NUL-delimited "<format>\x00<source>\x00<uti>\x00<dest>".
+    try testing.expectEqualStrings(
+        "AVIF\x00" ++ large_jpg ++ "\x00public.jpeg\x00/Users/someone/Pictures/large.avif",
+        request.payload,
+    );
 
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
 
     try testing.expectEqual(Status.done, h.model().status);
     try testing.expect(h.model().hasAvifResult());
@@ -1449,7 +1269,7 @@ test "AVIF alone spawns the pinned avifenc argv and writes next to the source" {
     try testing.expectEqualStrings("Done.", h.model().statusLine());
 }
 
-test "WebP alone spawns the pinned cwebp argv, whose output flag is -o" {
+test "WebP alone issues one image.encode for the WebP destination" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -1457,19 +1277,14 @@ test "WebP alone spawns the pinned cwebp argv, whose output flag is -o" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
 
-    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
-    const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-    // cwebp takes its destination after `-o`, unlike avifenc's positional
-    // second argument — a reordering here would silently write the wrong file.
-    const expected_argv = [_][]const u8{
-        "cwebp", "-q", "80", large_jpg, "-o", "/Users/someone/Pictures/large.webp",
-    };
-    try testing.expectEqual(expected_argv.len, spawn.argv.len);
-    for (expected_argv, spawn.argv) |expected, actual| {
-        try testing.expectEqualStrings(expected, actual);
-    }
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingHostCount());
+    const request = h.encodeRequest(.webp) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(
+        "WebP\x00" ++ large_jpg ++ "\x00public.jpeg\x00/Users/someone/Pictures/large.webp",
+        request.payload,
+    );
 
-    try h.encodeOk("cwebp", ".webp", "671054");
+    try h.encodeOk(.webp, "671054");
 
     try testing.expectEqual(Status.done, h.model().status);
     try testing.expect(h.model().hasWebpResult());
@@ -1477,7 +1292,7 @@ test "WebP alone spawns the pinned cwebp argv, whose output flag is -o" {
     try testing.expectEqual(@as(u64, 671054), h.model().webp_size);
 }
 
-test "Both runs two encodes at once and joins them" {
+test "Both issues two image.encode requests at once and joins them" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -1485,15 +1300,15 @@ test "Both runs two encodes at once and joins them" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
 
-    // Concurrent, not sequential: both spawns are in flight before either
+    // Concurrent, not sequential: both requests are in flight before either
     // answers. A pipeline that chained them would show one here.
-    try testing.expectEqual(@as(usize, 2), h.fx().pendingSpawnCount());
+    try testing.expectEqual(@as(usize, 2), h.fx().pendingHostCount());
 
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
     // One format done is not the run done.
     try testing.expectEqual(Status.compressing, h.model().status);
 
-    try h.encodeOk("cwebp", ".webp", "671054");
+    try h.encodeOk(.webp, "671054");
 
     try testing.expectEqual(Status.done, h.model().status);
     try testing.expect(h.model().hasAvifResult());
@@ -1501,7 +1316,7 @@ test "Both runs two encodes at once and joins them" {
     try testing.expectEqualStrings("", h.model().warningMessage());
 }
 
-test "Both joins in whichever order the encoders finish" {
+test "Both joins in whichever order the workers finish" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -1509,11 +1324,11 @@ test "Both joins in whichever order the encoders finish" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
 
-    // cwebp answers FIRST this time. Real encoders finish in whatever order
-    // the OS gives them, so the join must not depend on the spawn order.
-    try h.encodeOk("cwebp", ".webp", "671054");
+    // WebP answers FIRST this time. Real workers finish in whatever order
+    // the OS gives them, so the join must not depend on request order.
+    try h.encodeOk(.webp, "671054");
     try testing.expectEqual(Status.compressing, h.model().status);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
 
     try testing.expectEqual(Status.done, h.model().status);
     try testing.expectEqual(@as(u64, 717003), h.model().avif_size);
@@ -1530,8 +1345,8 @@ test "AVIF succeeding while WebP fails is a done run that names WebP" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
 
-    try h.encodeOk("avifenc", ".avif", "717003");
-    try h.encodeExit("cwebp", 1);
+    try h.encodeOk(.avif, "717003");
+    try h.encodeReply(.webp, false, "encode");
 
     // THE decision: `.done`, not `.failed`. avifenc already wrote
     // large.avif to disk — claiming the run failed would contradict the
@@ -1557,8 +1372,8 @@ test "WebP succeeding while AVIF fails is the same rule, mirrored" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
 
-    try h.encodeExit("avifenc", 1);
-    try h.encodeOk("cwebp", ".webp", "671054");
+    try h.encodeReply(.avif, false, "encode");
+    try h.encodeOk(.webp, "671054");
 
     try testing.expectEqual(Status.done, h.model().status);
     try testing.expect(h.model().hasWebpResult());
@@ -1574,8 +1389,8 @@ test "Both formats failing is a failed run, not a done one" {
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
 
-    try h.encodeExit("avifenc", 1);
-    try h.encodeExit("cwebp", 1);
+    try h.encodeReply(.avif, false, "encode");
+    try h.encodeReply(.webp, false, "encode");
 
     // The floor under the partial-success rule: nothing landed, so nothing
     // may claim success. This also keeps "`.failed` is always paired with
@@ -1596,7 +1411,7 @@ test "the only selected format failing is an ordinary failed run" {
     try h.send(.{ .set_format = .avif });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeExit("avifenc", 1);
+    try h.encodeReply(.avif, false, "encode");
 
     // Single-format mode reaches the SAME branch as "both failed" — there
     // is no separate code path for it, which is the point of the rule.
@@ -1608,61 +1423,38 @@ test "the only selected format failing is an ordinary failed run" {
 
 // ------------------------------------------------- encoders and encoding
 
-test "a missing encoder fails only its own format" {
-    var h = try Harness.createBare();
-    defer h.destroy();
-
-    // avifenc present, cwebp absent — the launch-time check would have
-    // failed outright. In Both mode the AVIF half must still work.
-    try h.resolveEncoders(true, false);
-    try h.send(.{ .set_format = .both });
-    try h.load(large_jpg, large_jpg_bytes);
-    try h.send(.smoosh);
-
-    // No point spawning a binary that is not there.
-    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
-    try testing.expect(h.encodeSpawn("cwebp") == null);
-
-    try h.encodeOk("avifenc", ".avif", "717003");
-
-    try testing.expectEqual(Status.done, h.model().status);
-    try testing.expect(h.model().hasAvifResult());
-    try testing.expect(std.mem.indexOf(u8, h.model().warningMessage(), "brew install webp") != null);
-}
-
-test "a missing encoder for the only selected format fails, naming its brew install" {
-    var h = try Harness.createBare();
-    defer h.destroy();
-
-    try h.resolveEncoders(false, true);
-    try h.send(.{ .set_format = .avif });
-    try h.load(large_jpg, large_jpg_bytes);
-    try h.send(.smoosh);
-
-    // Decided without any spawn at all, so the run is over in one dispatch.
-    try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
-    try testing.expectEqual(Status.failed, h.model().status);
-    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "brew install libavif") != null);
-}
-
-test "an encoder that exits clean without leaving a file is a write failure" {
+test "an encode worker that fails the atomic write is a write failure" {
     var h = try Harness.create();
     defer h.destroy();
 
     try h.send(.{ .set_format = .avif });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeExit("avifenc", 0);
-    // The output stat is what proves the file landed — the "write to
-    // output path failed" state has no other signal, since the encoder
-    // writes its own destination.
-    try h.encodeSize(".avif", false, "AccessDenied");
+    // The worker encoded bytes but the write/rename failed — it replies
+    // `ok = false` with the tag "write", which `update` maps to
+    // `.write_failed` (permissions wording) rather than `.encode_failed`.
+    try h.encodeReply(.avif, false, "write");
 
     try testing.expectEqual(Status.failed, h.model().status);
     const message = h.model().errorMessage();
     try testing.expect(std.mem.indexOf(u8, message, "AVIF") != null);
     try testing.expect(std.mem.indexOf(u8, message, "permissions") != null);
     try testing.expect(!h.model().hasAvifResult());
+}
+
+test "an encode worker that can't decode or encode is an encode failure" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .avif });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    // Any non-"write" failure tag is the generic encode failure.
+    try h.encodeReply(.avif, false, "encode");
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "AVIF") != null);
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "permissions") == null);
 }
 
 test "smooshing a WebP source to WebP is skipped rather than overwriting the source" {
@@ -1673,13 +1465,13 @@ test "smooshing a WebP source to WebP is skipped rather than overwriting the sou
     try h.load("/Users/someone/Pictures/photo.webp", "204800");
     try h.send(.smoosh);
 
-    // cwebp would have been handed the same path to read AND write.
-    // "Overwrite silently" is about a previous OUTPUT, never the user's
-    // source file.
-    try testing.expect(h.encodeSpawn("cwebp") == null);
-    try testing.expect(h.encodeSpawn("avifenc") != null);
+    // WebP's worker would have been handed the same path to read AND
+    // write. "Overwrite silently" is about a previous OUTPUT, never the
+    // user's source file.
+    try testing.expect(h.encodeRequest(.webp) == null);
+    try testing.expect(h.encodeRequest(.avif) != null);
 
-    try h.encodeOk("avifenc", ".avif", "98304");
+    try h.encodeOk(.avif, "98304");
 
     try testing.expectEqual(Status.done, h.model().status);
     try testing.expect(std.mem.indexOf(u8, h.model().warningMessage(), "already a WebP") != null);
@@ -1695,38 +1487,38 @@ test "the output path replaces the source extension, not a dot in a parent direc
     try h.load("/Users/someone/my.photos/holiday", "204800");
     try h.send(.smoosh);
 
-    const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
     try testing.expectEqualStrings(
         "/Users/someone/my.photos/holiday.avif",
-        spawn.argv[spawn.argv.len - 1],
+        try h.encodeDest(.avif),
     );
+}
+
+test "a source path containing a newline still parses the encode payload" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // macOS allows '\n' in a filename. The `image.encode` payload is
+    // NUL-delimited precisely so a newline in the source path cannot shift
+    // the fields — a '\n' delimiter would put "b.jpg" where the UTI goes.
+    try h.send(.{ .set_format = .avif });
+    try h.load("/Users/someone/Pictures/a\nb.jpg", "204800");
+    try h.send(.smoosh);
+
+    try testing.expectEqualStrings("/Users/someone/Pictures/a\nb.avif", try h.encodeDest(.avif));
+    try h.encodeOk(.avif, "150000");
+    try testing.expectEqual(Status.done, h.model().status);
 }
 
 // -------------------------------------------------------------- HEIC input
 //
-// `avifenc`/`cwebp` reject HEIC as an INPUT format outright (confirmed
-// live), even though `sips` decodes it fine for the preview. `smoosh`
-// routes a HEIC/HEIF source through ONE shared `sips`-to-PNG staging spawn
-// first; both encoders then read the staged PNG instead of the original
-// file.
+// HEIC used to be staged to a PNG through `sips` before the encoders could
+// read it. M14c deleted that: ImageIO decodes HEIC directly in the encode
+// worker, so a `.heic` source takes the exact same path as any other.
 
 const photo_heic = "/Users/someone/Pictures/photo.heic";
 const photo_heic_bytes = "2202009";
 
-test "isHeicSource matches .heic/.heif case-insensitively and nothing else" {
-    try testing.expect(main.isHeicSource("photo.heic"));
-    try testing.expect(main.isHeicSource("/a/b/PHOTO.HEIC"));
-    try testing.expect(main.isHeicSource("photo.heif"));
-    try testing.expect(main.isHeicSource("photo.HEIF"));
-    try testing.expect(!main.isHeicSource("photo.jpg"));
-    try testing.expect(!main.isHeicSource("photo"));
-    try testing.expect(!main.isHeicSource(""));
-    // A dot in a parent directory, no extension of its own — the same
-    // hazard `outputPath` guards against, checked here too.
-    try testing.expect(!main.isHeicSource("/a/my.photos/holiday"));
-}
-
-test "a HEIC source stages a sips conversion before either encoder runs" {
+test "a HEIC source encodes directly, with no staging step" {
     var h = try Harness.create();
     defer h.destroy();
 
@@ -1735,122 +1527,30 @@ test "a HEIC source stages a sips conversion before either encoder runs" {
     try h.send(.smoosh);
 
     try testing.expectEqual(Status.compressing, h.model().status);
-    // The staging spawn only — the encoder has not started yet.
-    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
-    const spawn = h.fx().pendingSpawnAt(0) orelse return error.NoSpawn;
-    const expected_argv = [_][]const u8{
-        "/usr/bin/sips", "-s", "format", "png", photo_heic, "--out", test_converted_path,
-    };
-    try testing.expectEqual(expected_argv.len, spawn.argv.len);
-    for (expected_argv, spawn.argv) |expected, actual| {
-        try testing.expectEqualStrings(expected, actual);
-    }
-
-    try h.convertExit(0);
-
-    // Now the real encode is pending, reading the STAGED path but writing
-    // next to the ORIGINAL source — never a file named after the staging
-    // file.
-    const encode = h.encodeSpawn("avifenc") orelse return error.NoSpawn;
-    const expected_encode_argv = [_][]const u8{
-        "avifenc", "-q",                "58",                                 "--speed",
-        "6",       test_converted_path, "/Users/someone/Pictures/photo.avif",
-    };
-    try testing.expectEqual(expected_encode_argv.len, encode.argv.len);
-    for (expected_encode_argv, encode.argv) |expected, actual| {
-        try testing.expectEqualStrings(expected, actual);
-    }
-
-    try h.encodeOk("avifenc", ".avif", "204800");
-    try testing.expectEqual(Status.done, h.model().status);
-    try testing.expect(h.model().hasAvifResult());
-}
-
-test "Both formats share one HEIC conversion spawn, not one each" {
-    var h = try Harness.create();
-    defer h.destroy();
-
-    try h.send(.{ .set_format = .both });
-    try h.load(photo_heic, photo_heic_bytes);
-    try h.send(.smoosh);
-
-    // ONE staging spawn for the whole run, not one per requested format.
-    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
-    try h.convertExit(0);
-
-    // Both encodes now pending, both reading the staged path.
-    try testing.expectEqual(@as(usize, 2), h.fx().pendingSpawnCount());
-    const avif = h.encodeSpawn("avifenc") orelse return error.NoSpawn;
-    const webp = h.encodeSpawn("cwebp") orelse return error.NoSpawn;
-    try testing.expectEqualStrings(test_converted_path, avif.argv[avif.argv.len - 2]);
-    try testing.expectEqualStrings(test_converted_path, webp.argv[webp.argv.len - 3]);
-
-    try h.encodeOk("avifenc", ".avif", "204800");
-    try h.encodeOk("cwebp", ".webp", "184320");
-    try testing.expectEqual(Status.done, h.model().status);
-    try testing.expect(h.model().hasAvifResult());
-    try testing.expect(h.model().hasWebpResult());
-}
-
-test "a failed HEIC conversion fails the run without ever spawning the encoder" {
-    var h = try Harness.create();
-    defer h.destroy();
-
-    try h.load(photo_heic, photo_heic_bytes);
-    try h.send(.smoosh);
-    try h.convertExit(1);
-
-    try testing.expectEqual(Status.failed, h.model().status);
-    try testing.expectEqualStrings(
-        "Couldn't prepare that HEIC file for encoding.",
-        h.model().errorMessage(),
-    );
+    // Straight to the encode request — no `sips`, nothing spawned.
     try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
-    try testing.expect(!h.model().hasAvifResult());
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingHostCount());
+    try testing.expectEqualStrings(
+        "/Users/someone/Pictures/photo.avif",
+        try h.encodeDest(.avif),
+    );
+
+    try h.encodeOk(.avif, "204800");
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().hasAvifResult());
 }
 
-test "a failed HEIC conversion in Both mode fails once, not with a doubled message" {
+test "a HEIC source whose worker can't decode fails the run" {
     var h = try Harness.create();
     defer h.destroy();
 
-    try h.send(.{ .set_format = .both });
+    try h.send(.{ .set_format = .avif });
     try h.load(photo_heic, photo_heic_bytes);
     try h.send(.smoosh);
-    try h.convertExit(1);
+    try h.encodeReply(.avif, false, "encode");
 
     try testing.expectEqual(Status.failed, h.model().status);
-    // The staging failure is ONE shared cause, not two independent encoder
-    // failures — the message must not repeat itself the way the per-format
-    // join would for two genuinely different failures.
-    try testing.expectEqualStrings(
-        "Couldn't prepare that HEIC file for encoding.",
-        h.model().errorMessage(),
-    );
-}
-
-test "a HEIC conversion result that lands after reset is ignored" {
-    var h = try Harness.create();
-    defer h.destroy();
-
-    try h.load(photo_heic, photo_heic_bytes);
-    try h.send(.smoosh);
-    const staging_key = (h.fx().pendingSpawnAt(0) orelse return error.NoSpawn).key;
-
-    try h.send(.reset);
-    try h.drain();
-    try testing.expectEqual(Status.idle, h.model().status);
-
-    // The real hazard: a stale terminal for the CANCELLED staging spawn
-    // arriving anyway (a race the effects channel itself does not fully
-    // close — same reasoning as the pre-existing `.encode_result` guard).
-    // Dispatched directly, bypassing `fx` entirely, the same technique the
-    // Save As dead-code guards used, since this is the only way to
-    // actually reach the arm with the model already reset out of
-    // `.compressing`.
-    try h.send(.{ .convert_result = .{ .key = staging_key, .code = 1, .reason = .exited } });
-
-    try testing.expectEqual(Status.idle, h.model().status);
-    try testing.expectEqualStrings("", h.model().errorMessage());
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "AVIF") != null);
     try testing.expect(!h.model().hasAvifResult());
 }
 
@@ -1869,8 +1569,8 @@ test "an output larger than the source reads as larger, not a broken percentage"
     try h.send(.{ .set_format = .both });
     try h.load("/Users/someone/Pictures/tiny.png", "312");
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "315");
-    try h.encodeOk("cwebp", ".webp", "68");
+    try h.encodeOk(.avif, "315");
+    try h.encodeOk(.webp, "68");
 
     try testing.expectEqual(Status.done, h.model().status);
     const avif_line = h.model().avifResult(arena);
@@ -1906,8 +1606,8 @@ test "result lines render only for the formats that landed" {
     try h.send(.{ .set_format = .both });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
-    try h.encodeExit("cwebp", 1);
+    try h.encodeOk(.avif, "717003");
+    try h.encodeReply(.webp, false, "encode");
 
     try testing.expectEqualStrings("AVIF  700.2 KB  −88%", h.model().avifResult(arena));
     try testing.expectEqualStrings("", h.model().webpResult(arena));
@@ -1937,8 +1637,8 @@ test "re-smooshing clears the previous run's results" {
     try h.send(.{ .set_format = .both });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
-    try h.encodeExit("cwebp", 1);
+    try h.encodeOk(.avif, "717003");
+    try h.encodeReply(.webp, false, "encode");
     try testing.expect(h.model().warning_message_len > 0);
 
     // Re-running Smoosh on the same source is treated as "redo this" —
@@ -1949,8 +1649,8 @@ test "re-smooshing clears the previous run's results" {
     try testing.expect(!h.model().hasAvifResult());
     try testing.expectEqualStrings("", h.model().warningMessage());
 
-    try h.encodeOk("avifenc", ".avif", "717003");
-    try h.encodeOk("cwebp", ".webp", "671054");
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "671054");
     try testing.expectEqual(Status.done, h.model().status);
     try testing.expectEqualStrings("", h.model().warningMessage());
 }
@@ -1964,10 +1664,11 @@ test "a second Smoosh press while encoding is ignored" {
     try h.send(.smoosh);
     try h.send(.smoosh);
 
-    // A duplicate active key would be REJECTED by the effects channel, so
-    // without the guard the second press would deliver a spurious failure.
-    try testing.expectEqual(@as(usize, 1), h.fx().pendingSpawnCount());
-    try h.encodeOk("avifenc", ".avif", "717003");
+    // A duplicate active key would REPLACE the pending `image.encode`, so
+    // without the guard the second press would swap the request out from
+    // under the round already in flight.
+    try testing.expectEqual(@as(usize, 1), h.fx().pendingHostCount());
+    try h.encodeOk(.avif, "717003");
     try testing.expectEqual(Status.done, h.model().status);
 }
 
@@ -1975,13 +1676,18 @@ test "an encode result that lands after reset is ignored" {
     var h = try Harness.create();
     defer h.destroy();
 
+    try h.send(.{ .set_format = .avif });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
+    const encode_key = (h.encodeRequest(.avif) orelse return error.NoHostRequest).key;
 
-    // Same hazard the load chain hit twice: cancelling the encode delivers
-    // an ordinary nonzero terminal, indistinguishable from a real failure.
+    // A cancelled host request drops its own queued answer, but a worker
+    // already running still parks one — the `.encode_result` arm's own
+    // `status != .compressing` guard is the backstop. Feed a stale result
+    // directly to exercise it.
     try h.send(.reset);
     try h.drain();
+    try h.send(.{ .encode_result = .{ .key = encode_key, .ok = true, .bytes = "717003" } });
 
     try testing.expectEqual(Status.idle, h.model().status);
     try testing.expectEqualStrings("", h.model().errorMessage());
@@ -1995,7 +1701,7 @@ test "picking a new file clears the previous file's results" {
 
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
     try testing.expect(h.model().hasAvifResult());
 
     // Without the clear, the new file's "Ready to smoosh" screen would
@@ -2026,10 +1732,10 @@ test "changing the format mid-encode does not change what the run produces" {
     // the moment AVIF landed and silently drop the WebP file still on its
     // way, leaving a file on disk the UI never mentions.
     try h.send(.{ .set_format = .avif });
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
     try testing.expectEqual(Status.compressing, h.model().status);
 
-    try h.encodeOk("cwebp", ".webp", "671054");
+    try h.encodeOk(.webp, "671054");
     try testing.expectEqual(Status.done, h.model().status);
     try testing.expect(h.model().hasWebpResult());
 }
@@ -2051,7 +1757,7 @@ test "saving a landed format opens one dialog defaulting to its filename" {
 
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
 
     try h.send(.save_avif_as);
     const request = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
@@ -2082,7 +1788,7 @@ test "saving a copy does not touch the encode results" {
 
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
     try h.send(.save_avif_as);
     try h.saveRoundOk("/Users/someone/Desktop/large.avif");
 
@@ -2100,8 +1806,8 @@ test "each format's icon saves independently, and the note names only the most r
     try h.send(.{ .set_format = .both });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
-    try h.encodeOk("cwebp", ".webp", "671054");
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "671054");
 
     try h.send(.save_avif_as);
     const avif_request = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
@@ -2127,8 +1833,8 @@ test "cancelling a round is silent and leaves the other format's icon untouched"
     try h.send(.{ .set_format = .both });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
-    try h.encodeOk("cwebp", ".webp", "671054");
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "671054");
 
     try h.send(.save_avif_as);
     try h.saveDialog(null); // cancel AVIF's round
@@ -2148,7 +1854,7 @@ test "cancelling a round leaves the status line exactly as it was" {
 
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
     const before = h.model().statusLine();
 
     try h.send(.save_avif_as);
@@ -2165,8 +1871,8 @@ test "a copy failure is reported, and the other format's icon still works" {
     try h.send(.{ .set_format = .both });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
-    try h.encodeOk("cwebp", ".webp", "671054");
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "671054");
 
     try h.send(.save_avif_as);
     try h.saveDialog("/Volumes/Locked/large.avif");
@@ -2203,8 +1909,8 @@ test "pressing a save icon while a round is already in flight is ignored" {
     try h.send(.{ .set_format = .both });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
-    try h.encodeOk("cwebp", ".webp", "671054");
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "671054");
 
     try h.send(.save_avif_as);
     const before = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
@@ -2268,7 +1974,7 @@ test "pressing the same icon again after a round finishes runs a fresh round" {
 
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
 
     try h.send(.save_avif_as);
     try h.saveRoundOk("/Users/someone/Desktop/copy-one.avif");
@@ -2290,7 +1996,7 @@ test "re-smooshing clears a save note from the previous run" {
     try h.send(.{ .set_format = .avif });
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
     try h.send(.save_avif_as);
     try h.saveRoundOk("/Users/someone/Desktop/large.avif");
     try testing.expect(h.model().saveMessage().len > 0);
@@ -2308,7 +2014,7 @@ test "picking a new file clears a save note from the previous file" {
 
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
     try h.send(.save_avif_as);
     try h.saveRoundOk("/Users/someone/Desktop/large.avif");
     try testing.expect(h.model().saveMessage().len > 0);
@@ -2323,7 +2029,7 @@ test "reset clears an in-progress save round" {
 
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
     try h.send(.save_avif_as);
     try testing.expect(h.pendingHostNamed("dialog.saveFile") != null);
 
@@ -2342,7 +2048,7 @@ test "reset cancels the pending save dialog, so a stray answer cannot land" {
 
     try h.load(large_jpg, large_jpg_bytes);
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
     try h.send(.save_avif_as);
     const request = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
 
@@ -2366,7 +2072,7 @@ test "the destination extension names the format, not the source's" {
     // leak into the produced AVIF's default save name.
     try h.load("/Users/someone/Pictures/photo.png", "204800");
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "98304");
+    try h.encodeOk(.avif, "98304");
     try h.send(.save_avif_as);
 
     const request = h.pendingHostNamed("dialog.saveFile") orelse return error.NoHostRequest;
@@ -2709,7 +2415,7 @@ test "a drop clears the previous file's results and preview, like a pick does" {
 
     try h.load("/Users/someone/Pictures/large.jpg", "5846465");
     try h.send(.smoosh);
-    try h.encodeOk("avifenc", ".avif", "717003");
+    try h.encodeOk(.avif, "717003");
     try testing.expect(h.model().hasAvifResult());
     try testing.expect(h.model().hasPreview());
 
@@ -2720,20 +2426,19 @@ test "a drop clears the previous file's results and preview, like a pick does" {
 }
 
 // ---------------------------------------------------------------------
-// M14a: the vendored encoder archives.
+// The vendored encoders: M14a wired the archives, M14c calls them.
 //
-// These are the reachable callers that make the link proof real. A test
-// build never analyzes `main`, so without a call the extern symbols are
-// never emitted and this artifact would link clean whether or not
-// `build.zig` wired the archives in at all. They also pin the versions
-// the Phase A baseline was measured against, so a re-copied archive
-// cannot change the encoder out from under `docs/phase-b-baseline.md`
-// without a test going red.
+// The version probes pin what the Phase A baseline was measured against,
+// so a re-copied archive cannot change the encoder out from under
+// `docs/phase-b-baseline.md` without a test going red. That they run HERE,
+// in the test artifact, is half the link proof: `tests.root_module` is a
+// separate Debug module that inherits nothing from the exe's, and wiring
+// only the exe is the mistake this catches.
 //
-// That they run HERE, in the test artifact, is the other half of the
-// proof: `tests.root_module` is a separate Debug module that inherits
-// nothing from the exe's, and wiring only the exe is the mistake this
-// catches.
+// The encode smoke tests run REAL libavif/libaom/libwebp in-process — the
+// encode seam links and produces a well-formed container. Byte-level
+// parity against Phase A is a separate exercise (`docs/phase-b-baseline.md`,
+// "M14c"), not a unit test.
 
 test "libwebp links, at the version the baseline was measured against" {
     try testing.expectEqual(encoders.pinned.libwebp, encoders.libwebpVersion());
@@ -2745,6 +2450,62 @@ test "libavif links, at the version the baseline was measured against" {
 
 test "libaom links, at the version the baseline was measured against" {
     try testing.expectEqualStrings(encoders.pinned.libaom, encoders.libaomVersion());
+}
+
+/// A small opaque RGBA gradient — enough to exercise the RGB->YUV path and
+/// the container muxer without depending on a gitignored fixture.
+fn rgbaGradient(buffer: []u8, width: u32, height: u32) []u8 {
+    var index: usize = 0;
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            buffer[index + 0] = @intCast((x * 255) / width);
+            buffer[index + 1] = @intCast((y * 255) / height);
+            buffer[index + 2] = @intCast((x + y) & 0xFF);
+            buffer[index + 3] = 255;
+            index += 4;
+        }
+    }
+    return buffer[0..index];
+}
+
+test "encodeAvif produces a well-formed AVIF container" {
+    var buffer: [32 * 32 * 4]u8 = undefined;
+    const pixels = rgbaGradient(&buffer, 32, 32);
+
+    var encoded = try encoders.encodeAvif(pixels, 32, 32, .yuv444);
+    defer encoded.deinit();
+
+    try testing.expect(encoded.bytes.len > 0);
+    // Every AVIF opens with an ftyp box whose major brand is "avif".
+    try testing.expectEqualStrings("ftypavif", encoded.bytes[4..12]);
+}
+
+test "encodeWebp produces a well-formed WebP container" {
+    var buffer: [32 * 32 * 4]u8 = undefined;
+    const pixels = rgbaGradient(&buffer, 32, 32);
+
+    var encoded = try encoders.encodeWebp(pixels, 32, 32);
+    defer encoded.deinit();
+
+    try testing.expect(encoded.bytes.len > 0);
+    try testing.expectEqualStrings("RIFF", encoded.bytes[0..4]);
+    try testing.expectEqualStrings("WEBP", encoded.bytes[8..12]);
+}
+
+test "encodeAvif honours the requested chroma subsampling" {
+    var buffer: [32 * 32 * 4]u8 = undefined;
+    const pixels = rgbaGradient(&buffer, 32, 32);
+
+    // 4:2:0 drops chroma resolution, so on the same input it must not
+    // produce byte-identical output to 4:4:4 — a cheap check that the
+    // `yuv_format` argument reaches libavif at all.
+    var a = try encoders.encodeAvif(pixels, 32, 32, .yuv444);
+    defer a.deinit();
+    var b = try encoders.encodeAvif(pixels, 32, 32, .yuv420);
+    defer b.deinit();
+    try testing.expect(!std.mem.eql(u8, a.bytes, b.bytes));
 }
 
 // ================================================================= chroma

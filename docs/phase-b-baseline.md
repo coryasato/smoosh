@@ -438,3 +438,59 @@ asserting every pixel, and CoreGraphics' quarter turns come out as exact permuta
 resampling to account for. `decode` and `probe` agree on dimensions for every fixture, including
 `multi-primary.heic` (640x200, the primary frame) and the real `iphone-rotated-p3.heic`
 (3024x4032).
+
+## M14c (2026-08-29) — the encoders called, re-measured against the gate
+
+M14c wired `encoders.encodeAvif`/`encodeWebp` (the C shim in `src/encode.c` over vendored
+libavif 1.4.2 / libaom v3.14.1 / libwebp 1.6.0) into the `image.encode` worker. The whole fixture
+set was re-encoded from `imageio.decode`'s output — full-resolution, upright, sRGB, straight-alpha
+8-bit RGBA, no metadata — and compared to the AVIF/WebP byte columns above. `avifenc`'s pinned
+`-q 58 --speed 6` became `encoder->quality = 58 / qualityAlpha = 58 / speed = 6 / maxThreads = 1`;
+`cwebp -q 80` became `WebPEncodeRGBA(..., 80.0f, ...)`. AVIF is tagged sRGB explicitly
+(primaries BT709, transfer sRGB, matrix BT601, full range) since the decode drops the ICC profile.
+
+| Fixture | AVIF B | base | Δ | WebP B | base | Δ |
+|---|---|---|---|---|---|---|
+| `large.jpg` | 712234 | 717003 | -0.7% | 666042 | 671054 | -0.7% |
+| `photo-420.jpg` | 615065 | 634631 | -3.1% | 581148 | 599368 | -3.0% |
+| `ui.png` | 8398 | 9495 | -11.6% | 16144 | 16144 | +0.0% |
+| `ui.jpg` | 11694 | 12577 | -7.0% | 17648 | 17796 | -0.8% |
+| `gray.jpg` | 520683 | 520291 | +0.1% | 499222 | 499288 | -0.0% |
+| `alpha16.png` | 2232 | 695 | **+221%** | 1800 | 1760 | +2.3% |
+| `small.png` | 344 | 342 | +0.6% | 164 | 160 | +2.5% |
+| `tiny.png` | 315 | 315 | +0.0% | 68 | 68 | +0.0% |
+| `photo.heic` | 654656 | 655145 | -0.1% | 604060 | 604060 | +0.0% |
+| `p3.heic` | 713074 | 667716 | +6.8% | 641296 | 613948 | +4.5% |
+| `rotated-p3.heic` | 715616 | 667716 | +7.2% | 658914 | 613948 | +7.3% |
+| `rotated-gps.jpg` | 714337 | 717292 | -0.4% | 688380 | 671054 | +2.6% |
+| `iphone-rotated-p3.heic` | 601990 | 578634 | +4.0% | 742610 | 731748 | +1.5% |
+| `multi-primary.heic` | 3808 | 10223 | **-63%** | 4270 | 9314 | **-54%** |
+| `photo.webp` | 384996 | — | (was **fail**) | 461344 | 462808 | -0.3% |
+| `large.webp` | 421126 | — | (was **fail**) | 470874 | 489728 | -3.8% |
+
+Chroma subsampling per fixture is what `chroma.forSource` fed (`large.jpg`/`rotated-gps.jpg`/
+graphics-PNG/HEIC 4:4:4, `photo-420.jpg`/`ui.jpg` 4:2:0, `gray.jpg` 4:0:0) — the `AVIF yuv` column
+above, reproduced, and `avifImageCreate(w, h, 8, fmt)` sets it explicitly so it is honoured.
+
+**Two rows fall outside ±15%; neither is an encoder regression:**
+
+1. **`multi-primary.heic` (-63% / -54%).** The Phase A baseline encoded the WRONG image. `sips`
+   staged index 0 (the 400x300 item) while the file's `pitm` box names the 640x200 item as
+   primary; the baseline row itself records `400x300`. M13 fixed the decode to
+   `CGImageSourceGetPrimaryImageIndex`, so M14c encodes the 640x200 primary — a different, smaller
+   picture. This is the "a multi-image HEIC compresses the wrong image" bug closing, exactly as
+   PLAN.md scoped it, not a size regression.
+
+2. **`alpha16.png` AVIF (+221%, 695 B -> 2232 B).** A genuine difference, on a 512x512 synthetic
+   alpha gradient (the fixture exists for the 16-bit/alpha edge case, not as representative
+   content). Both sizes are in the low-KB noise floor; `avifenc` reading the 16-bit PNG directly
+   compresses the smooth gradient tighter than libavif does from the 8-bit straight-alpha buffer
+   the decode hands over. The WebP half matches (+2.3%). Flagged rather than tuned — the pinned
+   settings are the product, and chasing a 1.5 KB delta on a synthetic fixture is not worth
+   perturbing them.
+
+**Everything else is within ±15%, most within ±5%** — every real photograph, both graphics
+fixtures (`ui.png`/`ui.jpg`, the class that justified vendoring libaom), grayscale, the
+Display-P3 conversions and the orientation-tagged sources. The four WebP/AVIF sources that
+produced **fail** under Phase A now encode (`photo.webp`/`large.webp` shown; `.avif` sources
+likewise), which is the capability gain PLAN.md's "Known limitations" promised.

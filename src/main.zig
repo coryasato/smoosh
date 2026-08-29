@@ -10,10 +10,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const native_sdk = @import("native_sdk");
 const imageio = @import("imageio.zig");
+const encoders = @import("encoders.zig");
+const chroma = @import("chroma.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
-const app_dirs = native_sdk.app_dirs;
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 const platform = native_sdk.platform;
@@ -104,10 +105,10 @@ pub const Status = enum { idle, loading, ready, compressing, done, failed };
 /// their own outcome, so "Both" is two independent encodes joined at the
 /// end rather than one all-or-nothing operation.
 ///
-/// `.none` means "not part of this run" and `.pending` means "spawned,
-/// still waiting" — which is what makes the join immune to the user
-/// changing `Model.format` mid-encode: completion is "neither is
-/// `.pending`", never a re-read of the current selection.
+/// `.none` means "not part of this run" and `.pending` means "the encode
+/// worker is running, still waiting" — which is what makes the join immune
+/// to the user changing `Model.format` mid-encode: completion is "neither
+/// is `.pending`", never a re-read of the current selection.
 ///
 /// The failure tags are separate rather than one `.failed` because each
 /// one is a different sentence to the user.
@@ -115,27 +116,20 @@ pub const EncodeOutcome = enum {
     none,
     pending,
     ok,
-    /// The encoder binary is not installed (the launch-time presence
-    /// check said so).
-    missing_encoder,
     /// The output path would BE the source path — encoding a `.webp` to
-    /// WebP would have the encoder read and overwrite the same file.
+    /// WebP would read and overwrite the same file.
     same_path,
-    /// The encoder ran and exited nonzero (or was killed).
+    /// The worker could not decode the source or the encoder rejected the
+    /// frame.
     encode_failed,
-    /// The encoder claimed success but the output could not be stat'd —
-    /// the "write to output path failed" state.
+    /// The encode produced bytes but the atomic write (or the rename onto
+    /// the destination) failed — the "write to output path failed" state.
     write_failed,
-    /// The shared HEIC->PNG staging step (`sips`) failed or the source
-    /// vanished between pick and encode, so the encoder for this format
-    /// never even ran. Distinct from `encode_failed` because the encoder
-    /// itself is not what failed.
-    convert_failed,
 
     fn isFailure(outcome: EncodeOutcome) bool {
         return switch (outcome) {
             .none, .pending, .ok => false,
-            .missing_encoder, .same_path, .encode_failed, .write_failed, .convert_failed => true,
+            .same_path, .encode_failed, .write_failed => true,
         };
     }
 };
@@ -179,12 +173,6 @@ pub const Model = struct {
     webp_outcome: EncodeOutcome = .none,
     // options
     format: Format = .both,
-    // encoders — the launch-time `which avifenc`/`which cwebp` presence
-    // check. `null` until that hop answers; both land before any user
-    // input is possible, so `update`'s arms below never need to guard on
-    // this being unresolved.
-    avifenc_present: ?bool = null,
-    cwebp_present: ?bool = null,
     // ui
     status: Status = .idle,
     error_message_buffer: [256]u8 = undefined,
@@ -250,8 +238,6 @@ pub const Model = struct {
         "webp_path_len",
         "webp_size",
         "webp_outcome",
-        "avifenc_present",
-        "cwebp_present",
         "status",
         "error_message_buffer",
         "error_message_len",
@@ -497,9 +483,7 @@ pub const Msg = union(enum) {
     thumbnail_result: native_sdk.EffectHostResult, // host ImageIO thumbnail callback -> the preview pixels
     set_format: Format, // format chip pressed
     smoosh, // "Smoosh" clicked
-    convert_result: native_sdk.EffectExit, // `sips` HEIC->PNG staging callback, shared by both formats
-    encode_result: native_sdk.EffectExit, // fx.spawn callback, one per format encoded
-    encode_size_result: native_sdk.EffectHostResult, // host file-size callback -> avif_size/webp_size
+    encode_result: native_sdk.EffectHostResult, // `image.encode` worker callback, one per format — carries the output size
     save_avif_as, // AVIF result row's save icon clicked
     save_webp_as, // WebP result row's save icon clicked
     save_as_dialog_result: native_sdk.EffectHostResult, // host save-dialog callback
@@ -510,7 +494,6 @@ pub const Msg = union(enum) {
     // ceiling sized for small payloads, not an arbitrary file).
     // `std.Io.Dir.copyFileAbsolute` has no such cap.
     save_as_result: native_sdk.EffectHostResult, // host copy-file callback
-    encoder_check_result: native_sdk.EffectExit, // launch-time `which avifenc`/`which cwebp`
     reset, // clear current image, return to idle
 
     // Dispatched by effect/host-call result paths, never from markup —
@@ -521,12 +504,9 @@ pub const Msg = union(enum) {
         "stat_result",
         "probe_result",
         "thumbnail_result",
-        "convert_result",
         "encode_result",
-        "encode_size_result",
         "save_as_dialog_result",
         "save_as_result",
-        "encoder_check_result",
     };
 };
 
@@ -579,15 +559,10 @@ const thumbnail_key: u64 = 3;
 /// costs nothing and a reader looking for "id 4" finds it here.
 const preview_image_id: u64 = 4;
 const probe_key: u64 = 5;
-const avifenc_check_key: u64 = 6;
-const cwebp_check_key: u64 = 7;
 const avif_encode_key: u64 = 8;
 const webp_encode_key: u64 = 9;
-const avif_stat_key: u64 = 10;
-const webp_stat_key: u64 = 11;
 const save_dialog_key: u64 = 12;
 const save_copy_key: u64 = 13;
-const heic_convert_key: u64 = 14;
 
 /// Host-call names our own `HostBridge` answers (see `main`). Not SDK
 /// vocabulary — we bind the seam, so we name it.
@@ -595,61 +570,13 @@ const host_open_file = "dialog.openFile";
 const host_file_size = "file.stat";
 const host_save_file = "dialog.saveFile";
 const host_file_copy = "file.copy";
-/// The two ImageIO reads, answered OFF the loop thread (see `HostBridge`'s
-/// worker carrier). Split because their costs are nothing alike: `probe`
-/// allocates no bitmap at all, `thumbnail` decodes.
+/// The ImageIO reads and the encode, all answered OFF the loop thread (see
+/// `HostBridge`'s worker carrier). `probe` allocates no bitmap; `thumbnail`
+/// decodes a 160px preview; `encode` decodes at full resolution, runs
+/// libavif/libwebp, and writes the output file atomically.
 const host_image_probe = "image.probe";
 const host_image_thumbnail = "image.thumbnail";
-
-/// Absolute so the check does not depend on the inherited PATH — but
-/// `which`'s OWN job is to search that PATH for `avifenc`/`cwebp`, which is
-/// exactly what a real encode spawn would do resolving argv[0] the same
-/// way, so the check is honest about what it is proving.
-const which_path = "/usr/bin/which";
-
-/// Where `sips` stages a HEIC/HEIF source as a PNG before encoding —
-/// `avifenc`/`cwebp` reject HEIC as an INPUT format outright (see
-/// `isHeicSource`), even though ImageIO decodes it fine for the
-/// preview. Resolved once in `main`; `pub var` so tests can point it
-/// somewhere harmless, and `update` only ever reads it.
-pub var converted_path: []const u8 = "";
-
-/// The environment every `fx.spawn` child inherits (bound once, at launch,
-/// into `Runtime.Options.environ`) — see `resolveSpawnEnviron` below for why
-/// this differs from the raw process environment on a packaged app.
-var spawn_environ: std.process.Environ = .empty;
-
-/// A GUI-launched app (Finder/Dock double-click — every packaged `.app`,
-/// launched from `/Applications`) inherits launchd's minimal PATH
-/// (`/usr/bin:/bin:/usr/sbin:/sbin`), not the interactive-shell PATH
-/// `brew shellenv` adds to `.zshrc`/`.zprofile` — that file only runs for
-/// a login/interactive shell, which `native dev`/`native build` (always
-/// launched from a Terminal) get but a packaged app never does. Without
-/// this, `avifenc`/`cwebp` presence detection fails even with both
-/// installed via Homebrew. Every spawned child, `which` included, inherits
-/// this process's OWN environment (`Runtime.Options.environ`,
-/// threaded straight into each child — see effects.zig), so the fix is to
-/// widen THAT environment once at launch rather than touch the spawns
-/// themselves. Leaves PATH untouched if Homebrew's bin is already on it
-/// (the Terminal-launched case), so this changes nothing for `native dev`.
-pub fn resolveSpawnEnviron(gpa: std.mem.Allocator, base: std.process.Environ) !std.process.Environ {
-    const homebrew_paths = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin";
-
-    var map = try base.createMap(gpa);
-    defer map.deinit();
-
-    const current_path = map.get("PATH") orelse "";
-    if (std.mem.indexOf(u8, current_path, "/opt/homebrew/bin") != null) return base;
-
-    const augmented_path = if (current_path.len == 0)
-        homebrew_paths
-    else
-        try std.fmt.allocPrint(gpa, "{s}:{s}", .{ current_path, homebrew_paths });
-    defer if (current_path.len != 0) gpa.free(augmented_path);
-
-    try map.put("PATH", augmented_path);
-    return .{ .block = try map.createPosixBlock(gpa, .{}) };
-}
+const host_image_encode = "image.encode";
 
 // ----------------------------------------------------------- input limits
 //
@@ -743,33 +670,6 @@ pub fn parsePreviewReply(reply: []const u8) ?Preview {
     return .{ .width = width, .height = height, .pixels = pixels };
 }
 
-// ---------------------------------------------------------- encoder check
-//
-// Detects presence of avifenc/cwebp at launch; if either is missing,
-// names which tool and the exact brew install command. `init_fx` is the
-// SDK's boot-command hook — it runs exactly once, on the installing
-// frame, before the first view builds, so a launch that starts missing an
-// encoder shows the error on the very first paint rather than a flash of
-// the normal drop-zone.
-
-/// TEA's boot command (`UiApp.Options.init_fx`). Fires the two presence
-/// checks; `update`'s `.encoder_check_result` arm joins them.
-pub fn initFx(model: *Model, fx: *Effects) void {
-    _ = model;
-    fx.spawn(.{
-        .key = avifenc_check_key,
-        .argv = &.{ which_path, "avifenc" },
-        .output = .collect,
-        .on_exit = Effects.exitMsg(.encoder_check_result),
-    });
-    fx.spawn(.{
-        .key = cwebp_check_key,
-        .argv = &.{ which_path, "cwebp" },
-        .output = .collect,
-        .on_exit = Effects.exitMsg(.encoder_check_result),
-    });
-}
-
 // ---------------------------------------------------------- encode pipeline
 //
 // THE PARTIAL-FAILURE DECISION: in "Both" mode the two encodes are
@@ -778,44 +678,27 @@ pub fn initFx(model: *Model, fx: *Effects) void {
 // in the status bar. Only when NO requested format landed is the run
 // `.failed`.
 //
-// The deciding fact is that `avifenc`/`cwebp` write their own output files:
-// by the time WebP's nonzero exit arrives, `photo.avif` is already on disk
-// next to the source. Failing the whole run would mean either claiming
-// failure with a good file sitting right there, or deleting a file the user
-// can see. It also makes a missing encoder degrade instead of blocking — a
-// machine with only `avifenc` still gets its AVIF out of a "Both" run.
+// The deciding fact is that the encode worker writes its own output file
+// (atomically): by the time WebP's failure arrives, `photo.avif` is
+// already on disk next to the source. Failing the whole run would mean
+// either claiming failure with a good file sitting right there, or
+// deleting a file the user can see.
 //
 // The floor keeps the "Status → error mapping" invariant intact: a run
 // where everything failed is `.failed` with a message, which in
 // single-format mode is just the ordinary failure path — no special case.
+//
+// Each format is one `image.encode` host request, answered off the loop
+// thread by `HostBridge`'s worker carrier: the worker decodes the source
+// at full resolution through ImageIO, runs libavif/libwebp, and writes the
+// output atomically, replying with just the output size. There is no HEIC
+// staging step any more — ImageIO decodes HEIC directly — and no
+// subprocess of any kind.
 
 /// ONE encodable output format. `Format.both` is a REQUEST for two of
 /// these; every per-format path below works on this type, never on `Format`,
 /// which is exactly what keeps the two encodes independent.
 const Output = enum { avif, webp };
-
-/// Pinned by running both encoders against real fixtures. argv[0] is a
-/// bare name, not an absolute path: the launch-time `which` check proves
-/// the PATH resolution these spawns depend on.
-const avif_quality = "58";
-const avif_speed = "6";
-const webp_quality = "80";
-
-/// True for a `.heic`/`.heif` source (case-insensitive). `avifenc`/`cwebp`
-/// reject HEIC as an INPUT format outright — confirmed by running both
-/// directly against a real HEIC fixture — even though `sips` decodes it
-/// fine, which is what the preview thumbnail already relies on. `smoosh`
-/// uses this to route through a `sips`-to-PNG staging step first instead
-/// of handing the encoders a container they cannot read. `pub`, matching
-/// `formatBytes`/`formatSavings`/
-/// `resolveSpawnEnviron`'s precedent for a pure helper worth testing
-/// directly rather than only through the full dispatch path.
-pub fn isHeicSource(source_path: []const u8) bool {
-    const name_start = if (std.mem.lastIndexOfScalar(u8, source_path, '/')) |slash| slash + 1 else 0;
-    const dot = std.mem.lastIndexOfScalar(u8, source_path[name_start..], '.') orelse return false;
-    const ext = source_path[name_start + dot + 1 ..];
-    return std.ascii.eqlIgnoreCase(ext, "heic") or std.ascii.eqlIgnoreCase(ext, "heif");
-}
 
 fn outputLabel(output: Output) []const u8 {
     return switch (output) {
@@ -864,25 +747,26 @@ fn outputPath(buffer: []u8, source: []const u8, extension: []const u8) ?[]const 
     return buffer[0 .. stem_end + extension.len];
 }
 
+/// `image.encode`'s request payload: `"<format>\x00<source>\x00<uti>\x00<dest>"`.
+/// The worker needs the source path (it decodes the file itself), the
+/// source UTI (for `chroma.forSource` on the AVIF path), and the
+/// destination it writes atomically. Parsed by `HostBridge.startEncode`.
+///
+/// NUL-delimited, not newline: a macOS path may legally contain `\n` (only
+/// `/` and NUL are forbidden), so a source file named "a\nb.jpg" would
+/// otherwise shift every field. Both variable-length fields are paths.
+fn encodePayload(buffer: []u8, output: Output, source: []const u8, uti: []const u8, dest: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}\x00{s}\x00{s}\x00{s}", .{
+        outputLabel(output), source, uti, dest,
+    }) catch null;
+}
+
 /// Starts one format, or records why it could not start. Every path out of
 /// here leaves the format's outcome non-`.none`, so the join below always
-/// terminates.
-///
-/// `input_path` is what the encoder actually reads — `model.path()` for an
-/// ordinary source, or `converted_path` when the source is HEIC/HEIF. The
-/// DESTINATION is still always derived from `model.path()` (the real
-/// source name), never from `input_path` — a HEIC `photo.heic` must become
-/// `photo.avif`, not something named after the staging file.
-fn beginEncode(model: *Model, fx: *Effects, output: Output, input_path: []const u8) void {
-    // The boot-time presence check resolves both before any user input is
-    // possible; `null` would mean it never answered, and attempting the
-    // spawn is more useful than refusing on a guess.
-    const encoder_present = switch (output) {
-        .avif => model.avifenc_present orelse true,
-        .webp => model.cwebp_present orelse true,
-    };
-    if (!encoder_present) return setOutcome(model, output, .missing_encoder);
-
+/// terminates. The DESTINATION is derived from `model.path()` and written
+/// into the format's path buffer so the result line and Save As can find
+/// it; the worker reads the source and writes that destination itself.
+fn beginEncode(model: *Model, fx: *Effects, output: Output) void {
     const extension = switch (output) {
         .avif => ".avif",
         .webp => ".webp",
@@ -893,9 +777,8 @@ fn beginEncode(model: *Model, fx: *Effects, output: Output, input_path: []const 
     };
     const destination = outputPath(buffer, model.path(), extension) orelse
         return setOutcome(model, output, .encode_failed);
-    // A `.webp` source encoded to WebP would hand the encoder the same
-    // path to read and write. "Overwrite silently" is about a previous
-    // OUTPUT, never the user's source file.
+    // A `.webp` source encoded to WebP would read and overwrite itself.
+    // "Overwrite silently" is about a previous OUTPUT, never the source.
     if (std.mem.eql(u8, destination, model.path())) {
         return setOutcome(model, output, .same_path);
     }
@@ -904,21 +787,19 @@ fn beginEncode(model: *Model, fx: *Effects, output: Output, input_path: []const 
         .webp => model.webp_path_len = destination.len,
     }
 
+    var payload_buffer: [platform.max_dialog_path_bytes * 2 + 128]u8 = undefined;
+    const payload = encodePayload(&payload_buffer, output, model.path(), model.sourceUti(), destination) orelse
+        return setOutcome(model, output, .encode_failed);
+
     setOutcome(model, output, .pending);
-    fx.spawn(.{
+    fx.hostRequest(.{
         .key = switch (output) {
             .avif => avif_encode_key,
             .webp => webp_encode_key,
         },
-        .argv = switch (output) {
-            .avif => &.{ "avifenc", "-q", avif_quality, "--speed", avif_speed, input_path, destination },
-            .webp => &.{ "cwebp", "-q", webp_quality, input_path, "-o", destination },
-        },
-        // `.collect` rather than `.lines`: the encoders' progress output is
-        // of no use to the UI, and collect is the mode that also delivers
-        // `stderr_tail` on a nonzero exit.
-        .output = .collect,
-        .on_exit = Effects.exitMsg(.encode_result),
+        .name = host_image_encode,
+        .payload = payload,
+        .on_result = Effects.hostMsg(.encode_result),
     });
 }
 
@@ -927,12 +808,6 @@ fn beginEncode(model: *Model, fx: *Effects, output: Output, input_path: []const 
 fn failureText(model: *const Model, output: Output, buffer: []u8) []const u8 {
     const label = outputLabel(output);
     return switch (outcomeOf(model, output)) {
-        // Same wording as the launch-time presence check, scoped to the
-        // one format that needs it.
-        .missing_encoder => switch (output) {
-            .avif => "AVIF needs avifenc. Install with: brew install libavif",
-            .webp => "WebP needs cwebp. Install with: brew install webp",
-        },
         .same_path => switch (output) {
             .avif => "Skipped AVIF — the source is already an AVIF file.",
             .webp => "Skipped WebP — the source is already a WebP file.",
@@ -1210,21 +1085,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
 
         .reset => {
-            // Nothing in flight may land on the next model. For the load
-            // chain the cancels ARE the guard (a cancelled host request
-            // delivers nothing); for the encode spawns they pair with the
-            // `status` checks in those arms. Either way cancelling frees
-            // the keys, so an immediate re-pick is not rejected as a
-            // duplicate. `cancel` on an idle key is a no-op.
+            // Nothing in flight may land on the next model. Every hop is
+            // now a HOST request, and a cancelled one delivers no Msg — its
+            // queued answer dies by generation mismatch at drain. An encode
+            // worker already running keeps going and may still write its
+            // output file (there is no process to kill), but its result is
+            // dropped and the `status` check in `.encode_result` is a
+            // second guard. Cancelling also frees the keys, so an immediate
+            // re-pick is not rejected as a duplicate. `cancel` on an idle
+            // key is a no-op.
             fx.cancel(dialog_key);
             fx.cancel(stat_key);
             fx.cancel(probe_key);
             fx.cancel(thumbnail_key);
-            fx.cancel(heic_convert_key);
             fx.cancel(avif_encode_key);
             fx.cancel(webp_encode_key);
-            fx.cancel(avif_stat_key);
-            fx.cancel(webp_stat_key);
             fx.cancel(save_dialog_key);
             fx.cancel(save_copy_key);
             _ = fx.unregisterImage(preview_image_id);
@@ -1245,103 +1120,48 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 
             model.clearResults();
             model.status = .compressing;
-            // HEIC/HEIF cannot go to the encoders directly (see
-            // `isHeicSource`) — stage it as a PNG first, ONE shared spawn
-            // for whichever format(s) were requested, rather than one per
-            // format. `.pending` on each requested outcome is the same
-            // marker `beginEncode` itself would set; `.convert_result`
-            // reads it back to know which formats to actually start.
-            if (isHeicSource(model.path())) {
-                if (model.format != .webp) model.avif_outcome = .pending;
-                if (model.format != .avif) model.webp_outcome = .pending;
-                fx.spawn(.{
-                    .key = heic_convert_key,
-                    .argv = &.{ "/usr/bin/sips", "-s", "format", "png", model.path(), "--out", converted_path },
-                    .output = .collect,
-                    .on_exit = Effects.exitMsg(.convert_result),
-                });
-                return;
-            }
             // Two independent encodes, not one operation with two steps.
-            if (model.format != .webp) beginEncode(model, fx, .avif, model.path());
-            if (model.format != .avif) beginEncode(model, fx, .webp, model.path());
-            // Every requested format may have short-circuited (both
-            // encoders missing), in which case the run is already over.
+            // Each is one `image.encode` host request; the worker decodes
+            // the source (HEIC included — ImageIO reads it directly, so
+            // there is no staging step) and writes the output itself.
+            if (model.format != .webp) beginEncode(model, fx, .avif);
+            if (model.format != .avif) beginEncode(model, fx, .webp);
+            // A requested format may have short-circuited (`same_path`, or
+            // a path that would not fit its buffer), in which case the run
+            // may already be over.
             finishIfComplete(model);
         },
 
-        .convert_result => |exit| {
-            // Same staleness hazard as the rest of the encode chain:
-            // `.reset` cancels this spawn too.
+        .encode_result => |result| {
+            // Staleness: `.reset` cancels the request; a superseded answer
+            // is dropped at drain, and this guard is the backstop.
             if (model.status != .compressing) return;
-            if (exit.reason != .exited or exit.code != 0) {
-                // The staging step is ONE shared prerequisite for whichever
-                // formats were requested, not two independent encoder
-                // failures — fail directly with one sentence rather than
-                // routing through `finishIfComplete`, which would
-                // concatenate the identical message twice in "Both" mode.
-                // Nothing landed either way, so `.failed` is correct here
-                // regardless of how many formats were requested (the same
-                // all-failed floor the single-encoder path already uses).
-                if (model.avif_outcome == .pending) setOutcome(model, .avif, .convert_failed);
-                if (model.webp_outcome == .pending) setOutcome(model, .webp, .convert_failed);
-                return model.fail("Couldn't prepare that HEIC file for encoding.", .{});
-            }
-            if (model.avif_outcome == .pending) beginEncode(model, fx, .avif, converted_path);
-            if (model.webp_outcome == .pending) beginEncode(model, fx, .webp, converted_path);
-            finishIfComplete(model);
-        },
-
-        .encode_result => |exit| {
-            // Same staleness hazard as the load chain: `.reset` cancels
-            // these spawns and the cancellation arrives as an ordinary
-            // nonzero terminal.
-            if (model.status != .compressing) return;
-            const output: Output = if (exit.key == avif_encode_key)
+            const output: Output = if (result.key == avif_encode_key)
                 .avif
-            else if (exit.key == webp_encode_key)
+            else if (result.key == webp_encode_key)
                 .webp
             else
                 return;
-            if (exit.reason != .exited or exit.code != 0) {
-                setOutcome(model, output, .encode_failed);
-                return finishIfComplete(model);
-            }
-            // A zero exit is not yet a result: the output's SIZE is half of
-            // what the UI has to show. `file.stat` (a host command kept
-            // separate for exactly this reuse) answers it, and its failure
-            // is also how a file that never landed is caught.
-            fx.hostRequest(.{
-                .key = switch (output) {
-                    .avif => avif_stat_key,
-                    .webp => webp_stat_key,
-                },
-                .name = host_file_size,
-                .payload = outputPathOf(model, output),
-                .on_result = Effects.hostMsg(.encode_size_result),
-            });
-        },
-
-        .encode_size_result => |result| {
-            if (model.status != .compressing) return;
-            const output: Output = if (result.key == avif_stat_key)
-                .avif
-            else if (result.key == webp_stat_key)
-                .webp
-            else
-                return;
-            const size = if (result.ok)
-                std.fmt.parseInt(u64, result.bytes, 10) catch null
-            else
-                null;
-            if (size) |bytes| {
+            // On success `result.bytes` is the output's size as decimal
+            // text — the worker has already written the file atomically.
+            // On failure it is a short tag: "write" means the encode
+            // produced bytes but the atomic write/rename failed; anything
+            // else (decode or encoder failure) is `encode_failed`.
+            if (result.ok) {
+                const bytes = std.fmt.parseInt(u64, result.bytes, 10) catch {
+                    setOutcome(model, output, .encode_failed);
+                    return finishIfComplete(model);
+                };
                 switch (output) {
                     .avif => model.avif_size = bytes,
                     .webp => model.webp_size = bytes,
                 }
                 setOutcome(model, output, .ok);
             } else {
-                setOutcome(model, output, .write_failed);
+                setOutcome(model, output, if (std.mem.eql(u8, result.bytes, "write"))
+                    .write_failed
+                else
+                    .encode_failed);
             }
             finishIfComplete(model);
         },
@@ -1380,39 +1200,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 setSaveMessage(model, "Couldn't save {s} — check the folder's permissions.", .{outputLabel(output)});
             }
             model.saving = null;
-        },
-
-        .encoder_check_result => |exit| {
-            const found = exit.reason == .exited and exit.code == 0;
-            if (exit.key == avifenc_check_key) {
-                model.avifenc_present = found;
-            } else if (exit.key == cwebp_check_key) {
-                model.cwebp_present = found;
-            }
-            // Join: only decide once BOTH checks have answered, in
-            // whichever order they land.
-            const avifenc_present = model.avifenc_present orelse return;
-            const cwebp_present = model.cwebp_present orelse return;
-            if (avifenc_present and cwebp_present) return;
-            // Three distinct messages (not one templated over a joined
-            // tool list) so each names the exact `brew install` command
-            // for what is actually missing.
-            if (!avifenc_present and !cwebp_present) {
-                return model.fail(
-                    "Smoosh needs avifenc and cwebp to compress images. Install with: brew install libavif webp",
-                    .{},
-                );
-            }
-            if (!avifenc_present) {
-                return model.fail(
-                    "Smoosh needs avifenc to create AVIF files. Install with: brew install libavif",
-                    .{},
-                );
-            }
-            return model.fail(
-                "Smoosh needs cwebp to create WebP files. Install with: brew install webp",
-                .{},
-            );
         },
     }
 }
@@ -1460,20 +1247,32 @@ const HostBridge = struct {
 
     // ------------------------------------------------------ worker carrier
 
-    /// The app's load chain is strictly sequential — one probe, then one
-    /// thumbnail — so a single slot would do in the happy case. Three
-    /// exist for the unhappy one: a reset (or a second drop) mid-load
-    /// leaves the previous worker running, and it must have somewhere to
-    /// finish writing that the new request cannot be handed.
-    const worker_slot_count = 3;
+    /// The load chain is strictly sequential (one probe, then one
+    /// thumbnail), but an encode run issues TWO `image.encode` requests at
+    /// once in Both mode. A `reset` cancels the pending REQUESTS but cannot
+    /// stop a running encode worker — `avifEncoderWrite` has no
+    /// cancellation token — so it runs to completion holding its slot
+    /// (~1 s), then `pollFn` frees it and drops the answer (`abandoned`, or
+    /// the cancel's generation bump, or `.encode_result`'s status guard —
+    /// it is guarded three ways). The slot count only has to outrun how
+    /// fast a person can pile up abandoned encodes: reset -> drop -> smoosh
+    /// is three deliberate actions and neither the drop nor a dialog can be
+    /// automated (see CLAUDE.md), so ~4 workers in flight is the realistic
+    /// ceiling. Eight is unreachable, and a full pool degrades gracefully
+    /// (`startEncode` -> "no worker slot" -> one `.encode_failed`), which
+    /// still beats v0.1's unbounded `avifenc` spawn. Each encode worker
+    /// also holds a full-resolution decode transiently (~w·h·4, ≤200 MB at
+    /// the 50 MP guard); two at once is fine, and the guard has already run
+    /// off `probe` before any encode starts.
+    const worker_slot_count = 8;
 
-    const Job = enum { probe, thumbnail };
+    const Job = enum { probe, thumbnail, encode_avif, encode_webp };
 
     /// A worker's whole world. Its result buffer is sized for the largest
-    /// answer either job can produce — a full 160x160 preview — because
-    /// the thumbnail's pixels RIDE the host result rather than sitting in
-    /// a shared global (see `parsePreviewReply`). Per-slot rather than
-    /// shared is what makes an abandoned worker harmless.
+    /// answer any job can produce — a full 160x160 preview (the encode
+    /// jobs reply with just a size string). Per-slot rather than shared is
+    /// what makes an abandoned worker harmless. The encode jobs also carry
+    /// a destination path and the source UTI.
     const Slot = struct {
         key: u64 = 0,
         job: Job = .probe,
@@ -1488,6 +1287,12 @@ const HostBridge = struct {
         thread: ?std.Thread = null,
         path_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
         path_len: usize = 0,
+        /// Encode jobs only: where the worker writes the output file.
+        dest_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
+        dest_len: usize = 0,
+        /// Encode jobs only: the source UTI, for `chroma.forSource`.
+        uti_buffer: [imageio.max_uti_bytes]u8 = undefined,
+        uti_len: usize = 0,
         result: [thumbnail_reply_header + imageio.max_thumbnail_edge * imageio.max_thumbnail_edge * 4]u8 = undefined,
         result_len: usize = 0,
         ok: bool = false,
@@ -1498,6 +1303,12 @@ const HostBridge = struct {
 
         fn path(slot: *const Slot) []const u8 {
             return slot.path_buffer[0..slot.path_len];
+        }
+        fn dest(slot: *const Slot) []const u8 {
+            return slot.dest_buffer[0..slot.dest_len];
+        }
+        fn uti(slot: *const Slot) []const u8 {
+            return slot.uti_buffer[0..slot.uti_len];
         }
     };
 
@@ -1544,11 +1355,48 @@ const HostBridge = struct {
         // Returns WITHOUT answering: the mailbox is the only route out.
     }
 
-    /// Worker thread. Both jobs are pure `imageio` calls over a path —
-    /// no SDK, no Model, no allocator — which is what makes running them
-    /// here safe at all.
+    /// `image.encode`'s request handler (loop thread). `payload` is
+    /// `"<format>\x00<source>\x00<uti>\x00<dest>"` — see `main.encodePayload`
+    /// (NUL-delimited because a path may contain `\n`). Parses it, then
+    /// hands the worker a source path, a destination and a UTI; the worker
+    /// does the decode + encode + atomic write.
+    fn startEncode(self: *HostBridge, key: u64, payload: []const u8) void {
+        var it = std.mem.splitScalar(u8, payload, 0);
+        const format = it.next() orelse return self.reply(key, false, "malformed encode request");
+        const source = it.next() orelse return self.reply(key, false, "malformed encode request");
+        const source_uti = it.next() orelse return self.reply(key, false, "malformed encode request");
+        const destination = it.rest();
+        const job: Job = if (std.mem.eql(u8, format, "AVIF"))
+            .encode_avif
+        else if (std.mem.eql(u8, format, "WebP"))
+            .encode_webp
+        else
+            return self.reply(key, false, "unknown encode format");
+
+        self.abandon(key);
+        const slot = self.claim(key, job, source) orelse
+            return self.reply(key, false, "no worker slot");
+        const dest_len = @min(destination.len, slot.dest_buffer.len);
+        @memcpy(slot.dest_buffer[0..dest_len], destination[0..dest_len]);
+        slot.dest_len = dest_len;
+        const uti_len = @min(source_uti.len, slot.uti_buffer.len);
+        @memcpy(slot.uti_buffer[0..uti_len], source_uti[0..uti_len]);
+        slot.uti_len = uti_len;
+
+        slot.thread = std.Thread.spawn(.{}, workerMain, .{ self, slot }) catch {
+            slot.busy = false;
+            return self.reply(key, false, "thread spawn failed");
+        };
+    }
+
+    /// Worker thread. The probe/thumbnail jobs are pure `imageio` calls
+    /// over a path — no SDK, no Model, no allocator. The encode jobs go
+    /// further: they decode at full resolution (page allocator), run
+    /// libavif/libwebp through `encoders`, and write the output file
+    /// atomically via `self.io`. Still no SDK and no Model.
     fn workerMain(self: *HostBridge, slot: *Slot) void {
         switch (slot.job) {
+            .encode_avif, .encode_webp => self.runEncode(slot),
             .probe => {
                 const info = imageio.probe(slot.path()) catch |err| {
                     return self.finish(slot, false, @errorName(err));
@@ -1582,6 +1430,66 @@ const HostBridge = struct {
                 self.wake();
             },
         }
+    }
+
+    /// WORKER THREAD. The encode job in full: decode the source at full
+    /// resolution, run the vendored encoder, write the output atomically,
+    /// reply with the output's byte size. On failure the reply tag is
+    /// "write" if only the atomic write/rename failed (the encode itself
+    /// produced bytes), "encode" otherwise.
+    fn runEncode(self: *HostBridge, slot: *Slot) void {
+        const gpa = std.heap.page_allocator;
+
+        var decoded = imageio.decode(gpa, slot.path()) catch
+            return self.finish(slot, false, "encode");
+        defer decoded.deinit(gpa);
+
+        var encoded = (if (slot.job == .encode_avif)
+            encoders.encodeAvif(
+                decoded.pixels,
+                decoded.width,
+                decoded.height,
+                jpegSubsampling(gpa, self.io, slot.path(), slot.uti()),
+            )
+        else
+            encoders.encodeWebp(decoded.pixels, decoded.width, decoded.height)) catch
+            return self.finish(slot, false, "encode");
+        defer encoded.deinit();
+
+        atomicWrite(self.io, slot.dest(), encoded.bytes) catch
+            return self.finish(slot, false, "write");
+
+        const text = std.fmt.bufPrint(&slot.result, "{d}", .{encoded.bytes.len}) catch
+            return self.finish(slot, false, "encode");
+        slot.result_len = text.len;
+        slot.ok = true;
+        slot.done.store(true, .release);
+        self.wake();
+    }
+
+    /// The chroma format `avifenc --yuv auto` would have picked for this
+    /// source, reproduced from the container. Only a JPEG needs the file
+    /// scanned; `chroma.forSource` answers everything else off the UTI
+    /// alone. Any read failure falls back to 4:4:4 — the guess that cannot
+    /// lose chroma detail (`chroma.zig` says why).
+    fn jpegSubsampling(gpa: std.mem.Allocator, io: std.Io, path: []const u8, source_uti: []const u8) chroma.Subsampling {
+        if (!std.mem.eql(u8, source_uti, chroma.jpeg_uti)) return chroma.forSource(source_uti, "");
+        const head = gpa.alloc(u8, chroma.jpeg_scan_bytes) catch return .yuv444;
+        defer gpa.free(head);
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return .yuv444;
+        defer file.close(io);
+        const n = file.readPositionalAll(io, head, 0) catch return .yuv444;
+        return chroma.forSource(source_uti, head[0..n]);
+    }
+
+    /// Write `bytes` to `dest` atomically: a temp sibling in the
+    /// destination directory, then a rename onto `dest`. A crash mid-write
+    /// leaves the temp, never a truncated `dest`.
+    fn atomicWrite(io: std.Io, dest: []const u8, bytes: []const u8) !void {
+        var atomic = try std.Io.Dir.cwd().createFileAtomic(io, dest, .{ .replace = true });
+        defer atomic.deinit(io);
+        try atomic.file.writeStreamingAll(io, bytes);
+        try atomic.replace(io);
     }
 
     /// WORKER THREAD: park a short answer and nudge the loop. The two
@@ -1663,10 +1571,11 @@ const HostBridge = struct {
         if (std.mem.eql(u8, name, host_file_size)) return self.fileSize(key, payload);
         if (std.mem.eql(u8, name, host_save_file)) return self.saveFile(key, payload);
         if (std.mem.eql(u8, name, host_file_copy)) return self.copyFile(key, payload);
-        // The two ImageIO reads return without answering — see the worker
-        // carrier above.
+        // The ImageIO reads and the encode return without answering — see
+        // the worker carrier above.
         if (std.mem.eql(u8, name, host_image_probe)) return self.startWorker(key, .probe, payload);
         if (std.mem.eql(u8, name, host_image_thumbnail)) return self.startWorker(key, .thumbnail, payload);
+        if (std.mem.eql(u8, name, host_image_encode)) return self.startEncode(key, payload);
         self.reply(key, false, "unknown host command");
     }
 
@@ -1740,44 +1649,6 @@ const HostBridge = struct {
     }
 };
 
-/// Resolves `converted_path`, the app-temp file `sips` stages a HEIC
-/// source into before the encoders read it. Only one caller remains: M13
-/// retired the preview's own temp file (ImageIO hands back pixels, so
-/// there is nothing to write), and M14 retires this one with the staging
-/// step itself.
-///
-/// `dir_buf`/`path_buf` stay caller-owned rather than function-local
-/// statics so a second resolved path could coexist with this one — which
-/// is how it was used until the preview stopped needing a file.
-fn resolveAppTempPath(
-    io: std.Io,
-    environ: std.process.Environ,
-    filename: []const u8,
-    dir_buf: []u8,
-    path_buf: []u8,
-) ![]const u8 {
-    const State = struct {
-        /// `getPosix` hands back a sentinel slice; `app_dirs.Env` wants a
-        /// plain one, and the optional blocks the implicit coercion.
-        fn env(block: std.process.Environ, key: []const u8) ?[]const u8 {
-            const value = block.getPosix(key) orelse return null;
-            return value;
-        }
-    };
-    const dir = try app_dirs.resolveOne(
-        .{ .name = "smoosh" },
-        app_dirs.currentPlatform(),
-        .{ .home = State.env(environ, "HOME"), .tmpdir = State.env(environ, "TMPDIR") },
-        .temp,
-        dir_buf,
-    );
-    try std.Io.Dir.cwd().createDirPath(io, dir);
-    return app_dirs.join(app_dirs.currentPlatform(), path_buf, &.{ dir, filename });
-}
-
-var converted_dir_buf: [platform.max_dialog_path_bytes]u8 = undefined;
-var converted_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
-
 pub fn main(init: std.process.Init) !void {
     const app_info: platform.AppInfo = .{
         .app_name = "smoosh",
@@ -1807,7 +1678,7 @@ pub fn main(init: std.process.Init) !void {
     // — defers unwind in reverse. `Effects.deinit` calls `shutdown_fn` with
     // this pointer to join a worker that may still be decoding, so freeing
     // the bridge first would be a use-after-free at quit. Heap rather than
-    // `main`'s stack because it carries three worker slots with a 100 KiB
+    // `main`'s stack because it carries five worker slots with a 100 KiB
     // reply buffer each, and a worker holds a `*Slot` into it while it runs.
     const bridge = try std.heap.page_allocator.create(HostBridge);
     defer std.heap.page_allocator.destroy(bridge);
@@ -1817,7 +1688,6 @@ pub fn main(init: std.process.Init) !void {
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .update_fx = update,
-        .init_fx = initFx,
         .on_drop = onDrop,
         .markup = .{
             .source = app_markup,
@@ -1826,8 +1696,6 @@ pub fn main(init: std.process.Init) !void {
         },
     });
     defer app_state.destroy();
-
-    spawn_environ = try resolveSpawnEnviron(std.heap.page_allocator, init.minimal.environ);
 
     const runtime = try std.heap.page_allocator.create(native_sdk.Runtime);
     defer std.heap.page_allocator.destroy(runtime);
@@ -1843,18 +1711,16 @@ pub fn main(init: std.process.Init) !void {
             ".zig-cache/native-sdk-automation",
             window_title,
         ) else null,
-        .environ = spawn_environ,
     });
-
-    converted_path = try resolveAppTempPath(init.io, spawn_environ, "converted.png", &converted_dir_buf, &converted_path_buf);
 
     bridge.* = .{ .runtime = runtime, .app_state = app_state, .io = init.io };
     app_state.effects.bindHostCalls(.{
         .context = bridge,
         .request_fn = HostBridge.requestFn,
         .send_fn = HostBridge.sendFn,
-        // The worker carrier: without these four, `image.probe` and
-        // `image.thumbnail` would park answers nobody ever drains.
+        // The worker carrier: without these four, `image.probe`,
+        // `image.thumbnail` and `image.encode` would park answers nobody
+        // ever drains.
         .poll_fn = HostBridge.pollFn,
         .pending_fn = HostBridge.pendingFn,
         .bind_services_fn = HostBridge.bindServicesFn,

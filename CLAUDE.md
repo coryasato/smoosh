@@ -11,11 +11,12 @@ Goal: replace the "upload to TinyPNG / Squoosh / browser tab" workflow with a ze
   - **Zig core** (`src/main.zig`) — `Model` struct, `Msg` union, `update` fn, run through `native_sdk.UiApp(Model, Msg)`. **Not TypeScript** — see "Why Zig, not TS-core" below.
   - Pure `Model` / `Msg` / `update` architecture + effects channel (`fx`)
 - **Platform**: macOS only (for now)
-- **Image handling**:
-  - Decode/preview: Apple ImageIO, called from Zig (`src/imageio.zig`) — landed in M13, and the
-    full-resolution encoder-input decode landed in M14b.
-  - Encode: still system tools via `fx.spawn` (`avifenc`, `cwebp`). The vendored libavif/libaom/
-    libwebp archives are already linked in (M14a) but nothing calls them yet; M14c swaps the seam.
+- **Image handling** (all native as of M14c — the app spawns no subprocess):
+  - Decode/preview: Apple ImageIO, called from Zig (`src/imageio.zig`). `probe`/`thumbnail` landed
+    M13; the full-resolution encoder-input `decode` landed M14b.
+  - Encode: vendored static libavif/libaom/libwebp, via a C shim (`src/encode.c`) that
+    `src/encoders.zig` declares. Runs in the `image.encode` worker (`main.zig`'s `HostBridge`),
+    which decodes -> encodes -> writes the output atomically, off the loop thread. Landed M14c.
 
 ## Why Zig, not TS-core
 Originally planned as a TS-core app (`src/core.ts`, "no JS runtime in binary" — see git history). Reversed after spiking file acquisition: native open/save dialogs (`native-sdk.dialog.openFile`/`saveFile`) and file drops are gated behind `RunOptions.bridge`/`.builtin_bridge`, fields that only exist on hand-authored `main.zig`. Verified from source (`@native-sdk/cli@0.8.0`'s `build/app.zig`): `addApp`'s `AppOptions` has no passthrough for them, the CLI-generated TS-core `main.zig` hardcodes them off with no override, and the build hard-panics if a tree carries both `src/core.ts` and `src/main.zig` ("an app has exactly one core"). There is no partial-adoption path — TS-core categorically cannot reach these. Confirmed by building and `native check`-validating a throwaway spike app, not by reading docs alone.
@@ -38,7 +39,7 @@ re-enters the exact same load chain a picked one does. Full spec and source cita
 2. **Predictable Native SDK patterns** — keep `update` pure, all I/O via the effects channel (`fx`), explicit messages.
 3. **Beautiful by default** — lean on Native SDK design tokens and built-in components.
 4. **Fast feedback** — preview + size delta should appear quickly.
-5. **Honest about constraints** — Native SDK has no built-in encoder. We start with system tools, then move to a fully native Zig pipeline.
+5. **Honest about constraints** — Native SDK has no built-in encoder. v0.1 shelled out to system tools; Phase B replaced them with vendored libavif/libaom/libwebp linked into the binary (no subprocess, no dependency).
 6. **macOS-first** — optimize for Apple Silicon and ImageIO. No Linux/Windows scope in v0.1.
 
 ## Working in this repo
@@ -99,24 +100,29 @@ the failure appears solely in the test artifact. `linkFramework` also needs an e
 - `src/imageio.zig` — the whole ImageIO C-ABI seam (`extern fn`, not `@cImport`): `probe`,
   `thumbnail` and `decode`, all callable from a worker thread and all returning straight-alpha
   8-bit sRGB. `probe` and `thumbnail` are host commands; **`decode` deliberately is not** — a
-  full-resolution buffer cannot ride the 256 KiB host result, and M14c's encode worker (its only
-  caller) is already off the loop thread. `decode` applies the EXIF orientation BY HAND, through
-  three scalar CTM calls rather than `CGContextConcatCTM`; the header says why.
+  full-resolution buffer cannot ride the 256 KiB host result, and its one caller (the
+  `image.encode` worker) is already off the loop thread. `decode` applies the EXIF orientation BY
+  HAND, through three scalar CTM calls rather than `CGContextConcatCTM`; the header says why.
 - `src/chroma.zig` — the source-container chroma table plus the hand-rolled JPEG SOF parser, which
   is how `avifenc --yuv auto`'s behaviour survives decoding everything to RGBA. Pure over bytes.
-  **Nothing calls it yet** — M14c's libavif seam is its only consumer.
+  The `image.encode` worker calls `forSource` to pick libavif's `yuvFormat` for a JPEG source.
 - `src/imageio_tests.zig` — its tests. Imported by `main.zig`'s `test` block and run by
   `native test` like everything else, since M14a. (It used to be a file nothing imported, run by
   hand — see "Commands" for why, and do not reintroduce that pattern.) Its fixtures are PNGs
   embedded as byte literals, because `test-images/` is gitignored; the orientation tests build
   their own tagged PNGs in-process (ImageIO reads the PNG `eXIf` chunk).
-- `src/encoders.zig` — the Zig-to-encoder seam, the mirror of `imageio.zig`. **M14a wired the
-  build but wrote no encoders**: right now this holds only the three version probes that prove the
-  vendored archives link, and the app still spawns `avifenc`/`cwebp`. The encode functions land in
-  M14c.
+- `src/encoders.zig` — the Zig-to-encoder seam, the mirror of `imageio.zig`. `encodeAvif`/
+  `encodeWebp` (landed M14c) plus the three version probes that pin the archive versions.
+  Unlike `imageio.zig` it does NOT hand-roll the C ABI — the libavif/libwebp encode APIs are
+  struct-heavy, so `src/encode.c` (compiled by `build.zig`, `#include`s the vendored headers)
+  does the struct work and exposes a flat scalar ABI this file declares in three lines.
+- `src/encode.c` — that shim. The only C in the tree. Reproduces `avifenc -q 58 --speed 6` /
+  `cwebp -q 80` through the C APIs; tags sRGB explicitly since the decode drops the ICC profile.
 - `build.zig` / `build.zig.zon` — ours since M14a (see "Toolchain"). `build.zig` links the vendored
-  archives and the ImageIO frameworks into both the exe and the test artifact; its comments record
-  why each line is there.
+  archives + ImageIO frameworks and compiles `src/encode.c` into the exe and the test artifact;
+  its comments record why each line is there — including that the two modules must be
+  de-duplicated (they are the same pointer for `native build`, and adding a `.c` twice is a fatal
+  `duplicate symbol`).
 - `third_party/` — vendored encode-only static archives (libavif, libaom, libwebp + libsharpyuv)
   and the headers for the two APIs we call. `third_party/README.md` records versions, provenance
   and the two traps the build cannot state.
@@ -159,16 +165,18 @@ For a hand-authored root, window geometry is stated three times and all three mu
   Registered images cap at 1 MiB of *decoded* RGBA (512x512), so no real photo can be registered
   directly. The 160px cap is set tighter still by `max_effect_host_result_bytes` (256 KiB), which
   the preview pixels ride; `main.zig` asserts that fit at comptime.
-- Two host commands of our own for ImageIO, `image.probe` and `image.thumbnail`, answered OFF the
-  loop thread through `HostCallBinding`'s worker-carrier trio (`poll_fn`/`pending_fn`/
-  `bind_services_fn`) plus `shutdown_fn`. `feedHostResult` is loop-thread-only — a worker parks its
-  answer in its own slot and calls `services.wake()`. The dialogs and the two file commands still
-  answer synchronously from `request_fn`, which is equally supported and right for them.
-- A second host command bound by hand, `file.stat` — `update` can never hold an `Io`, the bridge can.
-  Reused for output sizes rather than adding a stat spawn.
-- A third, `file.copy` (`std.Io.Dir.copyFileAbsolute`) — Save As copies an already-produced output,
+- Three host commands of our own answered OFF the loop thread through `HostCallBinding`'s
+  worker-carrier trio (`poll_fn`/`pending_fn`/`bind_services_fn`) plus `shutdown_fn`:
+  `image.probe`, `image.thumbnail`, and `image.encode` (one request per output format — decode +
+  encode + atomic write, replies the output size). `feedHostResult` is loop-thread-only — a
+  worker parks its answer in its own slot and calls `services.wake()`. The dialogs and the two
+  file commands answer synchronously from `request_fn`, which is equally supported and right for
+  them.
+- A host command bound by hand, `file.stat` — `update` can never hold an `Io`, the bridge can.
+  Feeds `original_size`.
+- Another, `file.copy` (`std.Io.Dir.copyFileAbsolute`) — Save As copies an already-produced output,
   which `fx.writeFile`'s 1 MiB cap can't hold.
-- `fx.spawn` (system tools: `sips` for HEIC staging only, `avifenc`, `cwebp`, `which`)
+- **No `fx.spawn` anywhere** — as of M14c the app runs no subprocess.
 - Hot-reload on `.native` files (Debug builds, via `.markup.watch_path`)
 - `on_drop` (`UiApp.Options`, SDK 0.8.2+) for real window-wide file drops.
 - Manifest: `capabilities = .{ "native_views", "gpu_surfaces", "file_drops" }` — markup renders onto a
@@ -192,18 +200,14 @@ v0.1 shipped (M1-M12; full history in `docs/plan-v0.1-archive.md`): pick or drop
 AVIF/WebP/Both, Smoosh auto-saves next to the source, optionally Save As to another location,
 packaged as an ad-hoc-signed `.app`.
 
-Phase B M13 (v0.2) is DONE: the load chain runs on ImageIO, both `sips` reads and `fx.loadImage`
-are gone, and the preview now shows the file's primary frame, upright and in sRGB.
-
-**M14b is DONE**: `imageio.decode` and `src/chroma.zig` exist and are tested against the whole
-fixture set, but **neither has a caller** — that is what M14b is. No output byte has moved.
-
-**M14a is DONE too**: the build is ejected and ours, the encode-only archives are vendored under
-`third_party/` and link into both the exe and the test artifact, and `src/imageio_tests.zig` runs
-under `native test` for the first time. **No encoder is called yet** — the app still spawns
-`avifenc`/`cwebp` with the pinned argv, so no output byte has moved and the Homebrew dependency is
-still there. M14c (the encode seams + parity) is all that is left of M14, and is what removes it.
-`native build`/`check`/`test`/`dev`/`package` all clean, zero `check` warnings.
+**Phase B is COMPLETE (v0.3).** M13 put decode/preview/probe on ImageIO; M14a/b/c put encode on
+vendored libavif/libaom/libwebp linked into the binary. **Smoosh has zero dependencies** — it
+spawns no subprocess and needs nothing installed. The encode runs in the `image.encode` worker:
+decode at full resolution -> libavif/libwebp via `src/encode.c` -> atomic write. Parity vs the
+Phase A sizes held (`docs/phase-b-baseline.md` "M14c"): every real photograph and both graphics
+fixtures within ±15%; two rows outside, neither a regression (`multi-primary.heic` was the
+wrong-image bug the primary-frame fix corrects; `alpha16.png` AVIF is a 1.5 KB delta on a
+synthetic gradient). `native build` 10.94 MB, `native test` 114/114, `check` zero warnings.
 **PLAN.md is the source of truth** for what is done and what is next.
 
 Two standing rules from that round, still load-bearing for any future work:

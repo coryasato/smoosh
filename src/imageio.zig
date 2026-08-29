@@ -26,8 +26,9 @@
 //!
 //! The first two are host commands (`image.probe`, `image.thumbnail`).
 //! `decode` is NOT, and deliberately: a full-resolution buffer cannot ride
-//! a 256 KiB host result, and its only caller will be M14c's encode
-//! worker, which is already off the loop thread and can call it directly.
+//! a 256 KiB host result. Its one caller is the `image.encode` worker in
+//! `main.zig`'s `HostBridge`, which is already off the loop thread and
+//! calls it directly (landed M14c).
 //!
 //! THIS FILE'S TESTS LIVE IN `src/imageio_tests.zig`, and **`native test`
 //! RUNS THEM** — `main.zig`'s `test` block imports that file. They stay in
@@ -47,11 +48,9 @@
 //! They need no fixtures — the PNGs are embedded there — so they work on a
 //! fresh clone.
 //!
-//! `decode` LANDED IN M14b AND HAS NO CALLER YET — M14c's libavif and
-//! libwebp seams are its only consumers. That is deliberate (PLAN.md's
-//! M14 split): it is pure logic and fully testable on its own, and
-//! landing it separately keeps M14c to the encoder swap and the parity
-//! investigation.
+//! `decode` landed in M14b; M14c wired it to the `image.encode` worker,
+//! which runs it and then `encoders.encodeAvif`/`encodeWebp` on the
+//! result before writing the output file atomically.
 
 const std = @import("std");
 

@@ -42,6 +42,17 @@ const vendor_archives = [_][]const u8{
 /// under `native test` at all.
 const frameworks = [_][]const u8{ "ImageIO", "CoreGraphics", "CoreFoundation" };
 
+/// The C shim over the struct-heavy libavif / libwebp encode APIs
+/// (`src/encoders.zig`'s header explains why it is C and not Zig
+/// `extern struct`s). It `#include`s `avif/avif.h` and `webp/encode.h`, so
+/// both vendored header roots go on the include path — of BOTH modules,
+/// same reason the archives do.
+const encode_shim = "src/encode.c";
+const header_paths = [_][]const u8{
+    "third_party/libavif/include",
+    "third_party/libwebp/include",
+};
+
 pub fn build(b: *std.Build) void {
     const artifacts = native_sdk.addAppArtifacts(b, b.dependency("native_sdk", .{}), .{
         .name = "smoosh",
@@ -55,8 +66,29 @@ pub fn build(b: *std.Build) void {
     // app_optimize != optimize) that inherits none of it. Miss the test
     // module and a test touching an archive dies at link time on
     // `undefined symbol: _WebPGetEncoderVersion`.
-    for ([_]*std.Build.Module{ artifacts.exe.root_module, artifacts.tests.root_module }) |mod| {
+    //
+    // But when `app_optimize == optimize` — the ReleaseFast `native build`
+    // — the SDK hands back the SAME module for both, so the list must be
+    // de-duplicated: adding a compiled `src/encode.c` twice is a fatal
+    // `duplicate symbol` (linking an `.a` twice was merely wasteful, which
+    // is why M14a's loop got away with it).
+    const exe_mod = artifacts.exe.root_module;
+    const test_mod = artifacts.tests.root_module;
+    const mods: []const *std.Build.Module = if (exe_mod == test_mod)
+        &.{exe_mod}
+    else
+        &.{ exe_mod, test_mod };
+    for (mods) |mod| {
         for (vendor_archives) |archive| mod.addObjectFile(b.path(archive));
+
+        // The encode shim and the headers it needs. `addCSourceFile` pulls
+        // in the C compiler and libc for this module; the archives above
+        // supply every symbol the shim references.
+        for (header_paths) |header_path| mod.addIncludePath(b.path(header_path));
+        mod.addCSourceFile(.{ .file = b.path(encode_shim), .flags = &.{"-std=c11"} });
+        // The shim calls malloc/memcpy and libwebp/libavif expect libc; the
+        // SDK does not link it for us on either module.
+        mod.link_libc = true;
 
         // `linkFramework` alone is not enough: the framework SEARCH PATH is
         // unset on every artifact the SDK does not run its platform wiring

@@ -29,8 +29,9 @@
 //! Everything here is a pure function over bytes: no ImageIO, no
 //! allocation, no I/O. Tested in `src/tests.zig`.
 //!
-//! NOTHING CALLS THIS YET. It lands in M14b with `imageio.decode`; M14c's
-//! libavif seam is its only consumer. See PLAN.md's M14 split.
+//! The one consumer is the `image.encode` worker in `main.zig`'s
+//! `HostBridge` (M14c): for a JPEG source it reads a prefix of the file
+//! and calls `forSource` to pick libavif's `yuvFormat`.
 
 const std = @import("std");
 
