@@ -135,8 +135,8 @@ the failure appears solely in the test artifact. `linkFramework` also needs an e
   `dialog-open-file-spike.zig` (file acquisition), `threaded-host-call-spike.zig` (long work off
   the loop thread), `imageio-decode-spike.zig` (the ImageIO C-ABI seam; builds standalone with
   `zig build-exe … -framework ImageIO -framework CoreGraphics -framework CoreFoundation`),
-  `static-archive-link-spike.zig` (M14's ejected `build.zig` — this one IS a build.zig: copy it,
-  do not `@import` it).
+  The link-path spike that preceded M14's ejected build was **deleted post-Phase-B** — `build.zig`
+  IS its live version and carries all four of its findings as comments. Read `build.zig`.
 - `docs/plan-v0.1-archive.md` — full v0.1 development history (see PLAN.md's header).
 - `docs/phase-b-baseline.md` — the pre-Phase-B measurement of the shipping app (size, PSNR, AVIF
   `yuvFormat`, metadata) plus the fixture-set inventory and how to regenerate it. Append-only: it

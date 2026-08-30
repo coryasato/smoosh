@@ -1108,9 +1108,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // worker already running keeps going and may still write its
             // output file (there is no process to kill), but its result is
             // dropped and the `status` check in `.encode_result` is a
-            // second guard. Cancelling also frees the keys, so an immediate
-            // re-pick is not rejected as a duplicate. `cancel` on an idle
-            // key is a no-op.
+            // second guard. `cancel` on an idle key is a no-op.
+            //
+            // These cancels are about DROPPING STALE ANSWERS, not about
+            // freeing the key space. A same-key host occupancy is REPLACED,
+            // never rejected (`effects.zig`'s `startHostRequest`: "a same-key
+            // HOST occupancy is replaced, never rejected" — the old result
+            // dies by generation mismatch), so a re-pick straight after a
+            // reset would have gone through regardless. Only the other keyed
+            // families — staged images, channels, ptys — reject a busy key,
+            // and Smoosh issues none of them.
             fx.cancel(dialog_key);
             fx.cancel(stat_key);
             fx.cancel(probe_key);

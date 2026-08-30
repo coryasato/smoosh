@@ -25,7 +25,7 @@ where nothing is installed** — no `brew`, no subprocess of any kind. `native t
 are gone. `native test` 108/108, `native check` zero warnings, `native build` clean at 5.5 MB.
 Steps 1-3 (the two prerequisite spikes and the Phase A baseline) were done 2026-08-27.
 **Steps 5 and 6 (both M14 gates) are DONE** (2026-08-28). The link path is proven
-(`docs/spikes/static-archive-link-spike.zig`; `addAppArtifacts` is real in CLI 0.10.1), and so are
+(see `build.zig`; `addAppArtifacts` is real in CLI 0.10.1), and so are
 the artifacts: encode-only `libwebp.a` + `libsharpyuv.a`, `libavif.a` and `libaom.a` are built for
 arm64-macos and link into both a running ReleaseFast exe and the Debug test artifact, at a measured
 cost of +5.20 MiB. Written up in `docs/phase-b-baseline.md` under "Phase B step 6". Nothing in
@@ -221,8 +221,8 @@ as the record of why the build looks the way it does, and `build.zig`'s own comm
 version. The gate was passed earlier still (step 5, 2026-08-28): `addAppArtifacts` is
 public in CLI 0.10.1 and returns `AppArtifacts{ exe, tests, install, run }`, `eject`'s output
 builds, and a prebuilt `libwebp.a` links into the executable and runs. The hand-written-`build.zig`
-fallback is not needed. Four things the spike settled that M14 must carry
-(`docs/spikes/static-archive-link-spike.zig` has the evidence):
+fallback is not needed. Four things the spike settled that M14 must carry (the spike is gone —
+`build.zig` is its live version and carries all four as comments):
 - **Wire BOTH `exe.root_module` and `tests.root_module`.** The exe's module is shared with the
   hidden `-analysis` object and `-model-contract` exe; the test artifact's is a separate Debug
   module that inherits nothing. Miss it and a test touching the archive dies on
@@ -602,6 +602,8 @@ Quick reference; full rationale for each is in `docs/plan-v0.1-archive.md`.
   INTRODUCES — today's subprocess encode never blocks the loop.
 
 ## Known limitations
+
+### Closed by Phase B
 All six entries below were measured while recording the Phase A baseline (`docs/phase-b-baseline.md`)
 and **all six are now closed by Phase B**. Kept here as the record of what the round fixed.
 - **~~Smoosh requires `brew install libavif webp`.~~ CLOSED by M14.** The encoders are vendored
@@ -623,6 +625,18 @@ and **all six are now closed by Phase B**. Kept here as the record of what the r
 - **~~A crash mid-encode can leave a truncated output.~~ CLOSED.** The worker writes
   `<name>.<ext>` via `createFileAtomic` + `replace` — a temp sibling in the destination directory,
   renamed into place. A crash leaves the temp, never a half-written output.
+
+### Open, introduced by Phase B
+- **"Both" decodes the source twice.** The two formats are two independent `image.encode` workers
+  (that independence is the partial-failure decision, and it is what the design wants), and each
+  calls `imageio.decode` on the same file. The cost is **peak memory, not latency**: two
+  full-resolution RGBA buffers are live at once, up to ~400 MB at the 50 MP guard. Wall-clock is
+  not the concern — the two decodes run concurrently on separate threads, where Phase A staged a
+  HEIC once but then wrote an intermediate to disk and had `avifenc` and `cwebp` each decode THAT
+  across three process spawns, largely serially. Whether Phase B is actually slower for a large
+  HEIC has **not been measured**; `avifenc`/`cwebp` are still installed, so it can be, against
+  master. Sharing one decode between the two workers would mean a refcounted buffer outliving both
+  slots — real complexity for a memory win only, so it is a deliberate trade, not an oversight.
 
 ## Next up
 **Phase B is COMPLETE — steps 1-9 are all DONE** (2026-08-27/29). Every spike, both M14 gates,
@@ -657,9 +671,9 @@ apparatus, and re-measured parity — two rows outside ±15%, neither a regressi
    consumer); the preview pixels ride the host result rather than a descriptor, behind a comptime
    assert; the worker carrier ships with an `abandoned` flag the spike did not need. Full account
    in the M13 entry above; live verification in "Verification strategy".
-5. ~~**Spike the link path** — the M14 gate.~~ **DONE** (2026-08-28) —
-   `docs/spikes/static-archive-link-spike.zig`, run against a throwaway `zig-core` app on CLI
-   0.10.1 / Zig 0.16.0. Verdict: works, and the SDK fights it less than expected.
+5. ~~**Spike the link path** — the M14 gate.~~ **DONE** (2026-08-28) — run against a throwaway
+   `zig-core` app on CLI 0.10.1 / Zig 0.16.0; the spike file was deleted post-Phase-B, its
+   findings now living in `build.zig`. Verdict: works, and the SDK fights it less than expected.
    `addAppArtifacts` is public and `native eject`'s output builds; Homebrew's `libwebp.a` links
    into the exe and `WebPGetEncoderVersion` returns 1.6.0 from the running app. Two things beyond
    the plan: `tests.root_module` is a SEPARATE module that must be wired too, and `linkFramework`
@@ -768,3 +782,87 @@ apparatus, and re-measured parity — two rows outside ±15%, neither a regressi
    - The `image.encode` payload is **NUL-delimited**, not newline — a macOS path may contain `\n`.
 
 UI polishing remains unplanned and now sits after a complete Phase B.
+
+## Roadmap — post-Phase-B sessions
+
+Five tracks, written down at the end of the Phase B review session (2026-08-30) so the next
+session can start from a decision rather than re-derive one. **Ordering matters for the first
+two; the rest are independent.** Each carries a model/effort suggestion — these are judgment
+calls about how much of the work is taste versus mechanism, not benchmarks.
+
+### 1 + 4. Condense the markdown, and cut the comments — ONE pass, not two
+**Do this first. It unblocks everything else by making the tree navigable.**
+
+These are the same job. A large fraction of the comment bulk is *history* ("this used to be X
+before M14a", "the `sips -g` hop this replaces"), and that is exactly what a CHANGELOG absorbs —
+so splitting them into two passes means touching every file twice.
+
+Scope: a `CHANGELOG.md` taking the M1-M14 narrative out of PLAN.md and
+`docs/plan-v0.1-archive.md`; PLAN.md shrinking to decisions, requirements and open work; CLAUDE.md
+losing its "Current status" duplication (it already tells itself not to restate PLAN.md, and does).
+
+**The comment rule — use this, not a volume target.** The comments are the most valuable thing in
+this repo and a size-driven cleanup would take out the load-bearing ones first, because they are
+the longest.
+- **Cut:** historical narration, anything a CHANGELOG entry now covers, anything restating what
+  the code plainly says.
+- **Keep:** traps that cost a day to rediscover (`build.zig`'s two modules, the framework search
+  path, the archive link order, the mandatory libsharpyuv), non-obvious WHY (the scalar CTM calls
+  over `CGAffineTransform`, the fixed-width preview header, NUL-delimited payloads), and
+  invariants (`.failed` is always paired with a message; "do not simplify JPEG to 4:2:0").
+
+**Also fold in: delete the two remaining spikes.** `docs/spikes/dialog-open-file-spike.zig` and
+`threaded-host-call-spike.zig` are frozen snapshots whose every conclusion now ships in tested
+code, and a drifted reference is worse than none. ~48 inbound references across 8 files, which is
+why it belongs in this pass rather than on its own. **Salvage first:** the threaded spike's
+measured evidence (a 100 ms timer fired 14 times across a 1.36 s worker and `gpu_frame` advanced
+105 -> 353, proving the loop never blocked) is a measurement, not restatable from the shipping
+code — move it into the CHANGELOG. `imageio-decode-spike.zig` is the only real keep-case (it
+builds standalone, so it can isolate an ImageIO regression from the SDK), but
+`src/imageio_tests.zig` covers the same surface and actually runs. The link-path spike was already
+deleted this way (2026-08-30); `build.zig` is its live version.
+
+*Suggested: **Opus 5, high effort.** Deciding what is load-bearing requires understanding why each
+comment exists, across the whole tree at once — the case where the strongest model earns its cost.*
+
+### 2. Performance
+**Measure before touching anything.** The app is already effectively instant on normal photos, and
+optimizing without a number is how the parity gate gets perturbed for nothing. Every change here
+must be re-checked against `docs/phase-b-baseline.md`.
+
+Ranked by payoff-to-risk:
+- **`drawToRgba8`'s `@memset(pixels, 0)`** — a full-buffer write, up to 200 MB, redundant because
+  our transforms always cover the whole destination. Cheapest real win, no parity risk.
+- **`encoder->maxThreads = 1`** — the single biggest wall-clock lever on large photos. Set for
+  determinism while parity was being established; parity is banked now, so this is re-measurable
+  as a decision rather than a constraint.
+- **libaom rebuilt `-Os` instead of `-O3`** — Homebrew's is 5.4 MB against our 8.1 MB, so this
+  meaningfully cuts the 10.94 MB binary. Needs a full parity re-measure: libaom's rate control
+  carries FP math and optimization level can change contraction.
+- **`copy_out`'s extra malloc+memcpy** of the whole encoded buffer in `src/encode.c` — tidy, low
+  payoff, zero risk.
+- **The Both-mode double decode** — see "Known limitations". Memory, not latency.
+
+*Suggested: **Opus 5, medium** for the measuring and the first two items; **high** if touching
+encoder settings or rebuilding an archive, where the parity judgment is the whole task.*
+
+### 3. UI and style polish
+Independent of everything else — run it whenever. The `design` skill and Claude Design flows fit
+here. Constraint to respect: the app is meant to live in a corner of the desktop, so it must stay
+correct at `window_min_width` (420) and the layout floor recorded in `main.zig`.
+
+*Suggested: **Opus 5, medium.** Iterative and visual; the work is in the looking, not the
+reasoning.*
+
+### 5. The standalone-app review
+This is the umbrella, not a task, and the Phase B review (2026-08-30) already covered its
+correctness half — one real bug found and fixed (the case-insensitive `same_path` collision).
+What it did NOT touch, and what this track should:
+- **arm64-only.** `third_party/README.md` calls x86_64 "unexplored". This is a genuine gap the
+  moment the `.app` is handed to anyone else.
+- **Notarization.** Currently ad-hoc signed; fine for one machine, not for distribution.
+- **The app icon**, still a placeholder (README says so).
+- **Launch time**, never measured.
+
+*Suggested: **Opus 5, high**, or run `/code-review ultra` for the correctness sweep — it is
+user-triggered and billed, so it cannot be launched from inside a session.*

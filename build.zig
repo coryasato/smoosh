@@ -10,10 +10,12 @@
 //! but returns nothing, and `AppOptions` has no link passthrough, so
 //! owning the build is the only route to a vendored encoder.
 //!
-//! Everything below is transplanted from
-//! `docs/spikes/static-archive-link-spike.zig`, which proved it against a
-//! throwaway app first. Read that file's header before changing any of
-//! it — it records why each line is there and what is still unproven.
+//! Everything below was proved against a throwaway `zig-core` app first
+//! (CLI 0.10.1, Zig 0.16.0, macOS 26.6, arm64), in a spike since deleted:
+//! its four findings are the comments in this file, and this file is the
+//! live version of them. THIS is the reference now — the comments below
+//! record why each line is there, and each one has a failure mode that
+//! hides until the other artifact is built.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
