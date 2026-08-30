@@ -1477,6 +1477,68 @@ test "smooshing a WebP source to WebP is skipped rather than overwriting the sou
     try testing.expect(std.mem.indexOf(u8, h.model().warningMessage(), "already a WebP") != null);
 }
 
+test "an uppercase source extension is still the same file, because macOS volumes are" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // THE DATA-LOSS CASE. `Photo.AVIF` derives `Photo.avif`, which is not
+    // byte-equal — but APFS is case-insensitive by default, so the two
+    // name ONE file and the worker's atomic write would replace the user's
+    // original with a lossy re-encode of itself. A byte-exact compare here
+    // shipped exactly that.
+    try h.send(.{ .set_format = .both });
+    try h.load("/Users/someone/Pictures/Photo.AVIF", "204800");
+    try h.send(.smoosh);
+
+    try testing.expect(h.encodeRequest(.avif) == null);
+    // WebP is a different extension either way, so it still runs — the
+    // guard must skip the colliding format, not the whole run.
+    try testing.expect(h.encodeRequest(.webp) != null);
+
+    try h.encodeOk(.webp, "98304");
+
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(std.mem.indexOf(u8, h.model().warningMessage(), "already an AVIF") != null);
+}
+
+test "a mixed-case source extension collides too, and only with its own format" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // `.WebP` is how the format spells its own name, so it is the likeliest
+    // way a real file arrives here.
+    try h.send(.{ .set_format = .both });
+    try h.load("/Users/someone/Pictures/photo.WebP", "204800");
+    try h.send(.smoosh);
+
+    try testing.expect(h.encodeRequest(.webp) == null);
+    try testing.expectEqualStrings(
+        "/Users/someone/Pictures/photo.avif",
+        try h.encodeDest(.avif),
+    );
+}
+
+test "a case-only difference elsewhere in the path is not mistaken for a collision" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // The guard compares the WHOLE path case-insensitively, which is only
+    // safe because everything before the extension is copied verbatim.
+    // A JPEG source can never collide however its directories are cased.
+    try h.send(.{ .set_format = .both });
+    try h.load("/Users/someone/PICTURES/Photo.JPG", "204800");
+    try h.send(.smoosh);
+
+    try testing.expectEqualStrings(
+        "/Users/someone/PICTURES/Photo.avif",
+        try h.encodeDest(.avif),
+    );
+    try testing.expectEqualStrings(
+        "/Users/someone/PICTURES/Photo.webp",
+        try h.encodeDest(.webp),
+    );
+}
+
 test "the output path replaces the source extension, not a dot in a parent directory" {
     var h = try Harness.create();
     defer h.destroy();

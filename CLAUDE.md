@@ -207,7 +207,7 @@ decode at full resolution -> libavif/libwebp via `src/encode.c` -> atomic write.
 Phase A sizes held (`docs/phase-b-baseline.md` "M14c"): every real photograph and both graphics
 fixtures within ±15%; two rows outside, neither a regression (`multi-primary.heic` was the
 wrong-image bug the primary-frame fix corrects; `alpha16.png` AVIF is a 1.5 KB delta on a
-synthetic gradient). `native build` 10.94 MB, `native test` 114/114, `check` zero warnings.
+synthetic gradient). `native build` 10.94 MB, `native test` 118/118, `check` zero warnings.
 **PLAN.md is the source of truth** for what is done and what is next.
 
 Two standing rules from that round, still load-bearing for any future work:

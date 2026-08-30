@@ -14,7 +14,7 @@ file elsewhere, packaged as an ad-hoc-signed `.app`.
 
 **Phase B is COMPLETE (v0.3).** M13 moved decode/preview/probe onto ImageIO; M14 (a/b/c) moved
 encode onto vendored libavif/libaom/libwebp linked into the binary. **Smoosh now runs on a Mac
-where nothing is installed** — no `brew`, no subprocess of any kind. `native test` 114/114,
+where nothing is installed** — no `brew`, no subprocess of any kind. `native test` 118/118,
 `native check` zero warnings, `native build` clean at 10.94 MB. See the M14c entry below and
 `docs/phase-b-baseline.md` "M14c" for the parity re-measurement.
 
@@ -399,17 +399,37 @@ IMPLEMENT — some preserving what Phase A does, some fixing what it does wrong.
 ### Output handling
 - Auto-save next to the source file (e.g. `photo.jpg` → `photo.avif` / `photo.webp`) as soon as "Smoosh" completes — no save dialog in the default path.
 - If an output file already exists, overwrite it silently. Re-running "Smoosh" on the same source is treated as "redo this."
+- **"Overwrite silently" is about a previous OUTPUT, never the source.** A format whose destination
+  would BE the source is skipped (`EncodeOutcome.same_path`), and the comparison is
+  CASE-INSENSITIVE because macOS volumes are: on the default case-insensitive APFS, `Photo.AVIF`
+  and the `Photo.avif` this derives are one file, so a byte-exact compare let the atomic write
+  replace the user's original with a lossy re-encode of itself. Found in the Phase B review and
+  fixed there; pinned by three tests in `src/tests.zig`. Symlinked and hardlinked destinations are
+  still not covered — that needs an `Io` to stat with, which `update` can never hold.
 - Each landed result row carries its own save icon, an optional secondary action to copy that one
   file to a different location; it does not replace auto-save.
 
 ### Error states
 Each maps to a user-facing message and the `.failed` Model state:
-- Encoder binary missing (`avifenc` and/or `cwebp` not found) → name the missing tool + `brew install` command.
-- Unsupported/undecodable input format → name the file and expected formats.
-- Input exceeds size/megapixel limit → show the limit and the file's actual size.
-- Encode failed (non-zero exit from `fx.spawn`) → surface a short, non-technical message; encoder stderr is not surfaced.
-- Write to output path failed (permissions, disk full, read-only volume) → name the reason if known.
-- HEIC/HEIF staging step failed → one shared message, not a per-format one (see "Encoding strategy").
+- Source unreadable (`file.stat` failed) → "Can't read that file."
+- Unsupported/undecodable input → name the expected formats. `image.probe` is the gate, and it
+  reports off the frame COUNT, not a null source (`CGImageSourceCreateWithURL` succeeds on 49
+  bytes of text named `.jpg`).
+- Input exceeds the size or megapixel limit → show the limit and the file's actual size.
+- Preview could not be built (`image.thumbnail` failed, or its reply would not parse) → one
+  message; the load fails rather than showing a card with no image.
+- Encode failed (the worker could not decode the source, or libavif/libwebp rejected the frame) →
+  a short, non-technical message. There is no encoder stderr to surface any more.
+- Write to output path failed (permissions, disk full, read-only volume) → points at the folder.
+- Destination would be the source → skipped, and named as such ("already an AVIF file").
+
+**Three v0.1 error states no longer exist**, and their absence is the point of Phase B: "encoder
+binary missing" (nothing to install), "non-zero exit from `fx.spawn`" (no subprocess), and
+"HEIC/HEIF staging step failed" (ImageIO decodes HEIC directly). Messages naming `brew`, `avifenc`
+or `cwebp` are gone from the app entirely.
+
+In "Both" mode a per-format failure is a WARNING on a `.done` run, not a `.failed` one — only a run
+where no requested format landed sets `.failed` (see "the partial-failure decision" in `main.zig`).
 
 `.failed` is always paired with a populated `error_message_buffer`; the list above enumerates every
 message that can land there, and no other path may set `.failed`.

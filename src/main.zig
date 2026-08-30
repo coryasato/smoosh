@@ -779,7 +779,24 @@ fn beginEncode(model: *Model, fx: *Effects, output: Output) void {
         return setOutcome(model, output, .encode_failed);
     // A `.webp` source encoded to WebP would read and overwrite itself.
     // "Overwrite silently" is about a previous OUTPUT, never the source.
-    if (std.mem.eql(u8, destination, model.path())) {
+    //
+    // CASE-INSENSITIVELY, because macOS volumes are: APFS is
+    // case-insensitive by default, so `Photo.AVIF` and the `Photo.avif`
+    // this derives are ONE FILE, and a byte-exact compare would let the
+    // worker's atomic write land a lossy re-encode on top of the user's
+    // original. Comparing the whole path rather than just the extension is
+    // safe and not a widening: `outputPath` copies everything up to the
+    // stem verbatim, so the two strings can only differ in the extension —
+    // pure ASCII, no Unicode folding question.
+    //
+    // The residual is a genuinely case-SENSITIVE volume (opt-in on macOS),
+    // where `Photo.AVIF` and `Photo.avif` really are two files and this
+    // now skips a legal encode. That trade is deliberate: the failure it
+    // prevents is silent data loss, the one it introduces is a visible
+    // "Skipped AVIF" the user can work around by renaming. Symlinked or
+    // hardlinked destinations are still not covered — catching those needs
+    // an `Io` to stat with, which `update` can never hold.
+    if (std.ascii.eqlIgnoreCase(destination, model.path())) {
         return setOutcome(model, output, .same_path);
     }
     switch (output) {
@@ -1678,8 +1695,9 @@ pub fn main(init: std.process.Init) !void {
     // — defers unwind in reverse. `Effects.deinit` calls `shutdown_fn` with
     // this pointer to join a worker that may still be decoding, so freeing
     // the bridge first would be a use-after-free at quit. Heap rather than
-    // `main`'s stack because it carries five worker slots with a 100 KiB
-    // reply buffer each, and a worker holds a `*Slot` into it while it runs.
+    // `main`'s stack because it carries `worker_slot_count` slots with a
+    // 100 KiB reply buffer each (~820 KB), and a worker holds a `*Slot`
+    // into it while it runs.
     const bridge = try std.heap.page_allocator.create(HostBridge);
     defer std.heap.page_allocator.destroy(bridge);
 

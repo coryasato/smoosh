@@ -62,9 +62,11 @@ pub const jpeg_uti = "public.jpeg";
 /// Read a PREFIX, not a capped whole file: `Io.Dir.readFileAlloc` with a
 /// `.limited(...)` returns `error.StreamTooLong` on anything bigger
 /// rather than truncating, so every real photograph would fail. Open the
-/// file and `readSliceShort` into a buffer of this size instead — which
-/// is also why the parser must tolerate a JPEG cut off mid-segment, and
-/// does (it returns null rather than guessing).
+/// file and `File.readPositionalAll` into a buffer of this size instead
+/// (it fills what it can and returns the count, so a JPEG SMALLER than
+/// this is a short read, not an error) — which is also why the parser
+/// must tolerate a JPEG cut off mid-segment, and does (it returns null
+/// rather than guessing). `main.zig`'s `jpegSubsampling` is the caller.
 pub const jpeg_scan_bytes: usize = 1024 * 1024;
 
 /// The chroma format `avifenc --yuv auto` would have picked for this
