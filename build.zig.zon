@@ -1,0 +1,8 @@
+.{
+    .name = .smoosh,
+    .fingerprint = 0x3a63c5275a707070,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{ .native_sdk = .{ .path = "../../../.npm-global/lib/node_modules/@native-sdk/cli" } },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.zon" },
+}

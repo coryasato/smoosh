@@ -28,12 +28,12 @@
        height lands here rather than stretching the control rows. -->
   <if test="{hasFile}">
     <row key="file" gap="12" cross="center" grow="1">
-      <!-- The preview is a `sips`-generated thumbnail, not the source
-           image — registered images are capped at 512x512 decoded. Drawn
-           at `previewWidth`/`previewHeight`, which clamp the thumbnail to
-           the SOURCE's real dimensions: `sips -Z` upscales anything
-           smaller than 160px, and a 312-byte icon has no business
-           rendering as a blurry 160x160. -->
+      <!-- The preview is an ImageIO thumbnail, not the source image —
+           registered images are capped at 1 MiB of decoded RGBA (512x512),
+           and the 256 KiB host-result cap the pixels ride binds tighter
+           still. Drawn at its own honest size: ImageIO CAPS at 160px
+           rather than upscaling to it, so an 8x8 icon comes back 8x8 and
+           draws 8x8. -->
       <if test="{hasPreview}">
         <!-- A FIXED 168x168 frame (4px around the 160px thumbnail's longest
              edge) with the image centred inside. The image keeps its honest
@@ -43,7 +43,7 @@
              row. -->
         <panel key="preview-frame" width="168" height="168" background="surface_subtle" radius="md">
           <column grow="1" main="center" cross="center">
-            <image image="{image_id}" width="{previewWidth}" height="{previewHeight}" label="Preview of the chosen image" />
+            <image image="{image_id}" width="{preview_width}" height="{preview_height}" label="Preview of the chosen image" />
           </column>
         </panel>
       </if>
