@@ -529,9 +529,9 @@ test "statusLine names every Status, and .failed reports the error message" {
 // drain through the same `.wake` path live platforms use, then assert the
 // model. No GUI, no NSOpenPanel, no ImageIO, no libavif.
 //
-// M13 moved the load chain off spawns and onto HOST REQUESTS; M14c moved
-// the encode half the same way. Nothing in the app spawns a subprocess any
-// more, so every helper below drives `pendingHostAt`/`feedHostResult`.
+// Both halves — the load chain and the encode chain — are HOST REQUESTS.
+// Nothing in the app spawns a subprocess, so every helper below drives
+// `pendingHostAt`/`feedHostResult` rather than `pendingSpawnAt`/`feedExit`.
 
 const App = native_sdk.UiApp(Model, Msg);
 
@@ -806,8 +806,7 @@ test "picking a file lands the real path, its size, and a preview" {
     const probe_request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
     try testing.expectEqualStrings("image.probe", probe_request.name);
     try testing.expectEqualStrings(path, probe_request.payload);
-    // Nothing is spawned anywhere in the load chain any more — the two
-    // `sips` calls M13 replaced were the last of it.
+    // Nothing is spawned anywhere in the load chain.
     try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
 
     // A rotated source: the probe reports DISPLAY dimensions, so 3000x4000
@@ -816,7 +815,7 @@ test "picking a file lands the real path, its size, and a preview" {
     try testing.expectEqual(@as(u32, 3000), h.model().source_width);
     try testing.expectEqual(@as(u32, 4000), h.model().source_height);
     // The container, sniffed by ImageIO rather than read off the
-    // extension — M14's chroma table keys on this.
+    // extension — `chroma.forSource` keys on this.
     try testing.expectEqualStrings("public.jpeg", h.model().sourceUti());
 
     const thumb_request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
@@ -893,7 +892,7 @@ test "a non-image input fails with the supported-formats message" {
 
     try h.pick("/Users/someone/Pictures/not-an-image.jpg");
     try h.stat("128");
-    // THE PROBE is the format gate now, one hop earlier than `sips` was.
+    // THE PROBE is the format gate, before anything is decoded.
     // `imageio.probe` reports `NotAnImage` off the frame count, because
     // `CGImageSourceCreateWithURL` succeeds on 49 bytes of text named
     // `.jpg` and hands back a perfectly non-null source.
@@ -1124,9 +1123,8 @@ test "a file under the byte limit but over the megapixel limit fails, naming the
     const message = h.model().errorMessage();
     try testing.expect(std.mem.indexOf(u8, message, "51") != null);
     try testing.expect(std.mem.indexOf(u8, message, "50 MP") != null);
-    // No decode may be asked for on a file that already failed the limit —
-    // and unlike Phase A, none has happened yet either: the probe read
-    // properties only.
+    // No decode may be asked for on a file that already failed the limit,
+    // and none has happened yet either: the probe read properties only.
     try testing.expectEqual(@as(usize, 0), h.fx().pendingHostCount());
     try testing.expect(!h.model().hasPreview());
 }
@@ -1165,11 +1163,9 @@ test "a garbled probe answer fails the load rather than proceeding blind" {
     var h = try Harness.create();
     defer h.destroy();
 
-    // A DELIBERATE CHANGE from Phase A, where an unparseable `sips -g`
-    // answer was tolerated and the thumbnail spawn was left to decide.
-    // There is no second gate any more — the thumbnail is the same ImageIO
-    // read — so a probe that cannot name the image's size is a file the
-    // preview could not have drawn either.
+    // There is no second gate to fall through to — the thumbnail is the
+    // same ImageIO read — so a probe that cannot name the image's size is
+    // a file the preview could not have drawn either.
     try h.pick("/Users/someone/Pictures/weird.jpg");
     try h.stat("5000000");
     try h.probeRaw(true, "");
@@ -1230,7 +1226,7 @@ test "format survives picking a file, unlike the rest of the model" {
 // The load chain lands in `.ready`; `smoosh` then issues one `image.encode`
 // host request per requested format, whose worker decodes + encodes +
 // writes atomically off the loop thread and replies with the output size.
-// The sizes fed below are the Phase A recorded ones (`large.jpg`
+// The sizes fed below are the recorded baseline ones (`large.jpg`
 // 5,846,465 B -> AVIF 717,003 / WebP 671,054), so a test asserting a size
 // is asserting the model plumbs the worker's answer through unchanged.
 
@@ -1348,7 +1344,7 @@ test "AVIF succeeding while WebP fails is a done run that names WebP" {
     try h.encodeOk(.avif, "717003");
     try h.encodeReply(.webp, false, "encode");
 
-    // THE decision: `.done`, not `.failed`. avifenc already wrote
+    // THE decision: `.done`, not `.failed`. The AVIF worker already wrote
     // large.avif to disk — claiming the run failed would contradict the
     // file sitting next to the source.
     try testing.expectEqual(Status.done, h.model().status);
@@ -1573,9 +1569,9 @@ test "a source path containing a newline still parses the encode payload" {
 
 // -------------------------------------------------------------- HEIC input
 //
-// HEIC used to be staged to a PNG through `sips` before the encoders could
-// read it. M14c deleted that: ImageIO decodes HEIC directly in the encode
-// worker, so a `.heic` source takes the exact same path as any other.
+// ImageIO decodes HEIC directly in the encode worker, so a `.heic` source
+// takes the exact same path as any other — no staging hop, no special case
+// anywhere in `update`.
 
 const photo_heic = "/Users/someone/Pictures/photo.heic";
 const photo_heic_bytes = "2202009";
@@ -1589,7 +1585,7 @@ test "a HEIC source encodes directly, with no staging step" {
     try h.send(.smoosh);
 
     try testing.expectEqual(Status.compressing, h.model().status);
-    // Straight to the encode request — no `sips`, nothing spawned.
+    // Straight to the encode request, with nothing spawned.
     try testing.expectEqual(@as(usize, 0), h.fx().pendingSpawnCount());
     try testing.expectEqual(@as(usize, 1), h.fx().pendingHostCount());
     try testing.expectEqualStrings(
@@ -2195,10 +2191,9 @@ test "a small source draws at its own size, with no clamp left to do it" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Phase A needed a clamp here: `sips -Z 160` UPSCALED anything smaller
-    // than 160px, so `tiny.png` (8x8) came back a 160x160 blur and the
-    // drawn size had to be pulled back to the source's. ImageIO CAPS
-    // instead of upscaling — measured over the whole fixture set, where
+    // No clamp is needed against the source dimensions: ImageIO CAPS
+    // rather than upscaling a source smaller than the thumbnail edge —
+    // measured over the whole fixture set, where
     // `tiny.png` returns 8x8 and `small.png` returns 64x64 — so the
     // registered size is already honest and the markup binds it directly.
     var h = try Harness.create();
@@ -2248,10 +2243,7 @@ test "the preview renders only once an image is registered" {
 // they are pinned here rather than only through the dispatch path.
 //
 // THE IMAGEIO-CALLING HALF IS IN `src/imageio_tests.zig`, which `native
-// test` also runs since M14a — the split is now just tidiness, not the
-// link constraint it used to be (the test artifact linked no frameworks,
-// so anything touching `imageio.probe` died on `_CFRelease`). Read that
-// file's header before moving anything across.
+// test` also runs. The split is tidiness, not a constraint.
 
 test "parseProbeReply reads dimensions, orientation and the UTI" {
     const info = main.parseProbeReply("3000 4000 6 public.jpeg") orelse return error.NotParsed;
@@ -2488,9 +2480,9 @@ test "a drop clears the previous file's results and preview, like a pick does" {
 }
 
 // ---------------------------------------------------------------------
-// The vendored encoders: M14a wired the archives, M14c calls them.
+// The vendored encoders.
 //
-// The version probes pin what the Phase A baseline was measured against,
+// The version probes pin what the recorded baseline was measured against,
 // so a re-copied archive cannot change the encoder out from under
 // `docs/phase-b-baseline.md` without a test going red. That they run HERE,
 // in the test artifact, is half the link proof: `tests.root_module` is a
@@ -2499,8 +2491,8 @@ test "a drop clears the previous file's results and preview, like a pick does" {
 //
 // The encode smoke tests run REAL libavif/libaom/libwebp in-process — the
 // encode seam links and produces a well-formed container. Byte-level
-// parity against Phase A is a separate exercise (`docs/phase-b-baseline.md`,
-// "M14c"), not a unit test.
+// parity against the baseline is a separate exercise
+// (`docs/phase-b-baseline.md`, "M14c"), not a unit test.
 
 test "libwebp links, at the version the baseline was measured against" {
     try testing.expectEqual(encoders.pinned.libwebp, encoders.libwebpVersion());
@@ -2572,11 +2564,11 @@ test "encodeAvif honours the requested chroma subsampling" {
 
 // ================================================================= chroma
 //
-// M14b: reproducing `avifenc --yuv auto` from the source container, which
-// is the one thing decoding to RGBA would otherwise destroy. The expected
-// values below are not invented — every one is the `AVIF yuv` column
+// Reproducing `avifenc --yuv auto` from the source container, which is the
+// one thing decoding to RGBA would otherwise destroy. The expected values
+// below are not invented — every one is the `AVIF yuv` column
 // `docs/phase-b-baseline.md` measured on the real fixture, so a change
-// here is a change against the shipped v0.1 output.
+// here is a change against the recorded output.
 //
 // The JPEG headers are synthesized rather than read from `test-images/`
 // (gitignored). Only the marker structure matters to the parser, so a
@@ -2613,7 +2605,7 @@ fn jpegHeader(buffer: []u8, components: u8, h: u4, v: u4) []const u8 {
     return buffer[0..length];
 }
 
-test "parseJpegSampling reads the chroma format Phase A measured, per fixture" {
+test "parseJpegSampling reads the chroma format the baseline measured, per fixture" {
     var buffer: [64]u8 = undefined;
 
     // `large.jpg` and `rotated-gps.jpg`: photographs, and 4:4:4 anyway

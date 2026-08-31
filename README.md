@@ -24,10 +24,11 @@ auto-saved original.
 
 Ships as a `.app` (`native package --target macos --signing adhoc`) — ad-hoc
 signed, not notarized (no Apple Developer account behind this build; fine for a
-single-machine local tool, see PLAN.md's M10 entry). The app icon is a rough
-placeholder pending a proper design pass, also noted there.
+single-machine local tool). The app icon is a rough placeholder pending a proper
+design pass.
 
-See [PLAN.md](PLAN.md) for milestones, locked decisions, and open questions.
+See [PLAN.md](PLAN.md) for locked decisions, requirements, and what's next.
+See [CHANGELOG.md](CHANGELOG.md) for how it got here.
 See [CLAUDE.md](CLAUDE.md) for working context and toolchain notes.
 
 ## How it works
@@ -39,12 +40,12 @@ the binary.
 
 Encoding got there in phases:
 
-- **Phase A (v0.1)** — shelled out to `sips`, `avifenc` and `cwebp` through the
-  effects channel's `fx.spawn`. Fast to build, fast to iterate on the UI.
-- **Phase B (v0.2 / v0.3)** — decode moved to Apple's ImageIO
-  (`src/imageio.zig`), then encode to statically linked libavif / libaom /
-  libwebp via a small C shim (`src/encode.c`). Both run on a worker thread. No
-  subprocess touches your image, and the binary is self-contained.
+- **v0.1** — shelled out to `sips`, `avifenc` and `cwebp` through the effects
+  channel's `fx.spawn`. Fast to build, fast to iterate on the UI.
+- **v0.2 / v0.3** — decode moved to Apple's ImageIO (`src/imageio.zig`), then
+  encode to statically linked libavif / libaom / libwebp via a small C shim
+  (`src/encode.c`). Both run on a worker thread. No subprocess touches your
+  image, and the binary is self-contained.
 
 ## Requirements
 
@@ -85,19 +86,22 @@ verified against the running app.
 ## Layout
 
 ```
-src/main.zig      the app: Model, Msg, update, effects        (added in M1)
-src/app.native    the view                                    (added in M2)
-src/imageio.zig   the ImageIO seam: probe + thumbnail         (added in M13)
+src/main.zig      the app: Model, Msg, update, effects
+src/app.native    the view
+src/imageio.zig   the ImageIO seam: probe, thumbnail, decode
+src/encoders.zig  the encoder seam, over the C shim in src/encode.c
+src/chroma.zig    the source-container chroma table + JPEG SOF parser
+third_party/      vendored encode-only static archives
 app.zon           identity, window, permissions, capabilities
-docs/spikes/      proven reference implementations; not built as part of the app
-PLAN.md           milestones and decisions
+PLAN.md           decisions, requirements, what's next
+CHANGELOG.md      development history
 CLAUDE.md         working context for AI assistants
 ```
 
 `package.json`, `tsconfig.json`, and `src/core.ts` were an abandoned TypeScript
-core; deleted in M1, no npm/bun surface remains in this tree.
+core; no npm/bun surface remains in this tree.
 
-## Non-goals for v0.1
+## Non-goals
 
 Batch processing, quality sliders, side-by-side comparison, animated images, SVG,
 in-app editing, cloud upload or history, and any dependency on Node, ImageMagick,

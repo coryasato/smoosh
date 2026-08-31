@@ -56,7 +56,7 @@ int smoosh_encode_avif(const uint8_t *rgba, int w, int h,
     if (!image) return 1;
 
     // Tag sRGB explicitly. The decode has already converted to sRGB and
-    // dropped the ICC profile (Phase B strips metadata unconditionally), so
+    // dropped the ICC profile (Smoosh strips metadata unconditionally), so
     // without this the output would carry no color signalling at all.
     // matrixCoefficients BT601 matches avifenc's default for a non-identity
     // matrix.
@@ -83,8 +83,10 @@ int smoosh_encode_avif(const uint8_t *rgba, int w, int h,
     encoder->qualityAlpha = quality;
     encoder->speed = speed;
     // Single-threaded on purpose: libaom's rate control carries FP math and
-    // the parity gate compares byte sizes against the Phase A baseline.
-    // Determinism beats the few ms a second thread would save here.
+    // the parity gate compares byte sizes against the recorded baseline
+    // (`docs/phase-b-baseline.md`). Determinism beat the few ms a second
+    // thread would save while parity was being established; PLAN.md's
+    // roadmap lists revisiting this now that parity is banked.
     encoder->maxThreads = 1;
 
     if (avifEncoderWrite(encoder, image, &output) != AVIF_RESULT_OK) goto done;
@@ -100,7 +102,7 @@ done:
 // `WebPEncodeRGBA` is `cwebp -q <q>` with nothing else set: it runs
 // `WebPConfigInit` (method 4, the cwebp default), applies the quality, then
 // `WebPPictureImportRGBA` + `WebPEncode`. No metadata is attached, matching
-// Phase B's unconditional strip.
+// the unconditional strip.
 int smoosh_encode_webp(const uint8_t *rgba, int w, int h, int quality,
                        uint8_t **out, size_t *out_len) {
     if (w <= 0 || h <= 0) return 1;

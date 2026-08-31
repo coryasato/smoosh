@@ -60,10 +60,13 @@ not. The object-level diff is in `docs/phase-b-baseline.md`.
    `avifenc` used. Nothing in the build reports this.
 2. **These are `-O3` (upstream Release) where Homebrew's are `-Os`.** That
    is why ours is 8.1 MB against Homebrew's 5.4 MB despite 13 fewer
-   objects. libaom's rate control carries floating-point math and
-   optimization level can change FP contraction, so **output parity with
-   the Phase A baseline is NOT proven** and must be re-measured when the
-   encoders are actually called (M14c), not reasoned about.
+   objects. Output parity against the baseline HAS been measured with
+   these archives (`docs/phase-b-baseline.md`, "M14c") — but libaom's rate
+   control carries floating-point math and optimization level can change
+   FP contraction, so **rebuilding at a different optimization level
+   invalidates that measurement** and must be re-measured, not reasoned
+   about. PLAN.md's roadmap lists an `-Os` rebuild as a size win on
+   exactly those terms.
 
 ## Updating
 

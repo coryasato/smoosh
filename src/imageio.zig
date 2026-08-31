@@ -3,17 +3,12 @@
 //! channel — these are plain functions over a path, called from a WORKER
 //! THREAD by `main.zig`'s `HostBridge` (see its "worker carrier" section).
 //!
-//! Transplanted from `docs/spikes/imageio-decode-spike.zig`, which proved
-//! every claim below against the whole fixture set. Read that file's
-//! header before changing anything here.
-//!
 //! `extern fn` rather than `@cImport`: every type here is an opaque
 //! pointer or a plain scalar, so declaring them by hand costs less than
 //! wiring a header search. ImageIO, CoreGraphics and CoreFoundation are
-//! now linked EXPLICITLY — `build.zig` states all three on both the exe
-//! and the test module, as of M14a. Before that the app relied on AppKit
-//! pulling them in transitively (confirmed with `otool -L`, not assumed),
-//! and the test artifact got them not at all.
+//! linked EXPLICITLY — `build.zig` states all three on both the exe and
+//! the test module. Do not go back to relying on AppKit to pull them in
+//! transitively: the test artifact never got them that way.
 //!
 //! THREE reads live here, deliberately separate because their costs are
 //! nothing alike:
@@ -27,30 +22,13 @@
 //! The first two are host commands (`image.probe`, `image.thumbnail`).
 //! `decode` is NOT, and deliberately: a full-resolution buffer cannot ride
 //! a 256 KiB host result. Its one caller is the `image.encode` worker in
-//! `main.zig`'s `HostBridge`, which is already off the loop thread and
-//! calls it directly (landed M14c).
+//! `main.zig`'s `HostBridge`, which is already off the loop thread, calls
+//! it directly, and then runs `encoders.encodeAvif`/`encodeWebp` on the
+//! result.
 //!
-//! THIS FILE'S TESTS LIVE IN `src/imageio_tests.zig`, and **`native test`
-//! RUNS THEM** — `main.zig`'s `test` block imports that file. They stay in
-//! their own file rather than moving into `src/tests.zig` only because
-//! they are a coherent set about one seam; nothing forces the split any
-//! more.
-//!
-//! It used to. The SDK builds its test artifact from a separate Debug
-//! module (`build/app.zig`'s `test_app_mod`, which diverges from the app
-//! module because `app_optimize` is ReleaseFast) and `linkPlatform` never
-//! runs over it, so the test binary linked no frameworks and any test
-//! reaching the declarations below died at LINK time on
-//! `undefined symbol: _CFRelease`. M14a ejected `build.zig` and states the
-//! frameworks on `artifacts.tests.root_module` directly, which is what
-//! closed it.
-//!
-//! They need no fixtures — the PNGs are embedded there — so they work on a
-//! fresh clone.
-//!
-//! `decode` landed in M14b; M14c wired it to the `image.encode` worker,
-//! which runs it and then `encoders.encodeAvif`/`encodeWebp` on the
-//! result before writing the output file atomically.
+//! This file's tests live in `src/imageio_tests.zig` — their own file
+//! because they are a coherent set about one seam, not because anything
+//! forces the split. They embed their own PNGs, so they need no fixtures.
 
 const std = @import("std");
 
@@ -130,8 +108,8 @@ extern fn CGContextRelease(c: CGContextRef) void;
 // `CGAffineTransform` it really is: a 6-double struct is neither an HFA
 // nor small enough to pass in registers on arm64, so `CGContextConcatCTM`
 // would put an ABI question between us and the only correctness
-// requirement in Phase B that silently produces a WRONG IMAGE rather than
-// a failure. Three scalar calls have no such question.
+// requirement here that silently produces a WRONG IMAGE rather than a
+// failure. Three scalar calls have no such question.
 extern fn CGContextTranslateCTM(c: CGContextRef, tx: CGFloat, ty: CGFloat) void;
 extern fn CGContextScaleCTM(c: CGContextRef, sx: CGFloat, sy: CGFloat) void;
 extern fn CGContextRotateCTM(c: CGContextRef, angle: CGFloat) void;
@@ -147,9 +125,9 @@ pub const Error = error{
     Unreadable,
     /// The source opened but holds no images. THIS, not a null source, is
     /// how a non-image is detected: `CGImageSourceCreateWithURL` SUCCEEDS
-    /// on 49 bytes of text named `.jpg` and returns a non-null source
-    /// (measured in the spike). Testing the pointer would fall through
-    /// and report the wrong thing two hops later.
+    /// on 49 bytes of text named `.jpg` and returns a non-null source.
+    /// Testing the pointer would fall through and report the wrong thing
+    /// two hops later.
     NotAnImage,
     /// The primary frame's property dictionary is missing, or has no
     /// pixel dimensions in it.
@@ -204,9 +182,9 @@ pub fn swapsAxes(orientation: u8) bool {
 
 /// `CGBitmapContextCreate`'s only 8-bit RGBA layout is
 /// `kCGImageAlphaPremultipliedLast`, but `fx.registerImage` documents its
-/// input as STRAIGHT alpha and every encoder M14 will vendor wants the
-/// same. Undo the multiply in place, rounding to nearest so a round trip
-/// through 255 does not drift downward.
+/// input as STRAIGHT alpha and libavif/libwebp want the same. Undo the
+/// multiply in place, rounding to nearest so a round trip through 255
+/// does not drift downward.
 ///
 /// Fully opaque and fully transparent pixels are the whole fixture set
 /// bar one (`alpha16.png`), and both are already correct, so the loop
@@ -262,8 +240,8 @@ pub const Transform = struct {
 /// mappings independently and asserts this table reproduces them, so a
 /// sign error here fails a test rather than shipping a mirrored photo.
 ///
-/// **This is the only Phase B correctness requirement whose failure mode
-/// is a WRONG IMAGE rather than an error.** A flipped output looks like a
+/// **This is the only correctness requirement whose failure mode is a
+/// WRONG IMAGE rather than an error.** A flipped output looks like a
 /// successful compression.
 pub fn orientationTransform(orientation: u8, width: usize, height: usize) Transform {
     const w: f64 = @floatFromInt(width);
@@ -294,13 +272,12 @@ pub fn orientationTransform(orientation: u8, width: usize, height: usize) Transf
 /// Pinning depth here is load-bearing, not defensive: `small.png` in our
 /// own fixture set reports Depth 16 and `tiny.png` reports Depth 1, and
 /// carrying either into an encoder buys nothing (it is also what triggers
-/// the ImageIO alpha bug recorded in PLAN.md). The context normalizes
-/// depth, and drawing into an sRGB context performs the P3->sRGB
-/// conversion by itself — no ColorSync call of our own, verified
-/// pixel-wise in the spike.
+/// the ImageIO alpha bug recorded in PLAN.md's key decisions). The context
+/// normalizes depth, and drawing into an sRGB context performs the
+/// P3->sRGB conversion by itself — no ColorSync call of our own.
 ///
-/// Row 0 of the backing store is the image's TOP row (also verified), so
-/// no vertical flip is needed by anything downstream.
+/// Row 0 of the backing store is the image's TOP row, so no vertical flip
+/// is needed by anything downstream.
 fn drawToRgba8(image: CGImageRef, orientation: u8, buffer: []u8) Error![]u8 {
     const stored_width = CGImageGetWidth(image);
     const stored_height = CGImageGetHeight(image);
@@ -370,16 +347,13 @@ pub const Probe = struct {
 };
 
 /// Properties only — NO bitmap is allocated anywhere on this path, which
-/// is the whole reason it is a separate command from `thumbnail`. The
-/// megapixel guard runs off this, before a single pixel is decoded; the
-/// `sips -g` spawn it replaces could not offer that, because the preview
-/// decode it fed had already happened.
+/// is the whole reason it is a separate command from `thumbnail`: the
+/// megapixel guard runs off this, before a single pixel is decoded.
 ///
-/// Reads the PRIMARY frame, not index 0. That is a live-bug fix, not a
-/// precaution: `multi-primary.heic` has two top-level images with `pitm`
-/// naming the second, and every `sips` read Smoosh does today takes
-/// index 0 — so the guard measures, the card previews, and the encoder
-/// compresses an image the file never called primary.
+/// Reads the PRIMARY frame, not index 0. `multi-primary.heic` has two
+/// top-level images with `pitm` naming the second, so index 0 would mean
+/// the guard measuring, the card previewing, and the encoder compressing
+/// an image the file never called primary.
 pub fn probe(path: []const u8) Error!Probe {
     const url = try urlForPath(path);
     defer CFRelease(url);
@@ -434,8 +408,7 @@ pub const Thumbnail = struct {
 /// and decoding all of one to draw a 160px card would be absurd.
 /// `kCGImageSourceCreateThumbnailWithTransform` is what bakes the EXIF
 /// rotation (measured: a 4000x3000 Orientation=6 JPEG comes back 120x160),
-/// so this path needs no transform of its own — the full-resolution decode
-/// M14 adds will.
+/// so this path needs no transform of its own — `decode` below does.
 ///
 /// `kCGImageSourceCreateThumbnailFromImageAlways` forces the thumbnail to
 /// come from the image itself rather than a stale embedded one, which is
@@ -489,8 +462,8 @@ pub const Decoded = struct {
     width: u32,
     height: u32,
     /// `width * height * 4`, straight-alpha 8-bit sRGB, TOP-DOWN (row 0 is
-    /// the image's top row — verified in the spike, so an encoder that
-    /// expects top-down rows needs no flip). Owned by the caller.
+    /// the image's top row, so an encoder that expects top-down rows needs
+    /// no flip). Owned by the caller.
     pixels: []u8,
 
     pub fn deinit(self: *Decoded, allocator: std.mem.Allocator) void {
@@ -502,12 +475,9 @@ pub const Decoded = struct {
 /// The encoders' input: the primary frame at FULL resolution, upright, in
 /// sRGB, 8-bit, straight alpha, and carrying no metadata of any kind.
 ///
-/// Four of Phase B's correctness requirements are satisfied right here,
-/// and three of them are behaviour CHANGES rather than preservation —
-/// each one recorded as deliberate in PLAN.md:
+/// Four of PLAN.md's correctness requirements are satisfied right here:
 ///
-///  - **Primary frame, not index 0.** A live bug on `multi-primary.heic`,
-///    where every `sips` read v0.1 does takes the wrong image.
+///  - **Primary frame, not index 0.** See `probe`.
 ///  - **EXIF orientation baked in, BY HAND.** Unlike `thumbnail`, this
 ///    path gets no help: `CGImageSourceCreateImageAtIndex` returns the
 ///    frame unrotated (measured — the same 4000x3000 Orientation 6 source
@@ -517,9 +487,8 @@ pub const Decoded = struct {
 ///  - **sRGB, converted and not merely passed through.** The bitmap
 ///    context does it; a Display P3 photo comes out in sRGB numbers.
 ///  - **No metadata.** Encoding from decoded pixels copies nothing unless
-///    asked, which is how the GPS tags v0.1 leaks into every AVIF stop
-///    being copied. It also drops the ICC tag, which is why the sRGB
-///    conversion above is not optional — the encoder must TAG sRGB.
+///    asked. It also drops the ICC tag, which is why the sRGB conversion
+///    above is not optional — the encoder must TAG sRGB.
 ///
 /// Allocates `width * height * 4` bytes, which is 200 MB at the 50 MP
 /// guard's limit — the caller's megapixel check has already run off

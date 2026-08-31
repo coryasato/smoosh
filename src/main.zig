@@ -3,8 +3,7 @@
 //! `main.zig` is hand-authored: platform + Runtime are stood up BY HAND (not
 //! through the CLI's `runner.runWithOptions`, whose per-platform bring-up is
 //! non-`pub`) so a `HostCallBinding` can close over the `*Runtime` and reach
-//! `showOpenDialog`. See CLAUDE.md, "File acquisition, honestly", and the
-//! validated reference at `docs/spikes/dialog-open-file-spike.zig`.
+//! `showOpenDialog`. See CLAUDE.md, "File acquisition, honestly".
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -92,8 +91,7 @@ pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 // ------------------------------------------------------------------ model
 //
 // Buffers use `platform.max_dialog_path_bytes` (4096) to hold whatever
-// `showOpenDialog` hands back — see the spike's own dialog wiring at
-// docs/spikes/dialog-open-file-spike.zig.
+// `showOpenDialog` hands back.
 
 pub const Format = enum { avif, webp, both };
 pub const Status = enum { idle, loading, ready, compressing, done, failed };
@@ -147,16 +145,15 @@ pub const Model = struct {
     /// already applied, so a portrait photo stored landscape with EXIF
     /// Orientation 6 reports 3000x4000, not 4000x3000. 0 until the probe
     /// answers; a probe that cannot read them fails the load outright,
-    /// which is the change M13 makes here (the `sips -g` hop this replaces
-    /// tolerated an unparseable answer and let the preview decide).
+    /// because there is no later gate to defer to.
     source_width: u32 = 0,
     source_height: u32 = 0,
     /// The source's Uniform Type Identifier as ImageIO names it
     /// ("public.jpeg", "public.heic", "org.webmproject.webp") — the
     /// container, decided by sniffing the file rather than by trusting its
-    /// extension. Recorded here because M14's chroma table keys on it (a
-    /// JPEG keeps its own subsampling, everything else goes 4:4:4) and
-    /// `image.probe` is already returning it; nothing in v0.2 reads it.
+    /// extension. Recorded because `chroma.forSource` keys on it — a JPEG
+    /// keeps its own subsampling, everything else goes 4:4:4 — and a
+    /// mis-named JPEG must still be read as a JPEG.
     source_uti_buffer: [imageio.max_uti_bytes]u8 = undefined,
     source_uti_len: usize = 0,
     // result — per format, because the two encodes succeed or fail
@@ -496,8 +493,9 @@ pub const Msg = union(enum) {
     save_as_result: native_sdk.EffectHostResult, // host copy-file callback
     reset, // clear current image, return to idle
 
-    // Dispatched by effect/host-call result paths, never from markup —
-    // same idiom the spike uses for its `dialog_result` Msg.
+    // Dispatched by effect/host-call result paths, never from markup.
+    // Naming them keeps `native check`'s warnings meaningful: an unlisted
+    // Msg with no binding is a real bug, not expected noise.
     pub const view_unbound = .{
         "dialog_result",
         "dropped_file",
@@ -552,11 +550,10 @@ pub const Effects = native_sdk.Effects(Msg);
 const dialog_key: u64 = 1;
 const stat_key: u64 = 2;
 const thumbnail_key: u64 = 3;
-/// NOT an effect key: the only thing `preview_image_id` names now is the
-/// registry slot `fx.registerImage` fills and the `<image>` leaf draws.
-/// It was both until M13 retired `fx.loadImage`, which is why it sits in
-/// this list — the two namespaces are separate, but keeping it distinct
-/// costs nothing and a reader looking for "id 4" finds it here.
+/// NOT an effect key: `preview_image_id` names the registry slot
+/// `fx.registerImage` fills and the `<image>` leaf draws. It sits in this
+/// list only so a reader looking for "id 4" finds it — the two namespaces
+/// are separate.
 const preview_image_id: u64 = 4;
 const probe_key: u64 = 5;
 const avif_encode_key: u64 = 8;
@@ -634,8 +631,8 @@ pub fn parseProbeReply(reply: []const u8) ?SourceInfo {
 /// `max_effect_host_result_bytes` is 256 KiB and an over-cap answer is
 /// silently rewritten to the err route — so the fit is asserted at
 /// COMPTIME below rather than left as a comment for someone raising the
-/// preview size to trip over. A full-resolution decode (M14) can never
-/// ride the result and must use a descriptor.
+/// preview size to trip over. A full-resolution decode can never ride the
+/// result, which is why `imageio.decode` is not a host command at all.
 pub const Preview = struct {
     width: u32,
     height: u32,
@@ -691,9 +688,9 @@ pub fn parsePreviewReply(reply: []const u8) ?Preview {
 // Each format is one `image.encode` host request, answered off the loop
 // thread by `HostBridge`'s worker carrier: the worker decodes the source
 // at full resolution through ImageIO, runs libavif/libwebp, and writes the
-// output atomically, replying with just the output size. There is no HEIC
-// staging step any more — ImageIO decodes HEIC directly — and no
-// subprocess of any kind.
+// output atomically, replying with just the output size. HEIC needs no
+// staging step — ImageIO decodes it directly — and nothing spawns a
+// subprocess.
 
 /// ONE encodable output format. `Format.both` is a REQUEST for two of
 /// these; every per-format path below works on this type, never on `Format`,
@@ -1020,8 +1017,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // The megapixel check needs the source's real dimensions, and
             // `image.probe` reads them out of ImageIO's property
             // dictionary WITHOUT decoding anything. That ordering is the
-            // point: the `sips -g` hop this replaces could only report
-            // dimensions a decode had already paid for.
+            // point — the guard runs before a single pixel is decoded.
             fx.hostRequest(.{
                 .key = probe_key,
                 .name = host_image_probe,
@@ -1036,10 +1032,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // null source, because `CGImageSourceCreateWithURL` succeeds on 49
         // bytes of text named `.jpg`.
         //
-        // Unlike the `sips -g` hop this replaces, an unparseable answer is
-        // NOT tolerated. There is no longer a later gate to defer to — the
-        // thumbnail is the same ImageIO read, so a probe that could not
-        // name the image's size is a file the preview cannot draw either.
+        // An unparseable answer is NOT tolerated, because there is no
+        // later gate to defer to: the thumbnail is the same ImageIO read,
+        // so a probe that could not name the image's size is a file the
+        // preview cannot draw either.
         .probe_result => |result| {
             if (!result.ok) {
                 // Unsupported or undecodable input.
@@ -1076,13 +1072,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
 
         // No staleness guard on this arm or `.probe_result` above, and
-        // none is needed: every hop of the load chain is now a HOST
-        // request, and a cancelled one delivers no Msg at all — a queued
-        // answer dies by generation mismatch at drain (`cancelHostRequest`).
-        // A second pick mid-load replaces the in-flight request on the same
-        // key and drops its answer the same way. The encode chain below
-        // still guards, because those are real spawns whose cancellation
-        // arrives as an ordinary nonzero terminal.
+        // none is needed: every hop of the load chain is a HOST request,
+        // and a cancelled one delivers no Msg at all — a queued answer dies
+        // by generation mismatch at drain (`cancelHostRequest`). A second
+        // pick mid-load replaces the in-flight request on the same key and
+        // drops its answer the same way. The encode chain below still
+        // guards, because a worker already running cannot be cancelled.
         .thumbnail_result => |result| {
             if (!result.ok) {
                 return model.fail("Couldn't build a preview for that file.", .{});
@@ -1103,10 +1098,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 
         .reset => {
             // Nothing in flight may land on the next model. Every hop is
-            // now a HOST request, and a cancelled one delivers no Msg — its
+            // a HOST request, and a cancelled one delivers no Msg — its
             // queued answer dies by generation mismatch at drain. An encode
             // worker already running keeps going and may still write its
-            // output file (there is no process to kill), but its result is
+            // output file (there is nothing to kill), but its result is
             // dropped and the `status` check in `.encode_result` is a
             // second guard. `cancel` on an idle key is a no-op.
             //
@@ -1146,8 +1141,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.status = .compressing;
             // Two independent encodes, not one operation with two steps.
             // Each is one `image.encode` host request; the worker decodes
-            // the source (HEIC included — ImageIO reads it directly, so
-            // there is no staging step) and writes the output itself.
+            // the source (HEIC included — ImageIO reads it directly) and
+            // writes the output itself.
             if (model.format != .webp) beginEncode(model, fx, .avif);
             if (model.format != .avif) beginEncode(model, fx, .webp);
             // A requested format may have short-circuited (`same_path`, or
@@ -1251,10 +1246,10 @@ const App = native_sdk.UiApp(Model, Msg);
 ///  - `image.probe` and `image.thumbnail` answer from a WORKER THREAD
 ///    through the carrier mailbox below. `feedHostResult` is
 ///    loop-thread-only (`HostCallBinding`'s own doc comment says so, and
-///    `docs/spikes/threaded-host-call-spike.zig` proved the supported
-///    seam is the `poll_fn`/`pending_fn`/`bind_services_fn` trio plus
-///    `shutdown_fn`), so a worker never calls it — it parks its answer and
-///    nudges the loop, which drains and feeds on the right thread.
+///    the supported seam is instead the `poll_fn`/`pending_fn`/
+///    `bind_services_fn` trio plus `shutdown_fn`), so a worker never calls
+///    it — it parks its answer and nudges the loop, which drains and feeds
+///    on the right thread.
 const HostBridge = struct {
     runtime: *native_sdk.Runtime,
     app_state: *App,
@@ -1283,8 +1278,8 @@ const HostBridge = struct {
     /// is three deliberate actions and neither the drop nor a dialog can be
     /// automated (see CLAUDE.md), so ~4 workers in flight is the realistic
     /// ceiling. Eight is unreachable, and a full pool degrades gracefully
-    /// (`startEncode` -> "no worker slot" -> one `.encode_failed`), which
-    /// still beats v0.1's unbounded `avifenc` spawn. Each encode worker
+    /// (`startEncode` -> "no worker slot" -> one `.encode_failed`). Each
+    /// encode worker
     /// also holds a full-resolution decode transiently (~w·h·4, ≤200 MB at
     /// the 50 MP guard); two at once is fine, and the guard has already run
     /// off `probe` before any encode starts.
@@ -1757,9 +1752,8 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("tests.zig");
-    // Runnable under `native test` since M14a: `build.zig` now states the
-    // ImageIO frameworks on the test artifact's module, which the SDK's
-    // own platform wiring never reached. Before that these had to be run
-    // by hand from a file nothing imported.
+    // Reachable under `native test` because `build.zig` states the ImageIO
+    // frameworks on the test artifact's module — the SDK's own platform
+    // wiring never reaches it. See `build.zig` before adding a library.
     _ = @import("imageio_tests.zig");
 }
