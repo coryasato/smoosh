@@ -1,9 +1,10 @@
 # third_party — vendored encode-only static archives
 
-These four `.a` files are what let Smoosh encode AVIF and WebP without
-`brew install libavif webp`. They are committed deliberately: they are the
-build's inputs, they are ~8.8 MB, and reproducing them requires CMake,
-Ninja and ~2 GB of throwaway build tree that does not belong in this repo.
+These four `.a` files — and the upstream license text beside them — are what
+let Smoosh encode AVIF and WebP without `brew install libavif webp`. They are
+committed deliberately: they are the build's inputs, they are ~8.8 MB, and
+reproducing them requires CMake, Ninja and ~2 GB of throwaway build tree that
+does not belong in this repo.
 
 **Nothing here is modified upstream source.** Each archive is the
 unmodified output of an upstream release tarball built with the exact
@@ -42,6 +43,24 @@ libavif's C++ wrapper, and the `libwebpdecoder.a`/`libwebpdemux.a`
 archives. Decoding is ImageIO's job (`src/imageio.zig`) and animation is
 a stated non-goal, so an encode-only header surface keeps the vendored
 tree honest about what it is.
+
+## Licenses
+
+Each library's upstream license text is vendored beside its archive, and
+must stay there: all three are BSD-style and require the copyright notice
+and disclaimer be reproduced in **binary** redistributions — which a
+packaged `smoosh.app` is, since these archives are linked into it.
+
+| File | Covers |
+|---|---|
+| `libavif/LICENSE` | libavif (BSD 2-clause). Upstream ships one bundled file that also carries dav1d, libyuv and an Apache-2.0 gradle wrapper — none of which we build, but it is vendored verbatim rather than excerpted. |
+| `libaom/LICENSE` + `libaom/PATENTS` | libaom (BSD 2-clause), plus the AOMedia Patent License 1.0 |
+| `libwebp/COPYING` + `libwebp/PATENTS` | libwebp and libsharpyuv (BSD 3-clause), plus Google's additional patent grant |
+
+The PATENTS files are part of the terms, not supplementary reading: both
+AOMedia's and Google's grants are conditioned on them travelling with the
+software. Smoosh's own MIT license (`/LICENSE`) covers this repo's code
+and nothing under this directory.
 
 ## Why "encode-only" is verified, not assumed
 
