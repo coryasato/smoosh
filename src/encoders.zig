@@ -10,10 +10,10 @@
 //! still — and transcribing those layouts into Zig `extern struct`s is a
 //! silent-miscompile risk with no upside. `src/encode.c` does that struct
 //! work in C against the vendored headers and exposes a flat scalar ABI;
-//! this file declares just the three functions of it (M14c).
+//! this file declares just the three functions of it.
 //!
-//! `pinned` and the three version probes below stay: `src/tests.zig` pins
-//! all three archive versions through them, so a re-copied archive cannot
+//! `pinned` and the three version probes below exist so `src/tests.zig`
+//! can assert all three archive versions: a re-copied archive must not
 //! change the encoder out from under `docs/phase-b-baseline.md` silently.
 //!
 //! The archives are stated in `build.zig` and linked into BOTH the exe and
@@ -36,7 +36,7 @@ extern fn WebPGetEncoderVersion() c_int;
 extern fn avifVersion() [*:0]const u8;
 extern fn aom_codec_version_str() [*:0]const u8;
 
-/// The versions the Phase A baseline was measured against. An encoder
+/// The versions the parity baseline was measured against. An encoder
 /// upgrade is allowed — but it must be a DECISION, re-measured against
 /// `docs/phase-b-baseline.md`, not something that arrives silently with a
 /// re-copied archive. `src/tests.zig` pins all three.

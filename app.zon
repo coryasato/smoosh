@@ -3,7 +3,7 @@
     .name = "smoosh",
     .display_name = "Smoosh",
     .description = "A tiny native macOS app that compresses images into modern web formats.",
-    .version = "0.1.0",
+    .version = "0.3.0",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
     .permissions = .{ "view", "command" },

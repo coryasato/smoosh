@@ -1,57 +1,97 @@
 # Smoosh
 
-A tiny native macOS app that compresses images into modern web formats — drop an
-image in, get AVIF and/or WebP back, next to the original. No upload, no browser
-tab, no account.
+A tiny native macOS app that compresses images into modern web formats. Drop an image in, get AVIF
+and/or WebP back, next to the original. No upload, no browser tab, no account.
 
-It exists to replace the "open TinyPNG / Squoosh in a tab" workflow with
-something local and instant.
+## What it does
 
-## Status
+Drag an image onto the window — or click the drop zone to pick one. Smoosh shows a preview and the
+original file size. Choose **AVIF**, **WebP**, or **Both**, press **Smoosh**, and the compressed
+files land next to the original:
 
-**v0.3 — fully native, zero dependencies.** Both halves of the pipeline now run in-process:
-Apple's ImageIO reads your image (preview, dimensions, size limits, and the full-resolution
-decode), and statically linked libavif / libaom / libwebp encode it. The app spawns no
-subprocess and needs nothing installed — no Homebrew, no `avifenc`, no `cwebp`. Outputs are
-written atomically. The encode runs on a worker thread so the window keeps painting.
+```
+large.jpg
+Original  5.6 MB
 
-**v0.1 — feature-complete and packaged.** Smoosh launches to a drop zone — pick an
-image or drag one onto the window — see a preview and its size, choose AVIF / WebP
-/ Both, and press Smoosh — the compressed files land next to the original and the
-before/after size and savings percentage are shown per format, each with its own
-save icon to copy that one file to a location you choose, without touching the
-auto-saved original.
+AVIF  700.2 KB  −88%
+WebP  655.3 KB  −89%
+```
 
-Ships as a `.app` (`native package --target macos --signing adhoc`) — ad-hoc
-signed, not notarized (no Apple Developer account behind this build; fine for a
-single-machine local tool, see PLAN.md's M10 entry). The app icon is a rough
-placeholder pending a proper design pass, also noted there.
+Each result row carries a save icon to copy that one file somewhere else — the auto-saved copy next
+to the original stays put.
 
-See [PLAN.md](PLAN.md) for milestones, locked decisions, and open questions.
-See [CLAUDE.md](CLAUDE.md) for working context and toolchain notes.
+"Both" writes two files so a page can serve AVIF with a WebP fallback. Each is measured on its own:
+there is no combined savings number, because no browser downloads both.
 
-## How it works
+## What you get
 
-Built on the [Native SDK](https://native-sdk.dev): the view is declarative
-markup (`src/app.native`), the logic is plain Zig on a `Model` / `Msg` / `update`
-loop, and the SDK's own engine renders every pixel. No web view, no JS runtime in
-the binary.
+- **AVIF** at quality 58, speed 6. **WebP** at quality 80. These are fixed — the settings are the
+  product, not a panel to tune.
+- **Chroma subsampling follows the source.** A JPEG keeps its own; everything else is encoded 4:4:4.
+  This is what keeps screenshots, UI exports and other flat-colour graphics sharp, where a blanket
+  4:2:0 would soften them.
+- **Metadata is stripped** — EXIF, GPS, XMP, and the ICC profile. Web output is the whole point of
+  the tool, and location data in a file you are about to publish is rarely what you meant.
+- **Everything is converted to sRGB**, and tagged as such. A Display P3 photo comes out with correct
+  colour in every browser rather than a wide-gamut file most clients mishandle.
+- **Rotation is baked into the pixels**, so an orientation-tagged photo is upright everywhere,
+  including in clients that ignore the tag.
+- **Outputs are written atomically.** A crash or a full disk mid-encode leaves the previous file
+  intact, never a truncated one.
 
-Encoding got there in phases:
+Outputs are named after the source and overwrite a previous Smoosh run silently — running it again
+is "redo this". A format whose output would *be* the source is skipped and says so, so a `.webp`
+source never overwrites itself.
 
-- **Phase A (v0.1)** — shelled out to `sips`, `avifenc` and `cwebp` through the
-  effects channel's `fx.spawn`. Fast to build, fast to iterate on the UI.
-- **Phase B (v0.2 / v0.3)** — decode moved to Apple's ImageIO
-  (`src/imageio.zig`), then encode to statically linked libavif / libaom /
-  libwebp via a small C shim (`src/encode.c`). Both run on a worker thread. No
-  subprocess touches your image, and the binary is self-contained.
+## Input
 
-## Requirements
+JPEG, PNG, WebP, HEIC/HEIF, TIFF, GIF and BMP — whatever macOS itself can decode.
 
-- macOS (Apple Silicon targeted; no Linux or Windows)
-- [`native`](https://native-sdk.dev) CLI **0.10.1**
-- Zig **0.16.0**
-- Nothing else — no Homebrew packages, no external encoders.
+Up to **100 MB** or **50 megapixels**, whichever comes first. Past either, Smoosh names the limit
+and your file's actual size instead of trying.
+
+If one format fails and the other succeeds, that is a success: the file that landed is reported
+normally and the one that did not is named in the status bar.
+
+## Installing
+
+There is no download yet — build it from source:
+
+```sh
+native package --target macos --signing adhoc            # zig-out/package/smoosh.app
+native package --target macos --signing adhoc --archive  # + zig-out/package/smoosh.dmg
+```
+
+Drag `smoosh.app` into `/Applications`. `--archive` also produces a drag-to-Applications DMG if you
+prefer that route.
+
+The build is **ad-hoc signed, not notarized.** That is fine for an app you build and install on
+your own machine. A copy that travels — AirDropped, emailed, downloaded — picks up a quarantine
+flag and will hit Gatekeeper's "unidentified developer" prompt; distributing it properly needs a
+paid Apple Developer identity.
+
+### Requirements
+
+- macOS on Apple Silicon. There is no x86_64 or universal build, and no Linux or Windows support.
+- [`native`](https://native-sdk.dev) CLI **0.10.1** and Zig **0.16.0** to build.
+- Nothing at runtime. No Homebrew packages, no external encoders, no Node.
+
+### Rough edges
+
+The app icon is a placeholder pending a proper design pass.
+
+## How it's built
+
+Smoosh is built on the [Native SDK](https://native-sdk.dev): the view is declarative markup
+(`src/app.native`), the logic is plain Zig on a `Model` / `Msg` / `update` loop, and the SDK's own
+engine renders every pixel. No web view, and no JS runtime in the binary.
+
+Both halves of the image pipeline run in-process. Apple's **ImageIO** reads the file — preview,
+dimensions, and the full-resolution decode. Statically linked **libavif / libaom / libwebp** encode
+it, through a small C shim (`src/encode.c`). Both run on a worker thread, so the window keeps
+painting while a large photo encodes.
+
+The app spawns no subprocess and reads nothing from your `PATH`.
 
 ## Development
 
@@ -60,16 +100,7 @@ native dev      # Debug build + run, with markup hot reload
 native build    # ReleaseFast binary into zig-out/bin/
 native check    # validate markup + app.zon
 native test     # test suite
-native package --target macos --signing adhoc   # zig-out/package/smoosh.app
-native package --target macos --signing adhoc --archive   # + zig-out/package/smoosh.dmg
 ```
-
-`--archive` wraps the `.app` in a zero-config drag-to-Applications DMG (generated
-Retina background, Applications alias, no `app.zon` configuration required).
-Installing means double-clicking the `.dmg` to mount it, then dragging the app
-icon onto the Applications alias inside that window — otherwise, just drag
-`zig-out/package/smoosh.app` straight into `/Applications` yourself, no DMG
-needed.
 
 Driving the running app:
 
@@ -79,26 +110,27 @@ native automate widget-click <view-label> <id>  # ids are bare numbers from snap
 native automate screenshot <view-label>
 ```
 
-A clean `native build` proves the code compiles, not that it works — changes are
-verified against the running app.
-
-## Layout
+A clean `native build` proves the code compiles, not that it works — changes are verified against
+the running app.
 
 ```
-src/main.zig      the app: Model, Msg, update, effects        (added in M1)
-src/app.native    the view                                    (added in M2)
-src/imageio.zig   the ImageIO seam: probe + thumbnail         (added in M13)
+src/main.zig      the app: Model, Msg, update, effects
+src/app.native    the view
+src/imageio.zig   the ImageIO seam: probe, thumbnail, decode
+src/encoders.zig  the encoder seam, over the C shim in src/encode.c
+src/chroma.zig    the source-container chroma table + JPEG SOF parser
+third_party/      vendored encode-only static archives
 app.zon           identity, window, permissions, capabilities
-docs/spikes/      proven reference implementations; not built as part of the app
-PLAN.md           milestones and decisions
-CLAUDE.md         working context for AI assistants
 ```
 
-`package.json`, `tsconfig.json`, and `src/core.ts` were an abandoned TypeScript
-core; deleted in M1, no npm/bun surface remains in this tree.
+[PLAN.md](PLAN.md) holds the decisions, requirements and open work.
+[CHANGELOG.md](CHANGELOG.md) is the development history.
+[CLAUDE.md](CLAUDE.md) is working context for AI assistants.
 
-## Non-goals for v0.1
+## License
 
-Batch processing, quality sliders, side-by-side comparison, animated images, SVG,
-in-app editing, cloud upload or history, and any dependency on Node, ImageMagick,
-or Sharp.
+Smoosh is [MIT licensed](LICENSE).
+
+The binary also statically links libavif, libaom and libwebp, which are BSD-licensed and carry
+their own terms — see [third_party/README.md](third_party/README.md).
+

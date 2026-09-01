@@ -1,22 +1,11 @@
-//! Tests for `src/imageio.zig`. **These run under `native test` like
-//! everything else** — `main.zig`'s `test` block imports this file.
-//!
-//! That is true only since M14a. Before it, `native test`'s artifact
-//! linked no frameworks (the SDK builds it from a fresh Debug module that
-//! `linkPlatform` never runs over), so any test touching ImageIO died at
-//! link time on `undefined symbol: _CFRelease` — and these tests
-//! therefore had to live in a file NOTHING imported and be run by hand.
-//! M14a ejected `build.zig`, which can state the frameworks on
-//! `artifacts.tests.root_module` itself. If you find that command in an
-//! old note, it is stale:
-//!
-//!     # NO LONGER NEEDED — `native test` runs these now.
-//!     zig test src/imageio_tests.zig -lc \
-//!       -framework ImageIO -framework CoreGraphics -framework CoreFoundation
+//! Tests for `src/imageio.zig`. They run under `native test` like
+//! everything else — `main.zig`'s `test` block imports this file, and
+//! `build.zig` states the ImageIO frameworks on the test artifact's
+//! module (the SDK's own platform wiring never reaches it).
 //!
 //! The pure helpers (`swapsAxes`, `unpremultiply`) are NOT here: they link
-//! fine in the app's own test artifact, so they are pinned in
-//! `src/tests.zig` where `native test` actually runs them.
+//! fine without frameworks, so they are pinned in `src/tests.zig` beside
+//! the rest of the pure logic.
 
 const std = @import("std");
 const imageio = @import("imageio.zig");

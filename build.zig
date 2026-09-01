@@ -1,21 +1,20 @@
-//! This build belongs to Smoosh, written once by `native eject` and then
-//! extended by hand for M14. The `native` CLI stops generating a build
-//! graph and drives this file through `zig build` instead; it will never
-//! rewrite it. `addAppArtifacts` wires the complete standard app build —
-//! executable, `zig build run`, `zig build test`, and the
+//! This build belongs to Smoosh: the `native` CLI generates no build graph
+//! for this tree and drives this file through `zig build` instead, so it
+//! will never rewrite it. `native eject` is one-shot and refuses if this
+//! file exists — there is no re-ejecting to pick up CLI changes.
+//!
+//! `addAppArtifacts` wires the complete standard app build — executable,
+//! `zig build run`, `zig build test`, and the
 //! -Dplatform/-Dweb-engine/-Dautomation/-Doptimize flags — from the
 //! framework's build/app.zig, so a framework upgrade still upgrades the
-//! build, while handing back the artifacts so we can link our own
-//! archives into them. `addApp` (what eject wrote) does the same wiring
-//! but returns nothing, and `AppOptions` has no link passthrough, so
-//! owning the build is the only route to a vendored encoder.
+//! build, while handing back the artifacts so we can link our own archives
+//! into them. `addApp` does the same wiring but returns nothing, and
+//! `AppOptions` has no link passthrough, so owning the build is the only
+//! route to a vendored encoder.
 //!
-//! Everything below was proved against a throwaway `zig-core` app first
-//! (CLI 0.10.1, Zig 0.16.0, macOS 26.6, arm64), in a spike since deleted:
-//! its four findings are the comments in this file, and this file is the
-//! live version of them. THIS is the reference now — the comments below
-//! record why each line is there, and each one has a failure mode that
-//! hides until the other artifact is built.
+//! Read the comments below before adding a library. Each records why a
+//! line is there, and each names a failure mode that hides until the
+//! OTHER artifact is built.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -72,8 +71,8 @@ pub fn build(b: *std.Build) void {
     // But when `app_optimize == optimize` — the ReleaseFast `native build`
     // — the SDK hands back the SAME module for both, so the list must be
     // de-duplicated: adding a compiled `src/encode.c` twice is a fatal
-    // `duplicate symbol` (linking an `.a` twice was merely wasteful, which
-    // is why M14a's loop got away with it).
+    // `duplicate symbol`. (Linking an `.a` twice is merely wasteful, so
+    // this only bites once there is a `.c` in the loop.)
     const exe_mod = artifacts.exe.root_module;
     const test_mod = artifacts.tests.root_module;
     const mods: []const *std.Build.Module = if (exe_mod == test_mod)

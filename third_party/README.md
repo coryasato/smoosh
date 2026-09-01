@@ -1,9 +1,10 @@
 # third_party — vendored encode-only static archives
 
-These four `.a` files are what let Smoosh encode AVIF and WebP without
-`brew install libavif webp`. They are committed deliberately: they are the
-build's inputs, they are ~8.8 MB, and reproducing them requires CMake,
-Ninja and ~2 GB of throwaway build tree that does not belong in this repo.
+These four `.a` files — and the upstream license text beside them — are what
+let Smoosh encode AVIF and WebP without `brew install libavif webp`. They are
+committed deliberately: they are the build's inputs, they are ~8.8 MB, and
+reproducing them requires CMake, Ninja and ~2 GB of throwaway build tree that
+does not belong in this repo.
 
 **Nothing here is modified upstream source.** Each archive is the
 unmodified output of an upstream release tarball built with the exact
@@ -43,6 +44,24 @@ archives. Decoding is ImageIO's job (`src/imageio.zig`) and animation is
 a stated non-goal, so an encode-only header surface keeps the vendored
 tree honest about what it is.
 
+## Licenses
+
+Each library's upstream license text is vendored beside its archive, and
+must stay there: all three are BSD-style and require the copyright notice
+and disclaimer be reproduced in **binary** redistributions — which a
+packaged `smoosh.app` is, since these archives are linked into it.
+
+| File | Covers |
+|---|---|
+| `libavif/LICENSE` | libavif (BSD 2-clause). Upstream ships one bundled file that also carries dav1d, libyuv and an Apache-2.0 gradle wrapper — none of which we build, but it is vendored verbatim rather than excerpted. |
+| `libaom/LICENSE` + `libaom/PATENTS` | libaom (BSD 2-clause), plus the AOMedia Patent License 1.0 |
+| `libwebp/COPYING` + `libwebp/PATENTS` | libwebp and libsharpyuv (BSD 3-clause), plus Google's additional patent grant |
+
+The PATENTS files are part of the terms, not supplementary reading: both
+AOMedia's and Google's grants are conditioned on them travelling with the
+software. Smoosh's own MIT license (`/LICENSE`) covers this repo's code
+and nothing under this directory.
+
 ## Why "encode-only" is verified, not assumed
 
 Against Homebrew's `libaom.a`, ours is missing exactly 13 objects and no
@@ -60,10 +79,13 @@ not. The object-level diff is in `docs/phase-b-baseline.md`.
    `avifenc` used. Nothing in the build reports this.
 2. **These are `-O3` (upstream Release) where Homebrew's are `-Os`.** That
    is why ours is 8.1 MB against Homebrew's 5.4 MB despite 13 fewer
-   objects. libaom's rate control carries floating-point math and
-   optimization level can change FP contraction, so **output parity with
-   the Phase A baseline is NOT proven** and must be re-measured when the
-   encoders are actually called (M14c), not reasoned about.
+   objects. Output parity against the baseline HAS been measured with
+   these archives (`docs/phase-b-baseline.md`, "M14c") — but libaom's rate
+   control carries floating-point math and optimization level can change
+   FP contraction, so **rebuilding at a different optimization level
+   invalidates that measurement** and must be re-measured, not reasoned
+   about. PLAN.md's roadmap lists an `-Os` rebuild as a size win on
+   exactly those terms.
 
 ## Updating
 

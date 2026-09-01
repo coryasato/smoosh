@@ -4,10 +4,10 @@
 //! destroy.
 //!
 //! `avifenc --yuv auto` is NOT a content detector: it never inspects the
-//! image. It reads the SOURCE CONTAINER, and after M14 hands it decoded
-//! RGBA the container is gone. So the table has to be carried explicitly,
-//! here, or every AVIF Smoosh writes changes chroma silently. Measured
-//! consequence on a UI fixture: 7.7 dB.
+//! image. It reads the SOURCE CONTAINER — and by the time libavif is
+//! handed decoded RGBA the container is gone. So the table has to be
+//! carried explicitly, here, or every AVIF Smoosh writes changes chroma
+//! silently. Measured consequence on a UI fixture: 7.7 dB.
 //!
 //! The table (PLAN.md, "Correctness requirements"; measured per fixture in
 //! `docs/phase-b-baseline.md`):
@@ -23,21 +23,21 @@
 //! JPEG itself is `1x1,1x1,1x1`. Quality >= 90 out of most encoders is
 //! 4:4:4; hardcoding 420 would soften every high-quality JPEG and every
 //! screenshot. And do NOT invent an "is this photographic?" heuristic —
-//! that is new behaviour, and it would disagree with v0.1 on exactly the
-//! files that justified vendoring libaom.
+//! that is new behaviour, and it would disagree with the recorded
+//! baseline on exactly the files that justified vendoring libaom.
 //!
 //! Everything here is a pure function over bytes: no ImageIO, no
 //! allocation, no I/O. Tested in `src/tests.zig`.
 //!
 //! The one consumer is the `image.encode` worker in `main.zig`'s
-//! `HostBridge` (M14c): for a JPEG source it reads a prefix of the file
-//! and calls `forSource` to pick libavif's `yuvFormat`.
+//! `HostBridge`: for a JPEG source it reads a prefix of the file and calls
+//! `forSource` to pick libavif's `yuvFormat`.
 
 const std = @import("std");
 
-/// The four formats libavif can be asked for. Named after the AVIF
-/// values rather than the JPEG ones so the M14c seam reads as a direct
-/// mapping onto `avifPixelFormat`.
+/// The four formats libavif can be asked for. Named after the AVIF values
+/// rather than the JPEG ones so `src/encode.c` reads as a direct mapping
+/// onto `avifPixelFormat`.
 pub const Subsampling = enum {
     yuv444,
     yuv422,
