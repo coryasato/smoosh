@@ -25,10 +25,9 @@ there is no combined savings number, because no browser downloads both.
 
 ## What you get
 
-- **AVIF** at quality 58, speed 6. **WebP** at quality 80. These are fixed — the settings are the
-  product, not a panel to tune.
+- **AVIF** at quality 58, speed 6. **WebP** at quality 80.
 - **Chroma subsampling follows the source.** A JPEG keeps its own; everything else is encoded 4:4:4.
-  This is what keeps screenshots, UI exports and other flat-colour graphics sharp, where a blanket
+  This is what keeps screenshots, UI exports and other flat-color graphics sharp, where a blanket
   4:2:0 would soften them.
 - **Metadata is stripped** — EXIF, GPS, XMP, and the ICC profile. Web output is the whole point of
   the tool, and location data in a file you are about to publish is rarely what you meant.
@@ -83,7 +82,7 @@ its source PNG has no alpha channel and draws its own rounded-square background.
 
 ## How it's built
 
-Smoosh is built on the [Native SDK](https://native-sdk.dev): the view is declarative markup
+Smoosh is built on [Native SDK](https://native-sdk.dev): the view is declarative markup
 (`src/app.native`), the logic is plain Zig on a `Model` / `Msg` / `update` loop, and the SDK's own
 engine renders every pixel. No web view, and no JS runtime in the binary.
 
