@@ -1,8 +1,9 @@
 # Smoosh — PLAN.md
 
 > Living plan: decisions still in force, requirements the code must keep satisfying, and what is
-> still open. How it got here — every milestone, every measurement behind a decision — is in
-> `CHANGELOG.md`. Update this file as decisions are made; append to the changelog as work lands.
+> still open. This file and `docs/phase-b-baseline.md` are the engineering record between them —
+> `CHANGELOG.md` is written for users and carries no reasoning. Update this file as decisions are
+> made; add a user-facing line to the changelog as work ships.
 
 ## Vision (one sentence)
 A beautiful, instant native macOS app that lets you drop an image and get back high-quality modern
@@ -18,22 +19,7 @@ libavif/libaom/libwebp write (`src/encoders.zig` over `src/encode.c`), and the e
 worker thread so the window keeps painting. **The app spawns no subprocess and needs nothing
 installed.**
 
-`native test` 118/118, `native check` zero warnings, `native build` 10.94 MB.
-
 What is left is UI and style polish, plus the standalone-app gaps — see "Roadmap".
-
-## Non-goals (for now)
-- Linux or Windows support
-- Batch processing of many files
-- Advanced quality controls / comparison view / side-by-side
-- Cloud upload / accounts / history
-- Animated image support
-- Vector / SVG handling
-- In-app image editing (crop, resize, etc.)
-- Any dependency on Node, ImageMagick or Sharp
-- Metadata-preservation toggles (EXIF, GPS, ICC) — Smoosh strips unconditionally
-- Wide-gamut output (P3 and beyond) — everything is converted to sRGB deliberately
-- Quality/speed sliders — the pinned settings are the product
 
 ## Product behavior
 
@@ -95,8 +81,8 @@ be more permissive than a typical web upload limit while still protecting agains
 exhaust memory decoded to RGBA. The error names both the file's actual size and the limit.
 
 ## Correctness requirements
-These are properties of the decode/encode path that must survive any change to it. Measurements
-behind each are in `docs/phase-b-baseline.md`; the reasoning is in `CHANGELOG.md`.
+These are properties of the decode/encode path that must survive any change to it. The
+measurements behind each are in `docs/phase-b-baseline.md`.
 
 - **Primary frame, not index 0.** Everything reads `CGImageSourceGetPrimaryImageIndex` — the
   megapixel guard, the preview and the encoder input.
@@ -107,8 +93,8 @@ behind each are in `docs/phase-b-baseline.md`; the reasoning is in `CHANGELOG.md
   performs the conversion for free; the encoder must then tag it explicitly, because the same path
   drops the ICC profile.
 - **Metadata is stripped, unconditionally.** Encoding from decoded pixels copies nothing unless
-  asked — this is the do-nothing path mechanically and a product decision editorially. No toggle
-  (see Non-goals).
+  asked — this is the do-nothing path mechanically and a product decision editorially. There is no
+  toggle, and adding one is not on the table.
 - **Decode to 8-BIT RGBA in `decode` and `thumbnail`; `probe` allocates no bitmap at all.** Pin the
   depth rather than inheriting the source's. Load-bearing on the current fixture set, not
   hypothetical: `small.png` reports Depth 16 and `tiny.png` reports Depth 1.
@@ -135,15 +121,24 @@ behind each are in `docs/phase-b-baseline.md`; the reasoning is in `CHANGELOG.md
   is a no-op.
 - **Signed ad-hoc, not notarized, not unsigned**, for a single-machine local tool with no paid Apple
   Developer identity. Revisit if this ever needs sharing.
-- **AVIF encoding stays on libaom; ImageIO does decoding only.** ImageIO's AVIF encoder is
-  quality-indistinguishable on photographs and 2.6× faster, but it is hard-locked to YUV420 with no
-  subsampling control exposed, which makes it decisively worse on the screenshot/UI/graphics
-  content this tool exists to compress. It also has an alpha interop bug on 16-bit sources.
-  Measurements in `CHANGELOG.md`, "why encode was NOT ImageIO's job".
+- **AVIF encoding stays on libaom; ImageIO does decoding only.** Measured, because the tempting
+  answer is wrong: on PHOTOGRAPHS ImageIO's AVIF encoder is quality-indistinguishable from
+  `avifenc -q 58 --speed 6` (714,717 B at 35.65 dB against 717,003 B at 35.73 dB on `large.jpg` —
+  0.08 dB, far under the ~0.5 dB just-noticeable threshold) and runs 2.6× faster. Generalizing from
+  photographs is the trap. On a UI/screenshot fixture `avifenc` produced 7,515 B at 47.77 dB in
+  YUV444 where ImageIO's best was 9,911 B at 40.04 dB in YUV420 — **32% larger and 7.7 dB worse** —
+  because ImageIO is hard-locked to YUV420 with no subsampling control exposed. Raising quality
+  does not help; it plateaus near 40 dB. It also has an alpha interop bug: a 16-bit source with
+  alpha yields a 10-bit AVIF whose alpha plane libavif/dav1d cannot decode, i.e. Chrome and
+  Firefox. Screenshots and UI exports are core input for a web-asset tool, so this would be a real
+  regression.
 - **The encoder settings are the pinned `avifenc`/`cwebp` ones, carried over literally** — AVIF
   q58/speed6, WebP q80 — because Smoosh vendors the same encoders those front-ends drive.
   `encoders.pinned` asserts the three archive versions so an upgrade cannot arrive silently with a
   re-copied file.
+- **The settings ARE the product: no sliders, no panels, no batch mode.** Smoosh exists to be a
+  drop zone that does one thing well. Every feature that would add a control is a feature that
+  makes it something else, and the answer is no by default.
 - **Long work runs off the loop thread through the WORKER-CARRIER seam, never `feedHostResult`.**
   `Effects` offers spawn/fetch/file/db/pty/channel and nothing that runs arbitrary Zig off-loop, so
   the seam is a `HostCallBinding.request_fn` that returns WITHOUT answering: the worker parks its
@@ -206,7 +201,12 @@ and `native check` are necessary and never sufficient.
   only, so this is a deliberate trade.
 - **arm64 only.** The vendored archives are non-fat arm64-macos; producing an x86_64 or universal
   build is unexplored. A genuine gap the moment the `.app` is handed to anyone else.
-- **The app icon is a placeholder** (see `CHANGELOG.md`'s M10 entry for what not to repeat).
+- **The app icon does not sit flush in the Dock.** `assets/icon.png` is opaque RGB with no alpha
+  channel (PNG color type 2), and the artwork draws its rounded square inside a full-bleed square
+  background. macOS does not mask app icons the way iOS does, so it renders as a square tile with a
+  smaller squircle floating inside it rather than flush like other Mac apps. The fix is the
+  artwork, not the code: an RGBA source whose squircle IS the icon bounds, with transparency
+  around it and Apple's standard margin.
 - **Launch time has never been measured.**
 
 ## Roadmap
@@ -245,8 +245,8 @@ reasoning.*
 ### 3. The standalone-app review
 The umbrella, not a task. The correctness half was covered by the Phase B review (2026-08-30) —
 one real bug found and fixed (the case-insensitive `same_path` collision). What it did NOT touch is
-the first three "Known limitations" above: **arm64-only**, **notarization** (currently ad-hoc
-signed, fine for one machine and not for distribution), **the placeholder icon**, and **launch
+the last four "Known limitations" above: **arm64-only**, **notarization** (currently ad-hoc
+signed, fine for one machine and not for distribution), **the icon's Dock shape**, and **launch
 time**.
 
 *Suggested: **Opus 5, high**, or run `/code-review ultra` for the correctness sweep — it is

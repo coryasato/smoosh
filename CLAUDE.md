@@ -57,8 +57,11 @@ Two non-obvious things about the hand-authored root this requires:
 Real window-wide file drops work through a different seam: `UiApp.Options.on_drop`, a
 `fn(platform.FileDropEvent) ?Msg` field beside `update_fx`/`init_fx` in `App.create`'s options
 (SDK 0.8.2+), dispatched from `handleRuntimeEvent`'s `.files_dropped` arm. A dropped path re-enters
-the exact same load chain a picked one does. Full spec and source citations in `CHANGELOG.md`'s M11
-entry.
+the exact same load chain a picked one does. Three constraints, all read out of the CLI's source:
+the drop is WINDOW-wide (a real drag carries no `view_label` or `point`, so the copy must not
+promise a targeted zone), the widget-level `canvas_widget_file_drop` channel is a dead end that no
+real drag ever reaches, and a drag-over highlight is impossible — the AppKit host emits nothing on
+`draggingEntered:`.
 
 ## Core Principles for this project
 1. **Extremely simple UX** — drop zone is the entire product. Minimal chrome.
@@ -148,7 +151,8 @@ that hides until the other artifact is built.
 - `docs/phase-b-baseline.md` — the pre-vendoring measurement of the shipping app (size, PSNR, AVIF
   `yuvFormat`, metadata) plus the fixture-set inventory and how to regenerate it. **Append-only:**
   it is the parity gate and cannot be re-measured now that the encoders have changed.
-- `CHANGELOG.md` — the full development history, M1-M14.
+- `CHANGELOG.md` — user-facing release notes. Not an engineering record; PLAN.md and
+  `docs/phase-b-baseline.md` are.
 
 There is no npm/bun surface in this tree at all (`src/core.ts`, `package.json`, `tsconfig.json`,
 `bun.lock` and `node_modules/` were the abandoned TS-core editor surface and are gone).
@@ -211,8 +215,8 @@ For a hand-authored root, window geometry is stated three times and all three mu
   libsharpyuv), non-obvious WHY (the scalar CTM calls over `CGAffineTransform`, the fixed-width
   preview header, NUL-delimited payloads), and invariants (`.failed` is always paired with a
   message; "do not simplify JPEG to 4:2:0"). Don't write, and cut on sight: historical narration
-  ("this used to be X", "the `sips -g` hop this replaces"), anything `CHANGELOG.md` already covers,
-  and anything restating what the code plainly says.
+  ("this used to be X", "the `sips -g` hop this replaces"), milestone archaeology, and anything
+  restating what the code plainly says.
 
 ## Two standing rules about automation
 - **Never automate a native file dialog** (open or save panel). The app runs as a bare executable

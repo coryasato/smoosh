@@ -78,7 +78,8 @@ paid Apple Developer identity.
 
 ### Rough edges
 
-The app icon is a placeholder pending a proper design pass.
+The app icon renders as a square tile in the Dock rather than sitting flush like other Mac apps —
+its source PNG has no alpha channel and draws its own rounded-square background.
 
 ## How it's built
 
