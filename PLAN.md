@@ -19,7 +19,7 @@ libavif/libaom/libwebp write (`src/encoders.zig` over `src/encode.c`), and the e
 worker thread so the window keeps painting. **The app spawns no subprocess and needs nothing
 installed.**
 
-What is left is UI and style polish, plus the standalone-app gaps — see "Roadmap".
+What is left is the standalone-app gaps — see "Roadmap".
 
 ## Product behavior
 
@@ -146,8 +146,10 @@ measurements behind each are in `docs/phase-b-baseline.md`.
   through `poll_fn`/`pending_fn`/`bind_services_fn`. `shutdown_fn` is not optional — it is the one
   window in which a still-running worker can be joined while `PlatformServices` is live.
 - **A full-resolution buffer can never ride a host result.** `max_effect_host_result_bytes` is
-  256 KiB and an over-cap answer is silently rewritten to the err route. The 160px preview fits
-  (100 KiB) behind a comptime assert; `imageio.decode` is deliberately not a host command at all.
+  256 KiB and an over-cap answer is silently rewritten to the err route. The 140px preview fits
+  (77 KiB) behind a comptime assert; `imageio.decode` is deliberately not a host command at all.
+  The cap that actually binds the preview is now the LAYOUT, not that budget — see
+  `imageio.max_thumbnail_edge`.
 
 ## Testing strategy
 Two tiers, in this order. Reaching for the GUI to answer a question a unit test answers faster is
@@ -235,85 +237,139 @@ Ranked by payoff-to-risk:
 encoder settings or rebuilding an archive, where the parity judgment is the whole task.*
 
 ### 2. UI and style polish
-**The design is settled and drawn; none of it is built.** The canvas is the spec — 12 window states
-across light and dark, plus three sheets (design tokens, the result row, the footer):
-<https://claude.ai/code/artifact/682de599-1cc7-4306-aac0-bbf9d886c2e6>
+**Shipped as v1 of the UI.** The canvas is the ORIGIN of this design, no longer a description of
+it — 12 window states across light and dark, plus three sheets (design tokens, the result row, the
+footer): <https://claude.ai/code/artifact/682de599-1cc7-4306-aac0-bbf9d886c2e6>
 
-Constraint to respect: the app is meant to live in a corner of the desktop, so it must stay correct
-at `window_min_width` (420) and the layout floor recorded in `main.zig`.
+**The board is now behind the app.** Iterating against it means reading "Where the build left the
+board" below first; every entry there is a place the drawn spec and the running app disagree, and
+in each the app is deliberate. Re-seeding the board from the built UI is the obvious next move
+before another visual pass.
+
+Constraint respected: the app is meant to live in a corner of the desktop, so it must stay correct
+at `window_min_width` (420). That floor is a TEST, not a comment — `tests.zig` lays the tallest
+state (both formats landed) out at 420x400 and fails naming the overflow in points. The 144px
+preview frame is what pays for everything else and is load-bearing.
 
 **Settled decisions.**
-- **The palette is app-owned**, set through `UiApp.Options.tokens` as one `canvas.DesignTokens` per
-  scheme. Peach `#F3B89A` is the Smoosh button and nothing else — the only saturated fill in the
-  window. Lilac appears once per result row, on the savings figure. Sky is work in progress (the
-  spinner). The format segments stay neutral.
-- **System face, no vendored font.** `Options.fonts` is not needed. The icon carries the
-  personality; SF is what a native macOS utility should render in.
-- **`surface_pressed` is DARKER than `surface_subtle` in BOTH schemes** (`#EAE1D3` / `#121216`) —
-  the one place this palette departs from the stock pack, where pressed is normally the lighter step
-  in a dark scheme. It is forced: `surface_pressed` is the segmented-control track and a ghost
-  `toggle-button`'s selected state is hard-wired to `surface_subtle`, so the track must sit under
-  the thumb. A `#17171C` track measured ΔL* 2.07 against the window and was invisible.
+- **The palette is app-owned**, set through `UiApp.Options.tokens_fn` (not `tokens`: the scheme is
+  model state fed by `on_appearance`, so the flip is one ordinary `Msg` and `tokens` stays a pure
+  function of the model). It is stated as OVERRIDES on the house theme, so roles the app never
+  draws keep the house value for the CURRENT scheme instead of inheriting the light register's ink
+  in a dark window.
+
+  Peach is the Smoosh button and nothing else — the only saturated fill in the window. Lilac
+  appears once per result row, on the savings figure. Sky is work in progress (the spinner). The
+  format segments stay neutral.
+- **Both schemes are WARM.** The board's dark neutrals lean blue-over-red by 4-6, which put cool
+  surfaces under this scheme's warm ink and made dark read as a different app. The built ramp
+  mirrors light's STRUCTURE instead of its values: a near-neutral ground with the warmth spent on
+  the surfaces sitting on it. Every dark value holds the board's L* to within 0.25 — only the hue
+  moved, so nothing about legibility shifted.
+- **A manual appearance toggle PINS the scheme.** The footer's ghost icon button offers the other
+  scheme (`moon` in light, `sun` in dark) and sets `scheme_pinned`; from then on `on_appearance` no
+  longer moves `color_scheme`. Contrast and reduce-motion keep following the OS either way — those
+  are accessibility settings, not a preference the button offers. `reset` preserves all four.
+- **The window ground is painted, not cleared.** `background="background"` on the root column is a
+  REPAINT fix, not decoration: the ground is otherwise the surface's clear colour, which is not a
+  display-list command, so a theme flip changed it while nothing damaged the bare regions. The
+  runtime's incremental present repainted every widget and left every uncovered patch of ground in
+  the OLD scheme — the window came out half light, half dark, until the next content change forced
+  a full repaint. Painting the ground as a real fill puts it in the diff.
+- **`surface_pressed` is DARKER than `surface_subtle` in BOTH schemes** — the one place this
+  palette departs from the stock pack, where pressed is normally the lighter step in a dark scheme.
+  It is forced: `surface_pressed` is the segmented-control track and a ghost `toggle-button`'s
+  selected state is hard-wired to `surface_subtle`, so the track must sit under the thumb. The test
+  pins the DIRECTION, not just the separation.
 - **No in-window header.** The titlebar already says Smoosh; a wordmark and app icon said it twice
   more in a 540pt window. Removing the row also fixed a Reset button that sat above an empty drop
-  zone offering to undo nothing. Reset moved beside Smoosh and takes the same treatment that button
-  has — disabled on exactly the guard that makes a press a no-op (`hasFile`). Worth 46px, most of
-  which went back to the preview frame.
+  zone offering to undo nothing. Worth 46px, most of which went back to the preview frame.
+- **ONE control row.** Format choice on the left, the two actions on the right, all on one
+  baseline — the board stacks them. Folded together they read as a single "set it, then run it"
+  line, and the row plus its 12pt gap went back to the tallest state's budget.
 - **Result rows sit BELOW the preview, spanning the content width.** Beside a 168px preview a row
-  carrying a labelled Save overflowed the 420pt minimum by 40px; below it, it clears the minimum
-  with 120px to spare. The preview frame pays: 168 → 144, ImageIO long-edge cap 160 → 140.
+  carrying a labelled Save overflowed the 420pt minimum by 40px. The preview frame pays: 168 → 144,
+  and `imageio.max_thumbnail_edge` 160 → 140 — the cap that binds the thumbnail is now the LAYOUT
+  (a longer edge than the frame overflows it), not the 256 KiB host-result budget.
 - **The savings figure is one hue, not two.** A magnitude threshold would be invented, and at
   −89% vs −88% both rows land the same colour anyway — the cue goes quiet exactly where comparing
   two formats is worth doing.
-- **Both action buttons are `size="sm"`.** The SDK's control rungs are sm 32 / default 40, so a
-  default-size Smoosh beside a sm Reset differs by 8px and cannot be aligned. Hierarchy comes from
-  the fill and the weight.
 - **`icon="download"`, NOT `icon="save"`.** The registry's `save` is a floppy disk — three paths
   with an inner label plate that collapses into mush at 14px. `download` is the arrow-into-tray
   glyph. The failure mark is `alert`, a circle with a bang, not a triangle.
 
 **What the markup cannot express** — every one of these was found by reading the SDK source after
 drawing something that could not be built:
-- **No `border` attribute on a panel, and nothing in the SDK strokes dashes.** No outlined or dashed
-  drop zone; the wash IS the recess. A `<badge>` DOES draw its own border — that is the one pill
-  outline available, and it is what the savings pill uses.
+- **A `<panel>` strokes a hairline and casts a shadow whether or not you ask.**
+  `emitPanelWidgetChrome` always emits both and no attribute declines them, so the drop zone and
+  preview frame get their wash-only treatment from `controls.panel.stroke_width = 0` and a zeroed
+  `shadow.sm`. There is no dashed stroke anywhere in the SDK either. A `<badge>` DOES draw its own
+  border — the one pill outline available, and what the savings pill uses.
+- **`<status-bar>` is a BAND, not a line.** It fills its frame with `surface`, draws its own top
+  hairline, and insets text 14pt with no way to clear it (`padding="0"` falls back to the default).
+  That is the filled-footer treatment this design rejected, and it broke the left edge. The status
+  line is a plain `<text>`; one widget, one id, one colour either way.
 - **`<span>` carries no `foreground`** (only weight/scale/mono/italic/underline). A two-tone result
-  line needs two `<text>` widgets and a model method per half — `resultLine` splits.
-- **`padding` is a single uniform number.** No per-side values anywhere. The footer row takes the
-  body's own 16 to keep the status text on the same left edge as the content above it.
+  line needs separate `<text>` widgets and a model method per half — `resultLine` split into
+  `avifSize`/`avifSavings` and their WebP twins.
+- **`padding` is a single uniform number.** No per-side values anywhere. A result card's left inset
+  is a leading `<spacer width="2">` and its height is stated outright, because 10pt of padding
+  would be 10 top and bottom too.
 - **`<toggle-group>` paints nothing at all** (an explicit no-op arm in the render switch). The
-  segmented track is a `<row background="surface_pressed" radius="lg" padding="2">` wrapped around
+  segmented track is a `<row background="surface_pressed" radius="md" padding="1">` wrapped around
   it. The thumb needs no styling — a ghost `toggle-button` is already transparent at rest and
   `surface_subtle` when selected.
-- **No per-widget shadow, and no letter-spacing.** The segmented thumb is a lightness step and
-  nothing more; the label stays "Format" rather than a tracked-out FORMAT.
-- **`background` takes a token NAME, not a hex** (`.class = .token_color`). Tinted pills in an
-  arbitrary hue are out; only `badge variant="destructive"` gets a translucent hue wash, and
-  `destructive` is spoken for by the failure mark.
+- **A ghost variant resolves ONE `foreground` for both states.** `active_foreground` is consulted
+  only for `default` and detached-group members, and `foreground` is a token-NAME attribute that
+  takes no binding — so the board's muted-unselected/full-ink-selected segments cannot be built
+  without an `<if>` inside the `<for>` and the widget-identity collision that causes. All three
+  segments take full ink, which is also what macOS does: the thumb marks the selection, not the ink.
+- **No per-widget shadow, and no letter-spacing.** The label stays "Format" rather than a
+  tracked-out FORMAT.
+- **`background` takes a token NAME, not a hex.** Tinted pills in an arbitrary hue are out; only
+  `badge variant="destructive"` gets a translucent hue wash, and `destructive` is spoken for by the
+  failure mark.
 
-**The work, in order.** Each step is independently checkable against the running app.
-1. `tokens_fn` — both schemes, driven off `on_appearance`. Land this first; everything else is
-   drawn against it.
-2. Root restructure — header row out, Reset into the actions row, status line out of the padded
-   body and under a full-bleed `<separator>`. Re-check every `key` on the root column's children.
-3. Segmented format row — the wrapping `<row>` plus ghost `toggle-button`s.
-4. Result rows — full-width cards, `icon="download"` with a "Save" label, `resultLine` split into
-   name/size and savings, subtitle gains the source UTI (`Original 5.7 MB · JPEG`).
-5. The state dot on `.done`, in the slot that already carries the spinner and the alert.
+**Where the build left the board.** Read this before iterating — each is measured, not a drift.
+- **Light `text_muted` is `#6B6773`**, the value the drawn states use, not the `#75717C` the token
+  sheet lists. The lighter value measures 4.25:1 on `surface_subtle`, and muted ink lands on that
+  surface constantly (the drop zone's hint, every result row's size figure).
+- **The creams are warmer than the sheet.** `surface_subtle` `#F7F1EA` → `#F4ECDF` and
+  `surface_pressed` `#EAE1D3` → `#E7D7C7`. Not a correction — the sheet's values render exactly as
+  drawn — but a compensation for WHERE they render: on the canvas that patch sits inside a cream
+  window on a warm page and every neighbour confirms its warmth, while in a 540pt window on someone
+  else's desktop the same field has nothing warm near it and 13 points of red-over-blue reads as
+  grey. The ceiling is the track: past about `#F3EADB` for the cards it stops separating from them.
+  The track also went three points DARKER, because warming the cards had squeezed it to ΔL* 3.81.
+- **The peach is lighter**, `#F3B89A` → `#F8CDB7`, six points of L*. The darker value read as a
+  muddy tan at this size against the warm ground; the one saturated fill in the window should feel
+  like the lightest thing in it.
+- **ONE outer radius, 10, on everything a hand lands on** — the segmented track, every button, and
+  a result card. The board draws the track at 8 against a 10 button, and side by side that reads as
+  a mistake rather than a distinction. The thumb keeps the board's one-step-in relationship (track
+  minus its own padding, so 8). Surfaces keep their own scale: preview frame 12, drop zone 16.
+  **The track will still look slightly larger than the buttons and that is structural**: it is the
+  segment height plus its padding, so it is always taller than the control inside it, and the same
+  arc on a taller shape reads differently. Measured and confirmed identical — the probe was setting
+  `radius.md` to 20, which moved the track and not the button.
+- **The action buttons are 30pt tall and Smoosh is 88 wide.** `size="sm"` IS 28, so the buttons
+  cannot reach the track's height through the rungs; both state it. Smoosh's width comes from
+  `min-width` on that one button rather than `button_inset_sm`, which would widen Reset, both Save
+  buttons and every segment with it — and the row has ~17pt of slack at the 420pt floor.
+- **The type scale is three sizes and no more**: 14 (file name, drop-zone headline), 13 (everything
+  else, labels and button text alike), 12 (the savings badge). `button_label_sm_step` is 1, not the
+  house 1.2, so `sm` button labels land on 13 with the text beside them instead of 12.8.
 
-**Verify against the running app, not the source.** Two things were read out of the SDK but never
-confirmed live: that a ghost `toggle-button`'s selected state really lands on `surface_subtle`, and
-whether unselected segment labels can be muted without an `<if>` inside the `<for>` — which collides
-with the widget-identity rule in `app.native`'s header comment.
+**The contrast check is in the test suite**, over the real `tokens_fn` values: every adjacent
+surface pair at ΔL* ≥ 3 and in the right DIRECTION, every drawn text pair at 4.5:1, the spinner at
+3:1. Mutation-checked in both directions — restoring the `#17171C` dark track reports 2.07 L*,
+restoring `#75717C` reports 4.25:1, and lifting the track above the thumb reports the direction
+failure. The pairs asserted are the pairs the markup DRAWS, not the cross product of the palette.
 
-**Carry the contrast check into the test suite.** Both schemes currently pass a script over every
-adjacent surface pair (ΔL* ≥ 3) and every text pair (4.5:1, or 3:1 for the spinner). It found two
-real bugs that text-contrast checking alone missed — the invisible dark track above, and a light
-spinner at 2.90:1. As a unit test over the `tokens_fn` values in `src/tests.zig` it would catch a
-future token edit at `native test` rather than by eye.
-
-*Suggested: **Opus 5, medium.** Iterative and visual; the work is in the looking, not the
-reasoning.*
+**Verified live, not from source.** Every claim above was checked against the running app through
+`native automate` — widget frames for geometry, framebuffer samples for colour, and a token probe
+where the two could not be told apart by eye. Two things remain unverifiable from here and need a
+person: **a real file drop** and **any native dialog** (see CLAUDE.md's two standing rules).
 
 ### 3. The standalone-app review
 The umbrella, not a task. The correctness half was covered by the Phase B review (2026-08-30) —

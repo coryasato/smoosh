@@ -134,8 +134,8 @@ fn readyModel() Model {
     var model: Model = .{
         .status = .ready,
         .image_id = 4,
-        .preview_width = 160,
-        .preview_height = 120,
+        .preview_width = 140,
+        .preview_height = 105,
         .source_width = 4000,
         .source_height = 3000,
         .original_size = 5_846_465,
@@ -165,8 +165,12 @@ test "app.native builds against the real Model in every Status" {
     for (std.enums.values(Status)) |status| {
         var model: Model = .{ .status = status };
         const tree = try buildTree(arena, &model);
-        const status_bar = findByText(tree.root, .status_bar, model.statusLine());
-        try testing.expect(status_bar != null);
+        // A `<text>`, not a `<status-bar>` — the widget paints a band
+        // this footer does not want (see `app.native`). One widget, one
+        // id, one colour either way, which is what the automation
+        // scripts and this assertion actually depend on.
+        const status_line = findByText(tree.root, .text, model.statusLine());
+        try testing.expect(status_line != null);
     }
 }
 
@@ -537,9 +541,9 @@ const App = native_sdk.UiApp(Model, Msg);
 
 /// A synthetic `image.thumbnail` answer: the same fixed-width header the
 /// bridge writes, then `width * height * 4` bytes of opaque grey. Sized
-/// for the largest preview the 160px cap allows, which is also what the
-/// bridge's own slot holds.
-var preview_reply_buffer: [16 + 160 * 160 * 4]u8 = undefined;
+/// for the largest preview `imageio.max_thumbnail_edge` allows, which is
+/// also what the bridge's own slot holds.
+var preview_reply_buffer: [16 + imageio.max_thumbnail_edge * imageio.max_thumbnail_edge * 4]u8 = undefined;
 
 fn previewReply(width: u32, height: u32) []const u8 {
     const header = std.fmt.bufPrint(&preview_reply_buffer, "{d:0>5} {d:0>5}\n", .{ width, height }) catch unreachable;
@@ -689,7 +693,7 @@ const Harness = struct {
         try self.pick(path);
         try self.stat(size);
         try self.probe(4000, 3000);
-        try self.thumbnail(160, 120);
+        try self.thumbnail(140, 105);
     }
 
     fn encodeLabel(format: Format) []const u8 {
@@ -824,12 +828,12 @@ test "picking a file lands the real path, its size, and a preview" {
 
     // The pixels ride the result, so this lands as a registered image
     // with no temp file and no second decode.
-    try h.thumbnail(120, 160);
+    try h.thumbnail(105, 140);
     try testing.expectEqual(Status.ready, h.model().status);
     try testing.expect(h.model().image_id != 0);
     try testing.expect(h.model().hasPreview());
-    try testing.expectEqual(@as(u32, 120), h.model().preview_width);
-    try testing.expectEqual(@as(u32, 160), h.model().preview_height);
+    try testing.expectEqual(@as(u32, 105), h.model().preview_width);
+    try testing.expectEqual(@as(u32, 140), h.model().preview_height);
     try testing.expectEqualStrings("", h.model().errorMessage());
 }
 
@@ -962,10 +966,10 @@ test "a preview answer that is not a well-formed reply fails rather than registe
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
     try h.probe(4000, 3000);
-    // The header says 160x120, the pixel run is one byte short. Registering
+    // The header says 140x105, the pixel run is one byte short. Registering
     // this would hand the canvas a buffer smaller than the dimensions it
     // was told to draw.
-    const truncated = previewReply(160, 120);
+    const truncated = previewReply(140, 105);
     try h.thumbnailRaw(true, truncated[0 .. truncated.len - 1]);
 
     try testing.expectEqual(Status.failed, h.model().status);
@@ -1067,7 +1071,7 @@ test "reset frees the effect keys so the next pick is not rejected" {
     try h.pick("/Users/someone/Pictures/second.jpg");
     try h.stat("200");
     try h.probe(4000, 3000);
-    try h.thumbnail(160, 90);
+    try h.thumbnail(140, 79);
 
     try testing.expectEqual(Status.ready, h.model().status);
     try testing.expectEqualStrings("/Users/someone/Pictures/second.jpg", h.model().path());
@@ -1214,7 +1218,7 @@ test "format survives picking a file, unlike the rest of the model" {
     try h.pick("/Users/someone/Pictures/photo.jpg");
     try h.stat("2516582");
     try h.probe(4000, 3000);
-    try h.thumbnail(160, 120);
+    try h.thumbnail(140, 105);
 
     // The pick chain touches file/preview state only; format is a
     // standing preference, not something a load can clobber.
@@ -1631,12 +1635,10 @@ test "an output larger than the source reads as larger, not a broken percentage"
     try h.encodeOk(.webp, "68");
 
     try testing.expectEqual(Status.done, h.model().status);
-    const avif_line = h.model().avifResult(arena);
-    try testing.expect(std.mem.indexOf(u8, avif_line, "larger") != null);
-    try testing.expect(std.mem.indexOf(u8, avif_line, "−") == null);
+    try testing.expectEqualStrings("+1% larger", h.model().avifSavings(arena));
     // The other format compressed fine in the same run — one growing does
     // not make the run a failure, or the other line wrong.
-    try testing.expect(std.mem.indexOf(u8, h.model().webpResult(arena), "−78%") != null);
+    try testing.expectEqualStrings("−78%", h.model().webpSavings(arena));
 }
 
 test "formatSavings covers smaller, larger, and unchanged outputs" {
@@ -1667,13 +1669,18 @@ test "result lines render only for the formats that landed" {
     try h.encodeOk(.avif, "717003");
     try h.encodeReply(.webp, false, "encode");
 
-    try testing.expectEqualStrings("AVIF  700.2 KB  −88%", h.model().avifResult(arena));
-    try testing.expectEqualStrings("", h.model().webpResult(arena));
+    try testing.expectEqualStrings("700.2 KB", h.model().avifSize(arena));
+    try testing.expectEqualStrings("−88%", h.model().avifSavings(arena));
+    try testing.expectEqualStrings("", h.model().webpSize(arena));
+    try testing.expectEqualStrings("", h.model().webpSavings(arena));
 
-    // ...and the view agrees: exactly one result line is in the tree.
+    // ...and the view agrees: the AVIF row's three registers are in the
+    // tree and the WebP row is absent entirely.
     const tree = try buildTree(arena, h.model());
-    try testing.expect(findByText(tree.root, .text, "AVIF  700.2 KB  −88%") != null);
-    try testing.expect(findByText(tree.root, .text, "") == null);
+    try testing.expect(findByText(tree.root, .text, "AVIF") != null);
+    try testing.expect(findByText(tree.root, .text, "700.2 KB") != null);
+    try testing.expect(findByText(tree.root, .badge, "−88%") != null);
+    try testing.expect(findByText(tree.root, .text, "WebP") == null);
 }
 
 // ------------------------------------------------------ lifecycle guards
@@ -1770,7 +1777,7 @@ test "picking a new file clears the previous file's results" {
 
     try h.stat("204800");
     try h.probe(4000, 3000);
-    try h.thumbnail(160, 120);
+    try h.thumbnail(140, 105);
     try testing.expectEqual(Status.ready, h.model().status);
 }
 
@@ -2232,8 +2239,8 @@ test "the preview renders only once an image is registered" {
     // keeps the source's aspect ratio instead of a hardcoded box. (Frames
     // are zero here: `finalize` builds the tree, the runtime lays it out.
     // The declared definite size is what the markup actually states.)
-    try testing.expectEqual(@as(f32, 160), image.layout.max_size.width);
-    try testing.expectEqual(@as(f32, 120), image.layout.max_size.height);
+    try testing.expectEqual(@as(f32, 140), image.layout.max_size.width);
+    try testing.expectEqual(@as(f32, 105), image.layout.max_size.height);
 }
 
 // ================================================================ imageio
@@ -2274,11 +2281,11 @@ test "parseProbeReply rejects every shape that is not a probe answer" {
 }
 
 test "parsePreviewReply splits the fixed-width header from the pixels" {
-    const reply = previewReply(160, 120);
+    const reply = previewReply(140, 105);
     const preview = main.parsePreviewReply(reply) orelse return error.NotParsed;
-    try testing.expectEqual(@as(u32, 160), preview.width);
-    try testing.expectEqual(@as(u32, 120), preview.height);
-    try testing.expectEqual(@as(usize, 160 * 120 * 4), preview.pixels.len);
+    try testing.expectEqual(@as(u32, 140), preview.width);
+    try testing.expectEqual(@as(u32, 105), preview.height);
+    try testing.expectEqual(@as(usize, 140 * 105 * 4), preview.pixels.len);
     try testing.expectEqual(@as(u8, 0x80), preview.pixels[0]);
 }
 
@@ -2457,7 +2464,7 @@ test "a real drop lands the real path, its size, and a preview" {
 
     try h.stat("1024");
     try h.probe(800, 600);
-    try h.thumbnail(160, 120);
+    try h.thumbnail(140, 105);
 
     try testing.expectEqual(Status.ready, h.model().status);
     try testing.expect(h.model().hasPreview());
@@ -2682,4 +2689,253 @@ test "forSource keys on the UTI and reads the file only for a JPEG" {
     // reproduce `avifenc` on it either way, and of the two guesses only
     // one is incapable of losing chroma detail.
     try testing.expectEqual(chroma.Subsampling.yuv444, chroma.forSource("public.jpeg", ""));
+}
+
+// ------------------------------------------------------ design tokens
+//
+// The palette is app-owned (`main.tokens`), which means nothing in the SDK
+// is checking that it stays legible. These two tests are that check, and
+// they found two real bugs the first time they ran: a dark segmented track
+// at ΔL* 2.07 against the window (invisible — the thumb had nothing to sit
+// on) and a light muted ink at 4.25:1 on the drop zone. Neither is
+// something a text-contrast pass alone would have caught, because the
+// first pair is two surfaces and the second only fails on ONE of the three
+// grounds muted ink lands on.
+//
+// The pairs below are exactly the pairs the markup DRAWS — not the cross
+// product of the palette. A pair nothing renders is a constraint on
+// nothing; a pair the view renders and the test omits is the bug.
+
+/// WCAG relative luminance: sRGB channels linearised, then the standard
+/// coefficients. `Color` already stores 0..1 sRGB-encoded floats.
+fn relativeLuminance(color: canvas.Color) f64 {
+    const channel = struct {
+        fn f(v: f32) f64 {
+            const c: f64 = v;
+            return if (c <= 0.04045) c / 12.92 else std.math.pow(f64, (c + 0.055) / 1.055, 2.4);
+        }
+    }.f;
+    return 0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b);
+}
+
+/// WCAG contrast ratio, order-independent.
+fn contrastRatio(a: canvas.Color, b: canvas.Color) f64 {
+    const ya = relativeLuminance(a);
+    const yb = relativeLuminance(b);
+    return (@max(ya, yb) + 0.05) / (@min(ya, yb) + 0.05);
+}
+
+/// CIE L* from the relative luminance — perceptual lightness, which is
+/// what "can I see this surface against that one" is asking. Two surfaces
+/// can differ in hex and be the same lightness; ΔL* is the honest measure.
+fn lightness(color: canvas.Color) f64 {
+    const y = relativeLuminance(color);
+    const f = if (y > 0.008856) std.math.cbrt(y) else 7.787 * y + 16.0 / 116.0;
+    return 116.0 * f - 16.0;
+}
+
+fn schemeTokens(scheme: canvas.ColorScheme) canvas.ColorTokens {
+    var model = Model{};
+    model.color_scheme = scheme;
+    return main.tokens(&model).colors;
+}
+
+test "every adjacent surface pair separates by at least 3 L* in both schemes" {
+    for ([_]canvas.ColorScheme{ .light, .dark }) |scheme| {
+        const c = schemeTokens(scheme);
+        const pairs = [_]struct { name: []const u8, a: canvas.Color, b: canvas.Color }{
+            // The drop zone, the preview frame and every result card sit
+            // straight on the window ground.
+            .{ .name = "surface_subtle on background", .a = c.surface_subtle, .b = c.background },
+            // The segmented track, likewise.
+            .{ .name = "surface_pressed on background", .a = c.surface_pressed, .b = c.background },
+            // The thumb on that track — the pair that forces
+            // `surface_pressed` to be the DARKER step in both schemes,
+            // because a ghost toggle-button's selected fill is hard-wired
+            // to `surface_subtle` and cannot be moved.
+            .{ .name = "surface_subtle on surface_pressed", .a = c.surface_subtle, .b = c.surface_pressed },
+        };
+        for (pairs) |pair| {
+            const delta = @abs(lightness(pair.a) - lightness(pair.b));
+            if (delta < 3.0) {
+                std.debug.print("{t}: {s} is only {d:.2} L* apart\n", .{ scheme, pair.name, delta });
+                return error.SurfacePairTooClose;
+            }
+        }
+
+        // DIRECTION, not just separation: the track must be the DARKER
+        // step in both schemes. A ghost toggle-button's selected fill is
+        // hard-wired to `surface_subtle`, so a track that drifted lighter
+        // than the thumb would still pass the ΔL* gate above while the
+        // thumb read as a hole punched in the track.
+        if (lightness(c.surface_pressed) >= lightness(c.surface_subtle)) {
+            std.debug.print("{t}: surface_pressed is not darker than surface_subtle\n", .{scheme});
+            return error.TrackNotUnderThumb;
+        }
+    }
+}
+
+test "every drawn text pair clears 4.5:1, and the spinner clears 3:1" {
+    for ([_]canvas.ColorScheme{ .light, .dark }) |scheme| {
+        const c = schemeTokens(scheme);
+        const text_pairs = [_]struct { name: []const u8, ink: canvas.Color, ground: canvas.Color }{
+            // The file name, on the window ground.
+            .{ .name = "text on background", .ink = c.text, .ground = c.background },
+            // The subtitle, the "Format" label, the status line.
+            .{ .name = "text_muted on background", .ink = c.text_muted, .ground = c.background },
+            // The drop zone's headline; a result row's format name.
+            .{ .name = "text on surface_subtle", .ink = c.text, .ground = c.surface_subtle },
+            // The drop zone's hint; a result row's size figure.
+            .{ .name = "text_muted on surface_subtle", .ink = c.text_muted, .ground = c.surface_subtle },
+            // The savings figure — the number the whole app exists to
+            // produce, and the only place lilac appears.
+            .{ .name = "success on surface_subtle", .ink = c.success, .ground = c.surface_subtle },
+            // The Smoosh button's label, knocked out of the peach fill.
+            .{ .name = "accent_text on accent", .ink = c.accent_text, .ground = c.accent },
+            // The failure mark. A 14px icon is non-text by WCAG and would
+            // pass at 3:1; it is held to the text bar because it is the
+            // only signal that a message is a failure rather than a
+            // result, and it sits next to text that clears 4.5.
+            .{ .name = "destructive on background", .ink = c.destructive, .ground = c.background },
+        };
+        for (text_pairs) |pair| {
+            const ratio = contrastRatio(pair.ink, pair.ground);
+            if (ratio < 4.5) {
+                std.debug.print("{t}: {s} is only {d:.2}:1\n", .{ scheme, pair.name, ratio });
+                return error.TextContrastTooLow;
+            }
+        }
+
+        // The spinner is a moving graphic, not text: 3:1 is the honest
+        // bar. It is stated separately rather than folded in at 4.5,
+        // because the light sky (#5090C8) measures 3.32 and passing it
+        // through the text gate would mean darkening a colour that is
+        // correct for what it is.
+        const spinner = contrastRatio(c.info, c.background);
+        if (spinner < 3.0) {
+            std.debug.print("{t}: info on background is only {d:.2}:1\n", .{ scheme, spinner });
+            return error.SpinnerContrastTooLow;
+        }
+    }
+}
+
+// ------------------------------------------------------- layout floor
+//
+// The app is meant to live in a corner of the desktop, so the constraint
+// is not "does it look right at 540x400" but "does the TALLEST state
+// still fit the SMALLEST window". That state is a done run in Both mode:
+// a 144px preview frame, two result cards under it, the format row, the
+// actions row and the footer, with nothing that can shrink.
+//
+// This is checked by laying the real tree out at the real floor and
+// asserting nothing spills past it. Flex overflow is otherwise SILENT
+// outside a debug app run — the runtime logs `zero_canvas_layout` and
+// keeps going, so a regression here would ship as a clipped Save button
+// nobody noticed.
+
+/// Deepest vertical overflow of any widget past its OWN container's
+/// bottom edge, or null when everything fits.
+///
+/// Against the parent, not against the window: a column that cannot fit
+/// its children hands each of them a frame anyway, and the spill shows up
+/// as a child hanging out of its immediate parent — the root's own frame
+/// stays exactly the window, so a root-only check reports nothing while
+/// the Save button is clipped.
+fn layoutBottomOverflow(layout: canvas.WidgetLayoutTree) ?f32 {
+    var worst: f32 = 0;
+    for (layout.nodes) |node| {
+        const parent_index = node.parent_index orelse continue;
+        const parent = layout.nodes[parent_index].frame;
+        const overflow = (node.frame.y + node.frame.height) - (parent.y + parent.height);
+        if (overflow > worst) worst = overflow;
+    }
+    // The same tolerance layout itself uses to separate real overflow
+    // from float noise.
+    return if (worst > 0.5) worst else null;
+}
+
+fn expectFitsAtFloor(arena: std.mem.Allocator, model: *const Model) !void {
+    const tree = try buildTree(arena, model);
+    const nodes = try arena.alloc(canvas.WidgetLayoutNode, 128);
+    const layout = try canvas.layoutWidgetTreeWithTokens(
+        tree.root,
+        geometry.RectF.init(0, 0, main.window_min_width, main.window_min_height),
+        main.tokens(model),
+        nodes,
+    );
+    if (layoutBottomOverflow(layout)) |overflow| {
+        std.debug.print(
+            "the view overflows a {d}x{d} window by {d:.2}pt - the preview frame is the usual thing to pay with\n",
+            .{ main.window_min_width, main.window_min_height, overflow },
+        );
+        return error.LayoutOverflowsFloor;
+    }
+}
+
+test "the tallest state fits the smallest window, in both schemes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // Both formats landed: the preview card plus two result rows, which
+    // is every pixel the view can ever ask for.
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "671054");
+    try h.encodeOk(.webp, "717003");
+    try testing.expectEqual(Status.done, h.model().status);
+
+    // Both schemes, because the palette is per-scheme and a pack's
+    // control metrics ride the same tokens the colours do.
+    for ([_]canvas.ColorScheme{ .light, .dark }) |scheme| {
+        h.model().color_scheme = scheme;
+        try expectFitsAtFloor(arena, h.model());
+    }
+}
+
+test "the idle drop zone fits the smallest window" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const model = Model{};
+    try expectFitsAtFloor(arena, &model);
+}
+
+test "the appearance toggle flips the scheme and pins it against the OS" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    h.model().color_scheme = .light;
+    try testing.expect(!h.model().scheme_pinned);
+
+    // The OS still wins while nothing has been pinned.
+    try h.send(.{ .appearance_changed = .{ .color_scheme = .dark } });
+    try testing.expectEqual(canvas.ColorScheme.dark, h.model().color_scheme);
+
+    // A press flips it and takes ownership...
+    try h.send(.toggle_color_scheme);
+    try testing.expectEqual(canvas.ColorScheme.light, h.model().color_scheme);
+    try testing.expect(h.model().scheme_pinned);
+
+    // ...after which an OS flip no longer moves it. A manual choice the
+    // next system change silently undid would be worse than no toggle.
+    try h.send(.{ .appearance_changed = .{ .color_scheme = .dark } });
+    try testing.expectEqual(canvas.ColorScheme.light, h.model().color_scheme);
+
+    // Contrast and reduce-motion are accessibility settings, not a
+    // preference the button offers, so they keep following the system.
+    try h.send(.{ .appearance_changed = .{ .color_scheme = .dark, .high_contrast = true, .reduce_motion = true } });
+    try testing.expect(h.model().high_contrast);
+    try testing.expect(h.model().reduce_motion);
+    try testing.expectEqual(canvas.ColorScheme.light, h.model().color_scheme);
+
+    // Reset clears the file, never the appearance.
+    try h.send(.reset);
+    try testing.expectEqual(canvas.ColorScheme.light, h.model().color_scheme);
+    try testing.expect(h.model().scheme_pinned);
 }

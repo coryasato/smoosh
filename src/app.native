@@ -1,14 +1,24 @@
 <!-- Two shapes, one column: with no file the middle is a pressable drop
-     zone that fills the window; with one it is a card — preview on the
-     left, the file's name/size and per-format results on the right. The
-     chrome around them (header, format chips, actions, status) never
-     moves, so the window never reflows out from under a press.
+     zone that fills the window; with one it is a card — a preview beside
+     the file's name and size, with one result row per format underneath,
+     spanning the content width. The chrome around them (format chips,
+     actions, status) never moves, so the window never reflows out from
+     under a press.
+
+     There is NO in-window header. The titlebar already says Smoosh; a
+     wordmark and app icon said it twice more in a 540pt window, and the
+     row also stranded a Reset button above an empty drop zone offering to
+     undo nothing. Reset now sits beside Smoosh and takes the same
+     treatment — disabled on exactly the guard that makes a press a no-op.
+     The 46px that bought went to the preview frame.
 
      The copy says "drop", not just "click" — `on_drop` (SDK 0.8.2+) makes
      a real window-wide drag-and-drop land in the same load chain a picked
      file does (see `main.zig`'s `onDrop`/`beginLoad`). The zone itself
      stays a click target too: dropping anywhere in the window works, but
-     the zone is still the one thing worth pointing at.
+     the zone is still the one thing worth pointing at. It is a WASH, not
+     an outline: no `border` attribute exists on a panel and nothing in
+     the SDK strokes dashes, so the recess is the whole affordance.
 
      Every direct child of the root column carries a `key`. Without one,
      unkeyed same-kind siblings take POSITIONAL identity, so each `<if>`
@@ -18,110 +28,227 @@
      identity regardless of which conditionals are currently in the tree,
      which is what `native automate` scripts (and engine-owned widget
      state) rely on. Validate with: native check -->
-<column gap="12" padding="16">
-  <row key="header" gap="8" cross="center">
-    <text grow="1" size="heading">Smoosh</text>
-    <button size="sm" variant="ghost" on-press="reset">Reset</button>
-  </row>
-
-  <!-- The middle band. Both arms carry `grow="1"` so the window's spare
-       height lands here rather than stretching the control rows. -->
-  <if test="{hasFile}">
-    <row key="file" gap="12" cross="center" grow="1">
-      <!-- The preview is an ImageIO thumbnail, not the source image —
-           registered images are capped at 1 MiB of decoded RGBA (512x512),
-           and the 256 KiB host-result cap the pixels ride binds tighter
-           still. Drawn at its own honest size: ImageIO CAPS at 160px
-           rather than upscaling to it, so an 8x8 icon comes back 8x8 and
-           draws 8x8. -->
-      <if test="{hasPreview}">
-        <!-- A FIXED 168x168 frame (4px around the 160px thumbnail's longest
-             edge) with the image centred inside. The image keeps its honest
-             size, so an 8x8 icon draws 8x8 rather than a blurry 160x160 —
-             but the card's geometry no longer depends on it, which is what
-             stops a small source from rendering as a lost dot in an empty
-             row. -->
-        <panel key="preview-frame" width="168" height="168" background="surface_subtle" radius="md">
-          <column grow="1" main="center" cross="center">
-            <image image="{image_id}" width="{preview_width}" height="{preview_height}" label="Preview of the chosen image" />
+<!-- `background="background"` is not decoration — it is a REPAINT fix.
+     The window ground is otherwise the surface's clear colour, which is
+     not a display-list command, so a theme flip changes it while nothing
+     damages the bare regions: the runtime's incremental present repaints
+     only the widgets whose commands changed and leaves every uncovered
+     patch of ground in the OLD scheme. Toggling light/dark showed the top
+     of the window in one scheme and the bottom in the other until the
+     next content change forced a full repaint. Painting the ground as a
+     real fill puts it in the diff, so a token change damages it like
+     anything else. -->
+<column background="background">
+  <!-- The root column takes NO padding of its own so the separator below
+       can bleed to both window edges. The body carries the 16, and the
+       footer restates it — `padding` is a single uniform number with no
+       per-side values anywhere, so a padded root could not have produced
+       a full-width rule. -->
+  <column key="body" grow="1" gap="12" padding="16">
+    <!-- The middle band. Both arms carry `grow="1"` so the window's spare
+         height lands here rather than stretching the control rows. -->
+    <if test="{hasFile}">
+      <column key="file" gap="12" grow="1">
+        <row key="summary" gap="12" cross="center">
+          <!-- The preview is an ImageIO thumbnail, not the source image —
+               registered images are capped at 1 MiB of decoded RGBA
+               (512x512), and the 256 KiB host-result cap the pixels ride
+               binds tighter still. Drawn at its own honest size: ImageIO
+               CAPS at its long edge rather than upscaling to it, so an
+               8x8 icon comes back 8x8 and draws 8x8. -->
+          <if test="{hasPreview}">
+            <!-- A FIXED 144x144 frame with the image centred inside. The
+                 image keeps its honest size, so an 8x8 icon draws 8x8
+                 rather than a blurry 144x144 — but the card's geometry no
+                 longer depends on it, which is what stops a small source
+                 from rendering as a lost dot in an empty row. 144, down
+                 from 168, is what pays for the result rows below: beside
+                 a 168px preview a row carrying a labelled Save overflowed
+                 the 420pt minimum by 40px. -->
+            <panel key="preview-frame" width="144" height="144" background="surface_subtle" radius="lg">
+              <column grow="1" main="center" cross="center">
+                <image image="{image_id}" width="{preview_width}" height="{preview_height}" label="Preview of the chosen image" />
+              </column>
+            </panel>
+          </if>
+          <column key="details" grow="1" gap="3">
+            <text key="name"><span weight="medium">{fileName}</span></text>
+            <text key="subtitle" size="sm" foreground="text_muted">{fileSubtitle}</text>
           </column>
-        </panel>
-      </if>
-      <column key="details" grow="1" gap="4">
-        <text key="name"><span weight="medium">{fileName}</span></text>
-        <text key="original" foreground="text_muted">Original {originalSize}</text>
-        <!-- One row per format that actually landed. Per-format rather
-             than a summed "combined savings" — no client ever downloads both
-             files, so each line reports what would really be served. A format
-             that failed shows no row; the status bar names it. Each row
-             carries its own save icon — the file already exists on disk
-             next to the source, so "Save As" here means "copy THIS one
-             file elsewhere", not a global action. -->
-        <if test="{hasAvifResult}">
-          <row key="avif-result" gap="4" cross="center">
-            <text grow="1" foreground="success">{avifResult}</text>
-            <stack>
-              <button size="sm" variant="ghost" icon="save" on-press="save_avif_as"
-                      disabled="{isSaving}" label="Save AVIF as…" />
-              <tooltip anchor="above">Save AVIF as…</tooltip>
-            </stack>
-          </row>
-        </if>
-        <if test="{hasWebpResult}">
-          <row key="webp-result" gap="4" cross="center">
-            <text grow="1" foreground="success">{webpResult}</text>
-            <stack>
-              <button size="sm" variant="ghost" icon="save" on-press="save_webp_as"
-                      disabled="{isSaving}" label="Save WebP as…" />
-              <tooltip anchor="above">Save WebP as…</tooltip>
-            </stack>
-          </row>
-        </if>
+        </row>
+
+        <!-- One card per format that actually landed, BELOW the preview
+             and spanning the content width. Per-format rather than a
+             summed "combined savings" — no client ever downloads both
+             files, so each row reports what would really be served. A
+             format that failed shows no row; the status bar names it.
+             Each row carries its own Save — the file already exists on
+             disk next to the source, so it means "copy THIS one file
+             elsewhere", not a global action.
+
+             Three registers per row, which is why it is three widgets and
+             not one line of text: the format name in ink, the size muted,
+             the savings figure in lilac. `<span>` carries weight and
+             scale but NOT `foreground`, so a two-tone line cannot be one
+             `<text>`.
+
+             The leading `<spacer>` is the row's left inset, and the
+             height is stated rather than padded: `padding` is uniform, so
+             the 10pt left inset the design draws would be 10 top and
+             bottom too, and a card built around a 28pt `size="sm"`
+             control would come out 48. `height="34"` is the design's
+             figure directly, with `cross="center"` centring the control
+             in it. -->
+        <column key="results" gap="6">
+          <if test="{hasAvifResult}">
+            <row key="avif-result" background="surface_subtle" radius="md" height="34" gap="8" cross="center">
+              <spacer width="2" />
+              <text size="sm" min-width="38"><span weight="medium">AVIF</span></text>
+              <text size="sm" foreground="text_muted">{avifSize}</text>
+              <spacer grow="1" />
+              <!-- The one pill outline available: a `<badge>` draws its
+                   own border where a panel cannot. One hue, never two by
+                   magnitude — a threshold would be invented, and at −89%
+                   vs −88% both rows land the same colour anyway, so the
+                   cue would go quiet exactly where comparing two formats
+                   is worth doing. -->
+              <badge variant="outline" foreground="success">{avifSavings}</badge>
+              <!-- `icon="download"`, NOT `icon="save"`: the registry's
+                   `save` is a floppy disk — three paths with an inner
+                   label plate that collapses into mush at 14px. -->
+              <button size="sm" variant="ghost" icon="download" on-press="save_avif_as"
+                      disabled="{isSaving}" label="Save AVIF as…">Save</button>
+            </row>
+          </if>
+          <if test="{hasWebpResult}">
+            <row key="webp-result" background="surface_subtle" radius="md" height="34" gap="8" cross="center">
+              <spacer width="2" />
+              <text size="sm" min-width="38"><span weight="medium">WebP</span></text>
+              <text size="sm" foreground="text_muted">{webpSize}</text>
+              <spacer grow="1" />
+              <badge variant="outline" foreground="success">{webpSavings}</badge>
+              <button size="sm" variant="ghost" icon="download" on-press="save_webp_as"
+                      disabled="{isSaving}" label="Save WebP as…">Save</button>
+            </row>
+          </if>
+        </column>
       </column>
+    </if>
+    <else>
+      <panel key="dropzone" grow="1" padding="16" background="surface_subtle" radius="xl"
+             on-press="pick_file" label="Drop an image, or click to choose one to compress">
+        <column gap="6" grow="1" main="center" cross="center">
+          <icon name="folder-open" width="28" height="28" foreground="text_muted" />
+          <text text-alignment="center">Drop an image here — or click to choose</text>
+          <text size="sm" foreground="text_muted" text-alignment="center">JPEG, PNG, HEIC, WebP, TIFF or GIF, up to 100 MB</text>
+        </column>
+      </panel>
+    </else>
+
+    <!-- ONE control row: the format choice on the left, the two actions
+         on the right, everything on the same baseline. The canvas draws
+         these as two stacked rows; folded into one they read as a single
+         "set it, then run it" line and give the tallest state back the
+         vertical room that a second row and its 12pt gap cost.
+
+         Everything in it is `size="sm"`, which is what makes the row one
+         height: the SDK's control rungs are sm 32 / default 40, so a
+         default-size Smoosh beside a sm Reset differs by 8px and cannot
+         be aligned. Hierarchy comes from the fill and the weight.
+
+         The segmented control: `<toggle-group>` paints NOTHING at all (an
+         explicit no-op arm in the render switch), so the track is the
+         wrapping `<row>` and the thumb is the ghost toggle-button's own
+         selected state — transparent at rest, `surface_subtle` when
+         selected. That is why `surface_pressed` is the darker step in
+         both schemes (see `palette` in main.zig): the track has to sit
+         UNDER the thumb. The label stays "Format" rather than a
+         tracked-out FORMAT — there is no letter-spacing to track with.
+
+         Each action disables on exactly the guard its own `update` arm
+         enforces, so a press that would be a silent no-op is shown as
+         unavailable: Smoosh on `canSmoosh`, Reset on `hasFile`. Choosing
+         a file lives on the drop zone above, and saving a copy lives on
+         each result row. -->
+    <row key="actions" gap="8" cross="center">
+      <text size="sm" foreground="text_muted">Format</text>
+      <row background="surface_pressed" radius="md" padding="1">
+        <toggle-group gap="2" label="Format">
+          <for each="formats" as="f">
+            <toggle-button size="sm" variant="ghost" selected="{f.value == format}" on-toggle="set_format:{f.value}">{f.label}</toggle-button>
+          </for>
+        </toggle-group>
+      </row>
+      <spacer grow="1" />
+      <!-- Both actions are stated at 30 — the segmented track's height
+           (a 28pt control plus its 1pt of track on each side), so the
+           whole row is one silhouette rather than a 30pt pill beside two
+           28pt ones. The buttons cannot reach it through the control
+           rungs: sm IS 28, and the track is by construction the segment
+           height plus its own padding, so it is always taller than the
+           control inside it.
+
+           Smoosh also carries a `min-width`. The house register holds one
+           10pt horizontal inset across every rung, so a button hugs its
+           label; the design gives the primary action 18 a side, and the
+           extra width is most of what makes it read as the thing to
+           press. `min-width` buys it on THIS button alone — raising
+           `button_inset_sm` would widen Reset, both Save buttons and
+           every segment with it, and the row has no room to spare at the
+           420pt floor. -->
+      <button size="sm" height="30" variant="ghost" on-press="reset" disabled="{not hasFile}">Reset</button>
+      <button size="sm" height="30" min-width="88" variant="primary" on-press="smoosh" disabled="{not canSmoosh}">Smoosh</button>
     </row>
-  </if>
-  <else>
-    <panel key="dropzone" grow="1" padding="16" background="surface_subtle" radius="lg"
-           on-press="pick_file" label="Drop an image, or click to choose one to compress">
-      <column gap="6" grow="1" main="center" cross="center">
-        <icon name="folder-open" width="28" height="28" foreground="text_muted" />
-        <text text-alignment="center">Drop an image here — or click to choose</text>
-        <text foreground="text_muted" text-alignment="center">JPEG, PNG, HEIC, WebP, TIFF or GIF, up to 100 MB</text>
-      </column>
-    </panel>
-  </else>
+  </column>
 
-  <row key="format" gap="8" cross="center">
-    <text foreground="text_muted">Format</text>
-    <toggle-group gap="4" label="Format">
-      <for each="formats" as="f">
-        <toggle-button size="sm" selected="{f.value == format}" on-toggle="set_format:{f.value}">{f.label}</toggle-button>
-      </for>
-    </toggle-group>
-  </row>
+  <!-- A full-bleed hairline and about 10px, which is the Mac answer: it
+       divides machine chatter from the controls without introducing a
+       second surface, and it survives the empty state — a rule with
+       nothing under it still reads as a status area, where a bare gap
+       reads as nothing at all. A filled band was the alternative and puts
+       a second cream surface directly under the cream drop zone, which in
+       a 400pt window is a permanent 34px carrying nothing. -->
+  <separator key="footer-rule" />
 
-  <!-- Smoosh disables on exactly the guard `update`'s own arm enforces
-       (`canSmoosh`) — a press that would be a silent no-op is better shown
-       as unavailable. Choosing a file lives on the dropzone/hero above,
-       and saving a copy lives on each result row's own icon — this row is
-       purely "run the compression". -->
-  <row key="actions" gap="8" cross="center">
-    <spacer grow="1" />
-    <button variant="primary" on-press="smoosh" disabled="{not canSmoosh}">Smoosh</button>
-  </row>
-
-  <row key="status" gap="8" cross="center">
+  <row key="status" gap="8" cross="center" padding="16">
+    <!-- One slot, three faces. A spinner while work is in flight, an
+         alert on failure, a lilac dot on success — all beside the bar
+         rather than recolouring it, because two `<status-bar>`s behind an
+         if/else would give the status line two different widget ids and
+         automation scripts address it as one. The failure mark is
+         `alert` (a circle with a bang), not a triangle. -->
     <if test="{isBusy}">
       <spinner key="busy" width="14" height="14" />
     </if>
-    <!-- A failure and a success both land in the same line of text, so the
-         failure gets a mark of its own. Beside the bar rather than
-         recolouring it: two `<status-bar>`s behind an if/else would give
-         the status line two different widget ids, and automation scripts
-         address it as one. -->
     <if test="{isFailed}">
       <icon key="failed" name="alert" width="14" height="14" foreground="destructive" label="Failed" />
     </if>
-    <status-bar grow="1">{statusLine}</status-bar>
+    <!-- A filled 7px dot, which no icon in the registry is: `circle-dot`
+         draws a ring around one. A panel is the dot — `radius` clamps to
+         half the box, so `sm` (8) rounds a 7px square to a circle. -->
+    <if test="{isDone}">
+      <panel key="done-dot" width="7" height="7" background="success" radius="sm" label="Done" />
+    </if>
+    <!-- A plain `<text>`, NOT a `<status-bar>`. The widget paints a band
+         whether or not you want one: an unconditional `surface` fill over
+         its whole frame, its own top hairline (a second rule directly
+         under the separator above), and a fixed 14pt text inset that
+         `padding` cannot clear — `padding="0"` falls back to the default.
+         That band IS the filled-footer treatment this design rejected,
+         and it also broke the left edge, sitting the status text 14pt in
+         from the content above it.
+
+         The design's constraint was never the KIND: one status widget,
+         one id, one colour, so the mark beside it carries the tone and
+         automation addresses the line as one thing. A `<text>` keeps
+         every part of that. -->
+    <text key="status-line" size="sm" foreground="text_muted" grow="1">{statusLine}</text>
+    <!-- The appearance toggle. It offers the OTHER scheme — `moon` while
+         light, `sun` while dark — so the glyph names what a press
+         produces. Icon-only, so `label` is its accessible name, and both
+         come from the model rather than an `<if>`: two conditional
+         buttons would be two widget ids for one control. -->
+    <button key="scheme-toggle" size="sm" variant="ghost" icon="{schemeIcon}"
+            on-press="toggle_color_scheme" label="{schemeToggleLabel}" />
   </row>
 </column>

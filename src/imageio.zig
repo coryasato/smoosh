@@ -15,7 +15,7 @@
 //!
 //!   `probe`     — properties only. Allocates no bitmap anywhere, so the
 //!                 megapixel guard can run BEFORE anything is decoded.
-//!   `thumbnail` — <=160px preview, orientation baked by ImageIO itself.
+//!   `thumbnail` — <=140px preview, orientation baked by ImageIO itself.
 //!   `decode`    — full resolution, upright, sRGB: the ENCODERS' input.
 //!                 Allocates, and can allocate 200 MB.
 //!
@@ -150,10 +150,15 @@ pub const Error = error{
 
 // ------------------------------------------------------------- helpers
 
-/// Longest edge of the preview, in pixels. The binding constraint is the
-/// 256 KiB host-result cap, not the 1 MiB registered-image budget — see
-/// `main.zig`'s `thumbnail_result` arm, which asserts the fit at comptime.
-pub const max_thumbnail_edge: u32 = 160;
+/// Longest edge of the preview, in pixels.
+///
+/// The binding constraint is NOT a budget — the 256 KiB host-result cap
+/// the pixels ride would allow 160, and `main.zig`'s `thumbnail_result`
+/// arm asserts that fit at comptime. It is the LAYOUT: `app.native` draws
+/// the preview inside a fixed 144x144 frame, and a thumbnail with a
+/// longer edge than the frame would overflow it. 140 leaves the 2px
+/// margin the frame is drawn with.
+pub const max_thumbnail_edge: u32 = 140;
 
 /// Widest UTI we will carry back ("public.heic", "org.webmproject.webp",
 /// "com.microsoft.bmp"): 64 is roomy for every type ImageIO names.
@@ -405,9 +410,9 @@ pub const Thumbnail = struct {
 ///
 /// `CGImageSourceCreateThumbnailAtIndex`, not
 /// `CGImageSourceCreateImageAtIndex` — Smoosh accepts sources up to 50 MP
-/// and decoding all of one to draw a 160px card would be absurd.
+/// and decoding all of one to draw a 140px card would be absurd.
 /// `kCGImageSourceCreateThumbnailWithTransform` is what bakes the EXIF
-/// rotation (measured: a 4000x3000 Orientation=6 JPEG comes back 120x160),
+/// rotation (measured: a 4000x3000 Orientation=6 JPEG comes back 105x140),
 /// so this path needs no transform of its own — `decode` below does.
 ///
 /// `kCGImageSourceCreateThumbnailFromImageAlways` forces the thumbnail to
@@ -481,7 +486,7 @@ pub const Decoded = struct {
 ///  - **EXIF orientation baked in, BY HAND.** Unlike `thumbnail`, this
 ///    path gets no help: `CGImageSourceCreateImageAtIndex` returns the
 ///    frame unrotated (measured — the same 4000x3000 Orientation 6 source
-///    comes back 120x160 as a thumbnail and 4000x3000 unrotated here).
+///    comes back 105x140 as a thumbnail and 4000x3000 unrotated here).
 ///    This is what stops the same source producing an upright AVIF and a
 ///    sideways WebP.
 ///  - **sRGB, converted and not merely passed through.** The bitmap

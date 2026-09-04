@@ -109,12 +109,13 @@ test "the thumbnail caps at the max edge, keeps aspect, and never upscales" {
 
     const wide_path = try writeFixture(&path_buffer, "wide.png", wide_png);
     const capped = try thumbnail(wide_path, &pixels);
-    try testing.expectEqual(@as(u32, 160), capped.width);
-    try testing.expectEqual(@as(u32, 80), capped.height);
-    try testing.expectEqual(@as(usize, 160 * 80 * 4), capped.pixels.len);
+    // The 320x160 fixture, capped on its long edge with aspect kept.
+    try testing.expectEqual(@as(u32, 140), capped.width);
+    try testing.expectEqual(@as(u32, 70), capped.height);
+    try testing.expectEqual(@as(usize, 140 * 70 * 4), capped.pixels.len);
 
-    // This is why Phase A's drawn-size clamp could go: `sips -Z 160`
-    // UPSCALED an 8x8 source into a 160x160 blur, ImageIO leaves it 8x8.
+    // This is why Phase A's drawn-size clamp could go: `sips -Z` UPSCALED
+    // an 8x8 source into a blurry full-size square, ImageIO leaves it 8x8.
     const tiny_path = try writeFixture(&path_buffer, "tiny.png", tiny_png);
     const small = try thumbnail(tiny_path, &pixels);
     try testing.expectEqual(@as(u32, 8), small.width);
@@ -233,7 +234,7 @@ test "decode returns the full frame in straight-alpha 8-bit sRGB RGBA" {
     var decoded = try decode(testing.allocator, path);
     defer decoded.deinit(testing.allocator);
 
-    // Full resolution, not the 160px preview: `thumbnail` would have
+    // Full resolution, not the capped preview: `thumbnail` would have
     // returned this same 4x2, so the sizes alone cannot tell them apart —
     // what can is that nothing here is capped.
     try testing.expectEqual(@as(u32, orient_width), decoded.width);
