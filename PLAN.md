@@ -235,9 +235,82 @@ Ranked by payoff-to-risk:
 encoder settings or rebuilding an archive, where the parity judgment is the whole task.*
 
 ### 2. UI and style polish
-The `design` skill and Claude Design flows fit here. Constraint to respect: the app is meant to live
-in a corner of the desktop, so it must stay correct at `window_min_width` (420) and the layout floor
-recorded in `main.zig`.
+**The design is settled and drawn; none of it is built.** The canvas is the spec — 12 window states
+across light and dark, plus three sheets (design tokens, the result row, the footer):
+<https://claude.ai/code/artifact/682de599-1cc7-4306-aac0-bbf9d886c2e6>
+
+Constraint to respect: the app is meant to live in a corner of the desktop, so it must stay correct
+at `window_min_width` (420) and the layout floor recorded in `main.zig`.
+
+**Settled decisions.**
+- **The palette is app-owned**, set through `UiApp.Options.tokens` as one `canvas.DesignTokens` per
+  scheme. Peach `#F3B89A` is the Smoosh button and nothing else — the only saturated fill in the
+  window. Lilac appears once per result row, on the savings figure. Sky is work in progress (the
+  spinner). The format segments stay neutral.
+- **System face, no vendored font.** `Options.fonts` is not needed. The icon carries the
+  personality; SF is what a native macOS utility should render in.
+- **`surface_pressed` is DARKER than `surface_subtle` in BOTH schemes** (`#EAE1D3` / `#121216`) —
+  the one place this palette departs from the stock pack, where pressed is normally the lighter step
+  in a dark scheme. It is forced: `surface_pressed` is the segmented-control track and a ghost
+  `toggle-button`'s selected state is hard-wired to `surface_subtle`, so the track must sit under
+  the thumb. A `#17171C` track measured ΔL* 2.07 against the window and was invisible.
+- **No in-window header.** The titlebar already says Smoosh; a wordmark and app icon said it twice
+  more in a 540pt window. Removing the row also fixed a Reset button that sat above an empty drop
+  zone offering to undo nothing. Reset moved beside Smoosh and takes the same treatment that button
+  has — disabled on exactly the guard that makes a press a no-op (`hasFile`). Worth 46px, most of
+  which went back to the preview frame.
+- **Result rows sit BELOW the preview, spanning the content width.** Beside a 168px preview a row
+  carrying a labelled Save overflowed the 420pt minimum by 40px; below it, it clears the minimum
+  with 120px to spare. The preview frame pays: 168 → 144, ImageIO long-edge cap 160 → 140.
+- **The savings figure is one hue, not two.** A magnitude threshold would be invented, and at
+  −89% vs −88% both rows land the same colour anyway — the cue goes quiet exactly where comparing
+  two formats is worth doing.
+- **Both action buttons are `size="sm"`.** The SDK's control rungs are sm 32 / default 40, so a
+  default-size Smoosh beside a sm Reset differs by 8px and cannot be aligned. Hierarchy comes from
+  the fill and the weight.
+- **`icon="download"`, NOT `icon="save"`.** The registry's `save` is a floppy disk — three paths
+  with an inner label plate that collapses into mush at 14px. `download` is the arrow-into-tray
+  glyph. The failure mark is `alert`, a circle with a bang, not a triangle.
+
+**What the markup cannot express** — every one of these was found by reading the SDK source after
+drawing something that could not be built:
+- **No `border` attribute on a panel, and nothing in the SDK strokes dashes.** No outlined or dashed
+  drop zone; the wash IS the recess. A `<badge>` DOES draw its own border — that is the one pill
+  outline available, and it is what the savings pill uses.
+- **`<span>` carries no `foreground`** (only weight/scale/mono/italic/underline). A two-tone result
+  line needs two `<text>` widgets and a model method per half — `resultLine` splits.
+- **`padding` is a single uniform number.** No per-side values anywhere. The footer row takes the
+  body's own 16 to keep the status text on the same left edge as the content above it.
+- **`<toggle-group>` paints nothing at all** (an explicit no-op arm in the render switch). The
+  segmented track is a `<row background="surface_pressed" radius="lg" padding="2">` wrapped around
+  it. The thumb needs no styling — a ghost `toggle-button` is already transparent at rest and
+  `surface_subtle` when selected.
+- **No per-widget shadow, and no letter-spacing.** The segmented thumb is a lightness step and
+  nothing more; the label stays "Format" rather than a tracked-out FORMAT.
+- **`background` takes a token NAME, not a hex** (`.class = .token_color`). Tinted pills in an
+  arbitrary hue are out; only `badge variant="destructive"` gets a translucent hue wash, and
+  `destructive` is spoken for by the failure mark.
+
+**The work, in order.** Each step is independently checkable against the running app.
+1. `tokens_fn` — both schemes, driven off `on_appearance`. Land this first; everything else is
+   drawn against it.
+2. Root restructure — header row out, Reset into the actions row, status line out of the padded
+   body and under a full-bleed `<separator>`. Re-check every `key` on the root column's children.
+3. Segmented format row — the wrapping `<row>` plus ghost `toggle-button`s.
+4. Result rows — full-width cards, `icon="download"` with a "Save" label, `resultLine` split into
+   name/size and savings, subtitle gains the source UTI (`Original 5.7 MB · JPEG`).
+5. The state dot on `.done`, in the slot that already carries the spinner and the alert.
+
+**Verify against the running app, not the source.** Two things were read out of the SDK but never
+confirmed live: that a ghost `toggle-button`'s selected state really lands on `surface_subtle`, and
+whether unselected segment labels can be muted without an `<if>` inside the `<for>` — which collides
+with the widget-identity rule in `app.native`'s header comment.
+
+**Carry the contrast check into the test suite.** Both schemes currently pass a script over every
+adjacent surface pair (ΔL* ≥ 3) and every text pair (4.5:1, or 3:1 for the spinner). It found two
+real bugs that text-contrast checking alone missed — the invisible dark track above, and a light
+spinner at 2.90:1. As a unit test over the `tokens_fn` values in `src/tests.zig` it would catch a
+future token edit at `native test` rather than by eye.
 
 *Suggested: **Opus 5, medium.** Iterative and visual; the work is in the looking, not the
 reasoning.*
