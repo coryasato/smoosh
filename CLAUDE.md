@@ -67,7 +67,8 @@ real drag ever reaches, and a drag-over highlight is impossible — the AppKit h
 1. **Extremely simple UX** — drop zone is the entire product. Minimal chrome.
 2. **Predictable Native SDK patterns** — keep `update` pure, all I/O via the effects channel (`fx`),
    explicit messages.
-3. **Beautiful by default** — lean on Native SDK design tokens and built-in components.
+3. **Beautiful by default** — the palette is app-owned through `tokens_fn`, but every widget is a
+   stock component; nothing here is a hand-drawn imitation of one.
 4. **Fast feedback** — preview + size delta should appear quickly.
 5. **Honest about constraints** — Native SDK has no built-in encoder; Smoosh vendors its own.
 6. **macOS-first** — optimize for Apple Silicon and ImageIO.
@@ -122,7 +123,9 @@ that hides until the other artifact is built.
 
 ### Repo layout
 - `src/main.zig` — the app. Hand-authored root: builds its own platform + Runtime.
-- `src/app.native` — markup view.
+- `src/app.native` — markup view. Its header comment carries the widget-identity rule (every root
+  child is keyed) and the reasons for the shapes the SDK forced; PLAN.md's "UI and style polish"
+  carries the palette and geometry decisions.
 - `src/imageio.zig` — the whole ImageIO C-ABI seam (`extern fn`, not `@cImport`): `probe`,
   `thumbnail` and `decode`, all callable from a worker thread and all returning straight-alpha
   8-bit sRGB. `probe` and `thumbnail` are host commands; **`decode` deliberately is not** — a
@@ -171,13 +174,19 @@ For a hand-authored root, window geometry is stated three times and all three mu
    views out against (`ShellWindow` label/title/size, the view's `gpu_*` fields).
 3. **`app.zon`'s `.shell.windows`** — identity, `native check`, and packaging.
 
+**The layout floor is a test, not a comment.** `tests.zig` lays the tallest state out at
+`window_min_width` x `window_min_height` and fails naming the overflow in points. Anything that
+grows a fixed-height row — the preview frame above all — has to be paid for somewhere; the test
+says how much you are over.
+
 ## Native SDK surfaces this app uses
 - Native dialogs (`runtime.showOpenDialog`/`showSaveDialog`, wired through a custom
   `HostCallBinding` — see "File acquisition, honestly")
 - `fx.registerImage` + `<image>` for previews — **of an ImageIO thumbnail, never the source image.**
   Registered images cap at 1 MiB of *decoded* RGBA (512x512), so no real photo can be registered
-  directly. The 160px cap is set tighter still by `max_effect_host_result_bytes` (256 KiB), which
-  the preview pixels ride; `main.zig` asserts that fit at comptime.
+  directly. `max_effect_host_result_bytes` (256 KiB) — which the preview pixels ride — binds
+  tighter still, and `main.zig` asserts that fit at comptime. What actually SETS the 140px cap is
+  neither: it is the fixed 144x144 frame the markup draws the preview inside.
 - Three host commands of our own answered OFF the loop thread through `HostCallBinding`'s
   worker-carrier trio (`poll_fn`/`pending_fn`/`bind_services_fn`) plus `shutdown_fn`:
   `image.probe`, `image.thumbnail`, and `image.encode` (one request per output format — decode +
@@ -192,6 +201,10 @@ For a hand-authored root, window geometry is stated three times and all three mu
 - **No `fx.spawn` anywhere** — the app runs no subprocess.
 - Hot-reload on `.native` files (Debug builds, via `.markup.watch_path`)
 - `on_drop` (`UiApp.Options`, SDK 0.8.2+) for real window-wide file drops.
+- `Options.tokens_fn` + `Options.on_appearance` for the app-owned palette — `tokens` (static) is
+  NOT used, because the colour scheme is model state the footer's toggle can also move. Claiming
+  either opts out of the SDK's automatic system-appearance theming, which is why the Model carries
+  the scheme itself.
 - Manifest: `capabilities = .{ "native_views", "gpu_surfaces", "file_drops" }` — markup renders onto
   a gpu_surface, so `gpu_surfaces` stays; `file_drops` is a real `app_manifest.CapabilityKind`
   string, confirmed by reading the SDK source (nothing in the runtime currently reads it as a gate —

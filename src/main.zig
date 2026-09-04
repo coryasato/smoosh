@@ -88,6 +88,243 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
 
 pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
+// ----------------------------------------------------------------- tokens
+//
+// The palette is APP-OWNED: `Options.tokens_fn` hands a complete
+// `canvas.DesignTokens` back on every rebuild, derived from the appearance
+// the model stores (`on_appearance` -> `.appearance_changed`). Claiming
+// `tokens_fn` opts out of the SDK's automatic system-appearance theming,
+// which is why the model has to carry the scheme itself.
+//
+// Everything below is stated as OVERRIDES on the house theme rather than a
+// fresh `ColorTokens`: roles this app never draws (warning, the syntax
+// ladder, the scrim) then keep the house value FOR THE CURRENT SCHEME,
+// instead of silently inheriting the light register's near-black ink in a
+// dark window.
+//
+// One colour at a time: peach is the Smoosh button and nothing else — the
+// only saturated fill in the window. Lilac (`success`) appears once per
+// result row, on the savings figure. Sky (`info`) is work in progress: the
+// spinner. The format segments stay neutral. A fourth hue means something
+// else has gone wrong.
+
+/// `surface_pressed` is DARKER than `surface_subtle` in BOTH schemes,
+/// which is where this palette departs from the stock pack (there, dark's
+/// pressed step is the LIGHTER one). It is forced, not a preference:
+/// `surface_pressed` is the segmented-control track, and a ghost
+/// `toggle-button`'s selected state is hard-wired to `surface_subtle` —
+/// so the track must sit UNDER the thumb or the thumb disappears. The
+/// first dark track tried, `#17171C`, measured ΔL* 2.07 against the
+/// window and was invisible; `tokens tests` in `tests.zig` now pin the
+/// separation.
+fn palette(scheme: canvas.ColorScheme) canvas.ColorTokenOverrides {
+    return switch (scheme) {
+        .light => .{
+            .background = canvas.Color.rgb8(0xFD, 0xFC, 0xFA),
+            .surface = canvas.Color.rgb8(0xFF, 0xFF, 0xFF),
+            // #F4ECDF, warmer than the token sheet's #F7F1EA. Not a
+            // correction — the sheet's value renders exactly as drawn —
+            // but a compensation for where it renders: on the canvas that
+            // patch sits inside a cream window on a warm page, and every
+            // neighbour confirms its warmth. In a 540pt window on someone
+            // else's desktop the same field has nothing warm near it, and
+            // 13 points of red-over-blue reads as grey. This spends 21.
+            //
+            // The ceiling is the segmented track (`surface_pressed`,
+            // #EAE1D3) that this sits above: past about #F3EADB the two
+            // close to under ΔL* 3 and the track stops reading. The
+            // contrast test in `tests.zig` pins both ends.
+            .surface_subtle = canvas.Color.rgb8(0xF4, 0xEC, 0xDF),
+            // #E7D7C7 — warmer AND a shade darker than the sheet's
+            // #EAE1D3. The warmth is for the same reason the cards above
+            // it got theirs; the darkening is because they got theirs:
+            // once `surface_subtle` warmed to #F4ECDF the track had only
+            // ΔL* 3.81 left under it, and the track's whole job is to sit
+            // UNDER the thumb. Three points of lightness buys 6.83 back.
+            .surface_pressed = canvas.Color.rgb8(0xE7, 0xD7, 0xC7),
+            .text = canvas.Color.rgb8(0x2A, 0x2A, 0x32),
+            // #6B6773, which is what the drawn states use — NOT the
+            // #75717C the token sheet lists. The lighter value measures
+            // 4.25:1 on `surface_subtle`, and muted ink lands on that
+            // surface constantly (the drop zone's hint, every result
+            // row's size figure). The contrast test pins it.
+            .text_muted = canvas.Color.rgb8(0x6B, 0x67, 0x73),
+            .border = canvas.Color.rgba8(0x2A, 0x2A, 0x32, 26),
+            // #F8CDB7 — six points of L* above the sheet's #F3B89A.
+            // The darker peach read as a muddy tan at this size against
+            // the warm ground; the button is the one saturated fill in
+            // the window and should feel like the lightest thing in it,
+            // not the heaviest. Knockout ink clears 9.76:1 either way.
+            .accent = canvas.Color.rgb8(0xF8, 0xCD, 0xB7),
+            .accent_text = canvas.Color.rgb8(0x2A, 0x2A, 0x32),
+            .success = canvas.Color.rgb8(0x6A, 0x55, 0xB8),
+            .success_text = canvas.Color.rgb8(0xFD, 0xFC, 0xFA),
+            .info = canvas.Color.rgb8(0x50, 0x90, 0xC8),
+            .info_text = canvas.Color.rgb8(0xFD, 0xFC, 0xFA),
+            .destructive = canvas.Color.rgb8(0xC4, 0x45, 0x3D),
+            .destructive_text = canvas.Color.rgb8(0xFD, 0xFC, 0xFA),
+            .focus_ring = canvas.Color.rgb8(0x75, 0x71, 0x7C),
+            .disabled = canvas.Color.rgb8(0xE7, 0xD7, 0xC7),
+        },
+        .dark => .{
+            // The dark neutrals are WARM, mirroring the light ramp's
+            // structure rather than the sheet's hexes: a near-neutral
+            // ground (+3 red over blue, like #FDFCFA) with the warmth
+            // spent on the surfaces that sit on it. The sheet's
+            // #1B1B21/#232329/#121216 all lean the other way (blue over
+            // red by 4-6), which put cool surfaces under this scheme's
+            // warm ink (#F4F0EA) and read as a different app from the
+            // light one. Every value below holds its predecessor's L* to
+            // within 0.25, so the ramp's lightness — and every contrast
+            // gate the test pins — is unchanged; only the hue moved.
+            .background = canvas.Color.rgb8(0x1D, 0x1B, 0x1A),
+            // Deliberately the same value as `surface_subtle`: the dark
+            // window has no raised-card surface of its own, and giving
+            // it one would put a third near-black step between the
+            // ground and the drop zone that nothing would read as
+            // elevation.
+            .surface = canvas.Color.rgb8(0x28, 0x22, 0x1C),
+            .surface_subtle = canvas.Color.rgb8(0x28, 0x22, 0x1C),
+            // Warmed to match the light track's spend (+16 red over
+            // blue). Dark needs no darkening — the ramp already leaves
+            // ΔL* 8.44 under the cards.
+            .surface_pressed = canvas.Color.rgb8(0x18, 0x10, 0x08),
+            .text = canvas.Color.rgb8(0xF4, 0xF0, 0xEA),
+            // Warm grey, not the sheet's violet-leaning #98939F: muted
+            // ink sits on the warm surfaces above and inherited their
+            // problem.
+            .text_muted = canvas.Color.rgb8(0x99, 0x94, 0x8F),
+            .border = canvas.Color.rgba8(0xFF, 0xFF, 0xFF, 23),
+            // Peach is the one hue that does NOT flip: it is the app's
+            // identity, it is only ever a fill under dark ink, and it
+            // clears 4.5:1 against `accent_text` in both schemes.
+            .accent = canvas.Color.rgb8(0xF8, 0xCD, 0xB7),
+            .accent_text = canvas.Color.rgb8(0x2A, 0x2A, 0x32),
+            .success = canvas.Color.rgb8(0xC9, 0xB7, 0xF2),
+            .success_text = canvas.Color.rgb8(0x1B, 0x1B, 0x21),
+            .info = canvas.Color.rgb8(0xA8, 0xD4, 0xF5),
+            .info_text = canvas.Color.rgb8(0x1B, 0x1B, 0x21),
+            .destructive = canvas.Color.rgb8(0xF0, 0x9A, 0x93),
+            .destructive_text = canvas.Color.rgb8(0x1B, 0x1B, 0x21),
+            .focus_ring = canvas.Color.rgb8(0x98, 0x93, 0x9F),
+            .disabled = canvas.Color.rgb8(0x18, 0x10, 0x08),
+        },
+    };
+}
+
+/// Five radii are drawn and the token scale holds four, so the two
+/// registers are split: SURFACES take the scale (below), CONTROLS state
+/// their own through `ControlVisualTokens.radius`. Without that split the
+/// drop zone's 16 and the segment thumb's 8 could not both exist.
+///
+/// ONE outer radius across everything a hand lands on: the segmented
+/// track, every button, and a result card are all 10. The canvas draws
+/// the track at 8 against a 10 button, and side by side that read as a
+/// mistake rather than a distinction — the track is a 32pt pill and the
+/// button a 28pt one, so the same arc on the shorter shape looks larger.
+/// The thumb keeps the design's one-step-in relationship: track minus its
+/// own 2pt padding, which is 8.
+const radii: canvas.RadiusTokenOverrides = .{
+    .sm = 8, // (unused by a surface — kept as the scale's bottom step)
+    .md = 10, // the segmented track, and a result card
+    .lg = 12, // the preview frame
+    .xl = 16, // the drop zone
+};
+
+/// The whole palette, rebuilt per view build. Cheap by construction — it
+/// is a few hundred bytes of struct copy, no allocation.
+pub fn tokens(model: *const Model) canvas.DesignTokens {
+    const scheme = model.color_scheme;
+    return canvas.DesignTokens.themeWithOverrides(.{
+        .color_scheme = scheme,
+        .contrast = if (model.high_contrast) .high else .standard,
+        .reduce_motion = model.reduce_motion,
+    }, .{
+        .colors = palette(scheme),
+        .radius = radii,
+        // The surface shadow, zeroed — the other half of the panel
+        // chrome above. `shadow.sm` is drawn under every opaque panel,
+        // and this app's two panels are recesses: a drop shadow lifts
+        // them off the page, which is the opposite of what they say.
+        // Nothing else in this app reads `shadow.sm`.
+        .shadow = .{ .sm = .{ .y = 0, .blur = 0, .spread = 0 } },
+        // One step, not 1.2. The house `sm` button label is
+        // `button_size - 1.2` = 12.8, which sat beside 13pt text
+        // everywhere in this window — the format label next to the
+        // segments, a result row's size next to its Save. At 1 the whole
+        // app resolves to three sizes and no more: 14 (the file name and
+        // the drop zone's headline), 13 (everything else, labels and
+        // button text alike), and the badge's 12.
+        .metrics = .{ .button_label_sm_step = 1 },
+        .controls = .{
+            .button_default = .{ .radius = 10 },
+            .button_primary = .{
+                .radius = 10,
+                // A disabled Smoosh is a NEUTRAL chip, not faded peach.
+                // The house treatment washes the rest colour at
+                // `states.disabled_alpha`, which on a saturated fill
+                // leaves a washed-out peach that still reads as the
+                // primary action. The design states the pair instead —
+                // the token doc's own "colour SWAP" case.
+                .disabled_background = palette(scheme).surface_pressed,
+                .disabled_foreground = palette(scheme).text_muted,
+            },
+            // Reset, each result row's Save, and the appearance toggle.
+            // Muted ink: a ghost control is a secondary action, and
+            // full-ink Reset competed with Smoosh beside it. 7 rather
+            // than the buttons' 10 — a ghost control has no fill to
+            // shape, so the radius only ever shows on its hover wash.
+            .button_ghost = .{ .radius = 10, .foreground = palette(scheme).text_muted },
+            // The segments are ghost toggle-buttons, so without this they
+            // would inherit the muted ghost ink above. They take FULL
+            // ink, all three of them — the design mutes the unselected
+            // pair, and the SDK cannot: a ghost variant resolves one
+            // `foreground` for both states (`active_foreground` is
+            // consulted only for `default` and detached-group members),
+            // and `foreground` is a token-name attribute that takes no
+            // binding, so a per-item ink would need an `<if>` inside the
+            // `<for>` and the widget-identity collision that causes.
+            // Full ink for all three is also what macOS itself does: the
+            // thumb marks the selection, not the ink.
+            //
+            // A `<panel>` strokes a hairline and casts a shadow whether or
+            // not you asked: `emitPanelWidgetChrome` always emits both,
+            // with no attribute to decline. The drop zone and the preview
+            // frame are washes, not cards — the recess IS the affordance,
+            // and an outline around it was never in the design. Zero the
+            // stroke here and the shadow below; this is the only table a
+            // `<panel>` reads.
+            .panel = .{ .stroke_width = 0 },
+            .toggle_button = .{ .radius = 8, .foreground = palette(scheme).text },
+        },
+    });
+}
+
+/// The appearance channel. Returns a Msg rather than mutating anything —
+/// the scheme is model state like everything else, so `tokens` above stays
+/// a pure function of the model and the flip is testable by dispatching
+/// one message.
+pub fn onAppearance(appearance: platform.Appearance) ?Msg {
+    return .{ .appearance_changed = .{
+        .color_scheme = switch (appearance.color_scheme) {
+            .light => .light,
+            .dark => .dark,
+        },
+        .high_contrast = appearance.high_contrast,
+        .reduce_motion = appearance.reduce_motion,
+    } };
+}
+
+/// What `.appearance_changed` carries — the canvas-side spelling of
+/// `platform.Appearance`. The two `ColorScheme` enums are distinct types
+/// (one per layer), and translating at the boundary keeps the platform
+/// type out of the Model.
+pub const AppearanceState = struct {
+    color_scheme: canvas.ColorScheme = .light,
+    high_contrast: bool = false,
+    reduce_motion: bool = false,
+};
+
 // ------------------------------------------------------------------ model
 //
 // Buffers use `platform.max_dialog_path_bytes` (4096) to hold whatever
@@ -197,6 +434,20 @@ pub const Model = struct {
     save_message_buffer: [256]u8 = undefined,
     save_message_len: usize = 0,
 
+    // appearance — the input to `tokens` above, never bound by the view.
+    // The defaults are what the app themes with for the one frame before
+    // `on_appearance` first fires.
+    color_scheme: canvas.ColorScheme = .light,
+    high_contrast: bool = false,
+    reduce_motion: bool = false,
+    /// Set once the user works the footer's appearance toggle. From then
+    /// on `appearance_changed` stops moving `color_scheme` — a manual
+    /// choice that the next OS flip silently undid would be worse than no
+    /// toggle at all. Contrast and reduce-motion keep following the OS
+    /// either way: those are accessibility settings, not a preference the
+    /// button offers.
+    scheme_pinned: bool = false,
+
     /// One chip per format, for the toggle-group (see "Chips" in the
     /// native-ui skill) — must live inside Model for `for each` to see it.
     ///
@@ -245,9 +496,15 @@ pub const Model = struct {
         "save_message_len",
         "path",
         "sourceUti",
+        "sourceKind",
+        "originalSize",
         "errorMessage",
         "warningMessage",
         "saveMessage",
+        "color_scheme",
+        "high_contrast",
+        "reduce_motion",
+        "scheme_pinned",
     };
 
     pub fn path(model: *const Model) []const u8 {
@@ -313,6 +570,41 @@ pub const Model = struct {
         return model.status == .failed;
     }
 
+    /// The third face of the one status mark: the slot beside the status
+    /// bar carries a spinner while busy and an alert on failure, so a
+    /// success dot completes the set rather than adding chrome. A
+    /// partially-successful run is `.done` and gets the dot — it landed a
+    /// file; the format that did not is named in the bar's own text.
+    pub fn isDone(model: *const Model) bool {
+        return model.status == .done;
+    }
+
+    // ------------------------------------------------- appearance toggle
+    //
+    // The button offers the OTHER scheme, so it shows that scheme's glyph
+    // and says what pressing it will do. Both are model fns rather than
+    // an `<if>` in the markup: two conditional buttons would be two
+    // widget ids for one control, and the footer is addressed by
+    // automation as a fixed set.
+
+    /// `sun` while dark, `moon` while light — the icon names what the
+    /// press produces, not the state it is in.
+    pub fn schemeIcon(model: *const Model) []const u8 {
+        return switch (model.color_scheme) {
+            .light => "moon",
+            .dark => "sun",
+        };
+    }
+
+    /// The toggle's accessible name, and the only place the appearance
+    /// states are spelled for a person.
+    pub fn schemeToggleLabel(model: *const Model) []const u8 {
+        return switch (model.color_scheme) {
+            .light => "Switch to dark appearance",
+            .dark => "Switch to light appearance",
+        };
+    }
+
     /// Same gate `update`'s `.smoosh` arm enforces, so the button is
     /// disabled exactly when pressing it would be a no-op.
     pub fn canSmoosh(model: *const Model) bool {
@@ -333,6 +625,42 @@ pub const Model = struct {
         return formatBytes(arena, model.original_size);
     }
 
+    /// The source container, spelled the way the format spells itself
+    /// ("JPEG", "HEIC") rather than the way ImageIO identifies it
+    /// ("public.jpeg"). Empty for anything not on this list, which is
+    /// what makes `fileSubtitle` degrade rather than print a UTI at the
+    /// user: ImageIO decodes more than Smoosh advertises, and a name
+    /// nobody recognises is worse than no name.
+    pub fn sourceKind(model: *const Model) []const u8 {
+        const uti = model.sourceUti();
+        const table = [_]struct { uti: []const u8, name: []const u8 }{
+            .{ .uti = "public.jpeg", .name = "JPEG" },
+            .{ .uti = "public.png", .name = "PNG" },
+            .{ .uti = "public.heic", .name = "HEIC" },
+            .{ .uti = "public.heif", .name = "HEIF" },
+            .{ .uti = "org.webmproject.webp", .name = "WebP" },
+            .{ .uti = "public.tiff", .name = "TIFF" },
+            .{ .uti = "com.compuserve.gif", .name = "GIF" },
+            .{ .uti = "com.microsoft.bmp", .name = "BMP" },
+        };
+        for (table) |entry| {
+            if (std.mem.eql(u8, uti, entry.uti)) return entry.name;
+        }
+        return "";
+    }
+
+    /// "Original 5.7 MB · JPEG" — the line under the file name. The
+    /// container is appended rather than given a row of its own: it is a
+    /// fact ABOUT the size line (what those bytes are), and the card has
+    /// exactly two lines of room beside a 144px preview.
+    pub fn fileSubtitle(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (!model.hasFile()) return "";
+        const size = model.originalSize(arena);
+        const kind = model.sourceKind();
+        if (kind.len == 0) return std.fmt.allocPrint(arena, "Original {s}", .{size}) catch "";
+        return std.fmt.allocPrint(arena, "Original {s} · {s}", .{ size, kind }) catch "";
+    }
+
     // ---------------------------------------------------------- results
     //
     // One line per format, shown only for a format that actually landed —
@@ -348,23 +676,31 @@ pub const Model = struct {
         return model.webp_outcome == .ok;
     }
 
-    /// "AVIF  700.2 KB  −88%". Empty unless AVIF landed this run.
-    pub fn avifResult(model: *const Model, arena: std.mem.Allocator) []const u8 {
-        if (!model.hasAvifResult()) return "";
-        return model.resultLine(arena, "AVIF", model.avif_size);
-    }
-    /// "WebP  655.3 KB  −89%". Empty unless WebP landed this run.
-    pub fn webpResult(model: *const Model, arena: std.mem.Allocator) []const u8 {
-        if (!model.hasWebpResult()) return "";
-        return model.resultLine(arena, "WebP", model.webp_size);
-    }
+    // A result row is drawn in THREE registers — the format name in ink,
+    // the output size muted, the savings figure in lilac inside a badge —
+    // so it is three bindings, not one line. `<span>` carries weight and
+    // scale but NOT `foreground`, so a multi-tone line can never be one
+    // `<text>`; the split lives here rather than as markup gymnastics.
 
-    fn resultLine(model: *const Model, arena: std.mem.Allocator, label: []const u8, size: u64) []const u8 {
-        return std.fmt.allocPrint(arena, "{s}  {s}  {s}", .{
-            label,
-            formatBytes(arena, size),
-            formatSavings(arena, model.original_size, size),
-        }) catch "";
+    /// "700.2 KB". Empty unless AVIF landed this run.
+    pub fn avifSize(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (!model.hasAvifResult()) return "";
+        return formatBytes(arena, model.avif_size);
+    }
+    /// "−88%" — or "+1% larger" for an output bigger than a tiny source.
+    pub fn avifSavings(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (!model.hasAvifResult()) return "";
+        return formatSavings(arena, model.original_size, model.avif_size);
+    }
+    /// "655.3 KB". Empty unless WebP landed this run.
+    pub fn webpSize(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (!model.hasWebpResult()) return "";
+        return formatBytes(arena, model.webp_size);
+    }
+    /// "−89%". Empty unless WebP landed this run.
+    pub fn webpSavings(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        if (!model.hasWebpResult()) return "";
+        return formatSavings(arena, model.original_size, model.webp_size);
     }
 
     // ---------------------------------------------------------- mutation
@@ -492,6 +828,8 @@ pub const Msg = union(enum) {
     // `std.Io.Dir.copyFileAbsolute` has no such cap.
     save_as_result: native_sdk.EffectHostResult, // host copy-file callback
     reset, // clear current image, return to idle
+    toggle_color_scheme, // footer appearance toggle
+    appearance_changed: AppearanceState, // `on_appearance` — the input to `tokens`
 
     // Dispatched by effect/host-call result paths, never from markup.
     // Naming them keeps `native check`'s warnings meaningful: an unlisted
@@ -505,6 +843,7 @@ pub const Msg = union(enum) {
         "encode_result",
         "save_as_dialog_result",
         "save_as_result",
+        "appearance_changed",
     };
 };
 
@@ -569,7 +908,7 @@ const host_save_file = "dialog.saveFile";
 const host_file_copy = "file.copy";
 /// The ImageIO reads and the encode, all answered OFF the loop thread (see
 /// `HostBridge`'s worker carrier). `probe` allocates no bitmap; `thumbnail`
-/// decodes a 160px preview; `encode` decodes at full resolution, runs
+/// decodes a capped preview; `encode` decodes at full resolution, runs
 /// libavif/libwebp, and writes the output file atomically.
 const host_image_probe = "image.probe";
 const host_image_thumbnail = "image.thumbnail";
@@ -627,7 +966,8 @@ pub fn parseProbeReply(reply: []const u8) ?SourceInfo {
 /// bytes of straight-alpha 8-bit sRGB RGBA.
 ///
 /// The pixels RIDE THE RESULT rather than sitting in a bridge-owned
-/// global. That is safe only because the preview is capped at 160px —
+/// global. That is safe only because the preview is capped at
+/// `imageio.max_thumbnail_edge` —
 /// `max_effect_host_result_bytes` is 256 KiB and an over-cap answer is
 /// silently rewritten to the err route — so the fit is asserted at
 /// COMPTIME below rather than left as a comment for someone raising the
@@ -1122,13 +1462,42 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.cancel(save_dialog_key);
             fx.cancel(save_copy_key);
             _ = fx.unregisterImage(preview_image_id);
-            // Format is a user preference, not per-file state — it is
-            // the one thing Reset deliberately keeps.
+            // Reset clears PER-FILE state. Two things survive it because
+            // neither describes the file: the format preference, and the
+            // appearance — the latter arrives once, from the OS, and
+            // wiping it would re-theme the window on a Reset press until
+            // the next system flip.
             const format = model.format;
-            model.* = .{ .format = format };
+            const color_scheme = model.color_scheme;
+            const high_contrast = model.high_contrast;
+            const reduce_motion = model.reduce_motion;
+            const scheme_pinned = model.scheme_pinned;
+            model.* = .{
+                .format = format,
+                .color_scheme = color_scheme,
+                .high_contrast = high_contrast,
+                .reduce_motion = reduce_motion,
+                .scheme_pinned = scheme_pinned,
+            };
         },
 
         .set_format => |format| model.format = format,
+
+        .appearance_changed => |appearance| {
+            // A pinned scheme is the user's, not the OS's — see
+            // `scheme_pinned`. The other two always follow the system.
+            if (!model.scheme_pinned) model.color_scheme = appearance.color_scheme;
+            model.high_contrast = appearance.high_contrast;
+            model.reduce_motion = appearance.reduce_motion;
+        },
+
+        .toggle_color_scheme => {
+            model.color_scheme = switch (model.color_scheme) {
+                .light => .dark,
+                .dark => .light,
+            };
+            model.scheme_pinned = true;
+        },
 
         .smoosh => {
             // `hasPreview` is the real gate, not `status == .ready`: it is
@@ -1288,7 +1657,8 @@ const HostBridge = struct {
     const Job = enum { probe, thumbnail, encode_avif, encode_webp };
 
     /// A worker's whole world. Its result buffer is sized for the largest
-    /// answer any job can produce — a full 160x160 preview (the encode
+    /// answer any job can produce — a preview at the full thumbnail cap
+    /// on both edges (the encode
     /// jobs reply with just a size string). Per-slot rather than shared is
     /// what makes an abandoned worker harmless. The encode jobs also carry
     /// a destination path and the source UTI.
@@ -1709,6 +2079,8 @@ pub fn main(init: std.process.Init) !void {
         .canvas_label = canvas_label,
         .update_fx = update,
         .on_drop = onDrop,
+        .tokens_fn = tokens,
+        .on_appearance = onAppearance,
         .markup = .{
             .source = app_markup,
             .watch_path = if (dev) "src/app.native" else null,
