@@ -411,7 +411,37 @@ session in §4), and **launch time**.
 user-triggered and billed, so it cannot be launched from inside a session.*
 
 ### 4. Deferred features — each its own session
-Real wants, neither small enough to ride another change.
+Real wants and one latent bug, none small enough to ride another change.
+
+- **Read-only source folders, and the screenshot-that-vanishes bug.** Two coupled problems, both
+  invisible from a Terminal `native dev` run (the responsible process is the terminal, which
+  already holds the TCC grants) and both real once packaged.
+
+  *The read bug (priority).* The `image.encode` worker re-reads the source path fresh —
+  `imageio.decode(path)`, with no full-res buffer retained between the preview and the Smoosh
+  press. A macOS screenshot dropped from its floating thumbnail is served from a `screencapture`
+  staging dir; a few seconds later macOS moves it to `~/Desktop` or, if the thumbnail was
+  dismissed, deletes it. So the encode fails to decode a file that previewed fine. Fix: at
+  `.ready`, classify the source, and for a staging/temp source copy the bytes into the app cache
+  dir (`app_dirs.cache`) once and point probe / thumbnail / encode at the copy. Normal sources are
+  untouched.
+
+  *The write destination.* Output is written beside the source. Beside a screenshot's staging path
+  that fails (`.write_failed`), and beside a read-only USB / `/Applications` / a full disk it also
+  fails — do NOT blanket-retry a guessed folder, which mixes those cases and drops files where
+  nobody asked. Instead classify UP FRONT with a writability probe at `.ready` (create + delete a
+  temp sibling): writable → sibling, as today; not writable AND the source looks like a screenshot
+  (name `Screenshot *`, or a screencapture path) → the screenshot folder (default `~/Desktop`;
+  reading a custom `com.apple.screencapture location` needs a `CFPreferencesCopyAppValue` binding
+  since the app spawns no subprocess — defer it, land on Desktop meanwhile); not writable and not a
+  screenshot → Save As. Report the path actually written; a status note ONLY when it is not
+  source-adjacent (a silent Desktop fallback on a Pictures file would be a lie).
+
+  *Packaging.* `NSDesktopFolderUsageDescription` in `app.zon`, or the Desktop write fails with no
+  prompt. Verify against `native package`, not just `native dev`.
+
+  Build order: (1) the read fix standalone — it removes the "file vanished" failure whatever the
+  destination logic is; (2) the writability-probe destination split; (3) the plist string.
 
 - **Clipboard paste (Cmd+V).** Not the text-clipboard effect: `fx.readClipboard` is text/plain and
   64 KiB. An image needs the rich-data pasteboard read (`runtime.readClipboardData` or equivalent —
