@@ -540,10 +540,39 @@ pub const Model = struct {
 
     /// The picked file's last path component — what the UI names, and
     /// what every error message interpolates. Empty until a pick lands.
-    pub fn fileName(model: *const Model) []const u8 {
+    /// The picked file's last path component, for DISPLAY. macOS names
+    /// screenshots with a NARROW NO-BREAK SPACE (U+202F) before "AM"/"PM"
+    /// and some downloads carry a NO-BREAK SPACE (U+00A0); both render as
+    /// a tofu box on the reference/screenshot/mobile paths and trip the
+    /// `zero_canvas_ui` diagnostic under `native dev`. They ARE spaces —
+    /// swap each for an ASCII one here, in an arena copy, never in
+    /// `path_buffer`, which every host file command reads verbatim.
+    pub fn fileName(model: *const Model, arena: std.mem.Allocator) []const u8 {
         const full = model.path();
-        if (std.mem.lastIndexOfScalar(u8, full, '/')) |slash| return full[slash + 1 ..];
-        return full;
+        const base = if (std.mem.lastIndexOfScalar(u8, full, '/')) |slash|
+            full[slash + 1 ..]
+        else
+            full;
+        // U+202F = E2 80 AF, U+00A0 = C2 A0 — each collapses to one ASCII
+        // space, so the copy is never longer than `base`.
+        const out = arena.alloc(u8, base.len) catch return base;
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < base.len) {
+            if (i + 3 <= base.len and base[i] == 0xE2 and base[i + 1] == 0x80 and base[i + 2] == 0xAF) {
+                i += 3;
+            } else if (i + 2 <= base.len and base[i] == 0xC2 and base[i + 1] == 0xA0) {
+                i += 2;
+            } else {
+                out[w] = base[i];
+                w += 1;
+                i += 1;
+                continue;
+            }
+            out[w] = ' ';
+            w += 1;
+        }
+        return out[0..w];
     }
 
     /// True once `thumbnail_result` registered preview pixels — the `<if>`
@@ -1278,12 +1307,28 @@ fn finishIfComplete(model: *Model) void {
 
     if (!model.hasAvifResult() and !model.hasWebpResult()) {
         // Nothing landed. In single-format mode this is just "the encode
-        // failed"; in Both mode it is both sentences, and either way it is
-        // the one path that may set `.failed`.
-        if (avif_failed and webp_failed) return model.fail("{s} {s}", .{
-            failureText(model, .avif, &avif_buffer),
-            failureText(model, .webp, &webp_buffer),
-        });
+        // failed"; in Both mode it is the one path that may set `.failed`.
+        //
+        // Two failure sentences fit the status line only when both are the
+        // short "X encoding failed." form. A shared WRITE failure — the
+        // real case: a screenshot dropped from a read-only temp folder —
+        // is "Couldn't save the AVIF … Couldn't save the WebP …" at ~113
+        // chars, and the line elided the half that says what to do. So a
+        // shared cause gets ONE sentence, and a `same_path` skip (never
+        // the story when the whole run failed) yields to the format that
+        // genuinely could not be produced.
+        if (avif_failed and webp_failed) {
+            if (model.avif_outcome == .write_failed or model.webp_outcome == .write_failed)
+                return model.fail("Couldn't write to that folder — check its permissions.", .{});
+            if (model.avif_outcome == .same_path)
+                return model.fail("{s}", .{failureText(model, .webp, &webp_buffer)});
+            if (model.webp_outcome == .same_path)
+                return model.fail("{s}", .{failureText(model, .avif, &avif_buffer)});
+            return model.fail("{s} {s}", .{
+                failureText(model, .avif, &avif_buffer),
+                failureText(model, .webp, &webp_buffer),
+            });
+        }
         if (avif_failed) return model.fail("{s}", .{failureText(model, .avif, &avif_buffer)});
         if (webp_failed) return model.fail("{s}", .{failureText(model, .webp, &webp_buffer)});
         return; // Nothing was requested at all — leave the status alone.
@@ -1374,6 +1419,28 @@ fn beginSave(model: *Model, fx: *Effects, output: Output) void {
 pub fn onDrop(drop: platform.FileDropEvent) ?Msg {
     if (drop.paths.len == 0) return null;
     return .{ .dropped_file = drop.paths[0] };
+}
+
+/// Keyboard shortcuts, from `Options.on_key`. It only fires for keys
+/// nothing else claimed — a Tab'd-to button keeps its own Enter/Space,
+/// and this window has no text fields and no anchored surfaces to
+/// compete. Plain keys only: any nav modifier or Shift means the user
+/// meant a chord or a character. Enter runs the primary action, Esc
+/// clears, 1/2/3 pick the format. Every one of these Msgs is safe when
+/// it does not apply — `.smoosh` no-ops without a loaded file
+/// (`hasPreview` guard in `update`), `.reset` is idempotent on an
+/// already-idle model (its `fx.cancel`s hit dead keys, the model
+/// rewrites the same defaults), and `.set_format` is just model state —
+/// so the "only when a file is loaded" part needs no check here.
+pub fn onKey(keyboard: canvas.WidgetKeyboardEvent) ?Msg {
+    if (keyboard.phase != .key_down) return null;
+    if (keyboard.modifiers.hasNavigationModifier() or keyboard.modifiers.shift) return null;
+    if (std.ascii.eqlIgnoreCase(keyboard.key, "enter")) return .smoosh;
+    if (std.ascii.eqlIgnoreCase(keyboard.key, "escape")) return .reset;
+    if (std.mem.eql(u8, keyboard.key, "1")) return .{ .set_format = .avif };
+    if (std.mem.eql(u8, keyboard.key, "2")) return .{ .set_format = .webp };
+    if (std.mem.eql(u8, keyboard.key, "3")) return .{ .set_format = .both };
+    return null;
 }
 
 /// Starts the load chain for a path that just arrived — from the open
@@ -2170,6 +2237,7 @@ pub fn main(init: std.process.Init) !void {
         .canvas_label = canvas_label,
         .update_fx = update,
         .on_drop = onDrop,
+        .on_key = onKey,
         .tokens_fn = tokens,
         .on_appearance = onAppearance,
         .markup = .{

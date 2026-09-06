@@ -870,6 +870,10 @@ test "cancelling a re-pick keeps the image already loaded" {
 }
 
 test "an unreadable file fails, and the card is what names it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     var h = try Harness.create();
     defer h.destroy();
 
@@ -884,7 +888,7 @@ test "an unreadable file fails, and the card is what names it" {
     // would crowd out the explanation. What the message still has to do
     // is explain.
     try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "read") != null);
-    try testing.expectEqualStrings("locked.jpg", h.model().fileName());
+    try testing.expectEqualStrings("locked.jpg", h.model().fileName(arena));
     // `.failed` always surfaces the error buffer through the status
     // line, never a canned string.
     try testing.expectEqualStrings(h.model().errorMessage(), h.model().statusLine());
@@ -1419,6 +1423,87 @@ test "the only selected format failing is an ordinary failed run" {
     try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "AVIF") != null);
     // A format that was never requested must not be blamed.
     try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "WebP") == null);
+}
+
+test "both formats failing to WRITE collapse to one folder-permission sentence" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    // Both encodes produced bytes but could not write beside a read-only
+    // source (a screenshot dropped from a temp folder). Two "check the
+    // folder's permissions" sentences ran ~113 chars and the status line
+    // elided the actionable half; a shared cause is said once.
+    try h.encodeReply(.avif, false, "write");
+    try h.encodeReply(.webp, false, "write");
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    const message = h.model().errorMessage();
+    try testing.expectEqualStrings("Couldn't write to that folder — check its permissions.", message);
+    try testing.expectEqualStrings(message, h.model().statusLine());
+    // The old concatenation carried "permissions" twice — the mutation check.
+    const first = std.mem.indexOf(u8, message, "permissions").?;
+    try testing.expect(std.mem.indexOf(u8, message[first + 1 ..], "permissions") == null);
+}
+
+test "onKey: Enter smooshes, 1/2/3 pick the format, everything else is ignored" {
+    const K = struct {
+        fn down(key: []const u8) canvas.WidgetKeyboardEvent {
+            return .{ .phase = .key_down, .key = key };
+        }
+    };
+
+    try testing.expect(main.onKey(K.down("enter")).? == .smoosh);
+    try testing.expect(main.onKey(K.down("Enter")).? == .smoosh); // host may not lowercase
+    try testing.expect(main.onKey(K.down("escape")).? == .reset);
+    try testing.expect(main.onKey(K.down("1")).?.set_format == .avif);
+    try testing.expect(main.onKey(K.down("2")).?.set_format == .webp);
+    try testing.expect(main.onKey(K.down("3")).?.set_format == .both);
+
+    // Unbound keys, key-up, and any chord/character modifier all decline.
+    try testing.expect(main.onKey(K.down("4")) == null);
+    try testing.expect(main.onKey(K.down("s")) == null);
+    try testing.expect(main.onKey(.{ .phase = .key_up, .key = "enter" }) == null);
+    try testing.expect(main.onKey(.{ .phase = .key_down, .key = "1", .modifiers = .{ .super = true } }) == null);
+    try testing.expect(main.onKey(.{ .phase = .key_down, .key = "3", .modifiers = .{ .shift = true } }) == null);
+    try testing.expect(main.onKey(.{ .phase = .key_down, .key = "enter", .modifiers = .{ .control = true } }) == null);
+    try testing.expect(main.onKey(.{ .phase = .key_down, .key = "escape", .modifiers = .{ .super = true } }) == null);
+}
+
+test "onKey Esc clears a loaded file and is a harmless no-op when idle" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .webp });
+    try h.load(large_jpg, large_jpg_bytes);
+    try testing.expect(h.model().hasFile());
+    try h.send(main.onKey(.{ .phase = .key_down, .key = "escape" }).?);
+    try testing.expect(!h.model().hasFile());
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqual(Format.webp, h.model().format); // format preference survives
+
+    var idle = try Harness.create();
+    defer idle.destroy();
+    try idle.send(main.onKey(.{ .phase = .key_down, .key = "escape" }).?);
+    try testing.expectEqual(Status.idle, idle.model().status);
+}
+
+test "onKey Enter routes through update to start an encode when a file is loaded" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .avif });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(main.onKey(.{ .phase = .key_down, .key = "enter" }).?);
+    try testing.expectEqual(Status.compressing, h.model().status);
+
+    // And Enter with nothing loaded is the same no-op the button guard is.
+    var idle = try Harness.create();
+    defer idle.destroy();
+    try idle.send(main.onKey(.{ .phase = .key_down, .key = "enter" }).?);
+    try testing.expectEqual(Status.idle, idle.model().status);
 }
 
 // ------------------------------------------------- encoders and encoding
@@ -2316,14 +2401,28 @@ test "the destination extension names the format, not the source's" {
 
 // -------------------------------------------------------------- derived text
 
-test "fileName is the last path component" {
+test "fileName is the last path component, with exotic spaces normalized" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     var model: Model = .{};
-    try testing.expectEqualStrings("", model.fileName());
+    try testing.expectEqualStrings("", model.fileName(arena));
 
     const path = "/Users/someone/Pictures/holiday photo.jpg";
     @memcpy(model.path_buffer[0..path.len], path);
     model.path_len = path.len;
-    try testing.expectEqualStrings("holiday photo.jpg", model.fileName());
+    try testing.expectEqualStrings("holiday photo.jpg", model.fileName(arena));
+
+    // A real macOS screenshot name: U+202F before "PM". The display name
+    // has a plain ASCII space; the stored path stays byte-for-byte the
+    // input every host file command needs.
+    const shot = "/var/folders/x/T/Screenshot 2026-09-06 at 2.10.59\u{202f}PM.png";
+    @memcpy(model.path_buffer[0..shot.len], shot);
+    model.path_len = shot.len;
+    try testing.expectEqualStrings("Screenshot 2026-09-06 at 2.10.59 PM.png", model.fileName(arena));
+    try testing.expect(std.mem.indexOf(u8, model.fileName(arena), "\u{202f}") == null);
+    try testing.expectEqualStrings(shot, model.path());
 }
 
 test "formatBytes scales across the units the UI shows" {
