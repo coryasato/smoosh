@@ -404,8 +404,64 @@ person: **a real file drop** and **any native dialog** (see CLAUDE.md's two stan
 The umbrella, not a task. The correctness half was covered by the Phase B review (2026-08-30) —
 one real bug found and fixed (the case-insensitive `same_path` collision). What it did NOT touch is
 the last four "Known limitations" above: **arm64-only**, **notarization** (currently ad-hoc
-signed, fine for one machine and not for distribution), **the icon's Dock shape**, and **launch
-time**.
+signed, fine for one machine and not for distribution), **the icon's Dock shape** (now a scoped
+session in §4), and **launch time**.
 
 *Suggested: **Opus 5, high**, or run `/code-review ultra` for the correctness sweep — it is
 user-triggered and billed, so it cannot be launched from inside a session.*
+
+### 4. Deferred features — each its own session
+Real wants, neither small enough to ride another change.
+
+- **Clipboard paste (Cmd+V).** Not the text-clipboard effect: `fx.readClipboard` is text/plain and
+  64 KiB. An image needs the rich-data pasteboard read (`runtime.readClipboardData` or equivalent —
+  the first task is confirming the SDK exposes one to a hand-authored root). Two payload shapes:
+    - a file URL on the pasteboard (image copied in Finder) → hand the path straight to `beginLoad`;
+    - raw bytes (a `Cmd-Ctrl-Shift-4` screenshot, "Copy Image" from a browser) → write to a temp
+      file then feed `beginLoad`, or decode the buffer directly if the `imageio` seam will take one.
+  Wiring, once an `on_key` hook exists: Cmd+V → a `.paste` Msg → an `update` arm that asks the
+  bridge to read the pasteboard (a host command, like `file.stat`) → the result re-enters the load
+  chain. Tests feed a fake host result for each payload shape. *Own session — the pasteboard type
+  negotiation is the whole task and can spill into platform-layer work.*
+
+- **App icon Dock shape.** Diagnosis is under "Known limitations" (the source is opaque RGB with
+  the squircle floating inside a full-bleed square; macOS does not mask app icons). Session
+  deliverable: regenerate the icon from art on Apple's macOS template — 1024² canvas, artwork in a
+  ~824² superellipse with the standard margin and shadow, transparency around it — then verify
+  every rung 16→1024 in the Dock and Finder. The art is the owner's; the code change is only the
+  asset `app.zon` points at. *Own session — an asset task, not a Zig one.*
+
+**Not planned — Dock-icon / Finder drop.** macOS delivers Dock-icon drops and "Open With" through
+`application:openURLs:` (an `odoc` Apple Event), a different channel from the drag machinery
+`on_drop` uses. It would need `CFBundleDocumentTypes` / `LSItemContentTypes` in `app.zon` AND an
+openURLs hook reachable from the hand-authored root — and `runMacos`'s document handling is
+non-`pub`, so that may not exist without platform-layer work. It also only applies to the packaged
+`.app`. Set aside: the payoff over a window drop is thin, and the "type `smoosh`, drag a file in"
+workflow it is usually wanted for is the CLI's job (below). Revisit only if an openURLs hook proves
+to be a one-liner.
+
+## A Smoosh CLI — beyond the app
+Not part of the desktop app and not on its roadmap: a second, tiny binary that shares the image
+core. `smoosh hello.jpg` writes `hello.avif` and `hello.webp` next to the source and exits.
+
+**Shape.**
+- Flags: `--avif`, `--webp` (both if neither is given), `--dest=<dir>` (default: beside the source).
+- `main` is: parse argv → for each requested format → `imageio.decode` → `encoders.encode{Avif,Webp}`
+  → atomic write. One Smoosh run per invocation; no batch progress, no watch mode, no config file.
+- Reuses `src/imageio.zig`, `src/encoders.zig`, `src/encode.c` UNCHANGED. They carry no Model / Msg
+  / Runtime dependency — `imageio.decode` already returns straight-alpha 8-bit sRGB callable off any
+  thread, and the encoders take that buffer directly. This is the dogfood: if the CLI cannot be
+  built cleanly on these seams, the seams are wrong.
+
+**Why it is its own session.** The cost is entirely in `build.zig`. A CLI is a third executable
+artifact that must replicate the exe's link wiring on its own module: compile `src/encode.c`
+exactly once (twice is a fatal `duplicate symbol`), link the vendored archives in order plus the
+mandatory libsharpyuv, and `addFrameworkPath` for ImageIO / CoreGraphics or the link fails with
+"searched paths: none". `build.zig`'s own comments flag every one of these as a trap that hides
+until the other artifact builds. Then argv parsing, exit codes, a smoke test, and a distribution
+decision (ship `smoosh` beside `Smoosh.app`; or a `--install` that symlinks it onto `PATH`).
+
+**What it unlocks.** `smoosh` + drag an image into the terminal — the quick path the app's window
+drop cannot be for a terminal user. And a Finder **Quick Action** becomes trivial: a `.workflow`
+bundle running `smoosh "$@"` on the selection, installed to `~/Library/Services/` or shipped inside
+the `.app`. The Quick Action has no independent design — it is this CLI with a Finder trigger.
