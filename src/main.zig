@@ -1324,9 +1324,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 
         .dialog_result => |result| {
             if (!result.ok) {
-                // Cancelled, or the panel itself failed. Neither is an
-                // error state: fall back to whatever we were showing.
-                model.status = if (model.hasPreview()) .ready else .idle;
+                // Cancelled, or the panel itself failed — not an error
+                // state. The loop keeps running while the panel is open,
+                // so a file may have been DROPPED onto the window in the
+                // meantime; that load owns `status` from then on
+                // (`.loading`, `.ready` or `.failed`), and stomping it
+                // back here hid a real load failure behind a file card
+                // with no message. Only fall back when nothing landed.
+                if (!model.hasFile()) model.status = .idle;
                 return;
             }
             beginLoad(model, fx, result.bytes);
