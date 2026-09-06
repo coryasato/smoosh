@@ -77,20 +77,32 @@
           </column>
         </row>
 
-        <!-- One card per format that actually landed, BELOW the preview
-             and spanning the content width. Per-format rather than a
-             summed "combined savings" — no client ever downloads both
-             files, so each row reports what would really be served. A
-             format that failed shows no row; the status bar names it.
+        <!-- One card per format in the run, BELOW the preview and
+             spanning the content width. Per-format rather than a summed
+             "combined savings" — no client ever downloads both files, so
+             each row reports what would really be served.
+
+             `showAvifRow`/`showWebpRow`, not `hasXResult`: a row is
+             RESERVED at full height for the whole `.compressing` phase,
+             so on a "Both" run the slower format fills its own row in
+             place instead of inserting above the faster one and punting
+             it down a frame later. While a reserved row waits, its size
+             is an em dash and its badge + Save are absent (the badge
+             arms already gate on `hasXResult`; Save gets its own `<if>`).
+             At settle a format that FAILED collapses its row — one
+             reflow, off the common path — so "a failed format shows no
+             row; the status bar names it" still holds.
+
              Each row carries its own Save — the file already exists on
              disk next to the source, so it means "copy THIS one file
              elsewhere", not a global action.
 
              Three registers per row, which is why it is three widgets and
              not one line of text: the format name in ink, the size muted,
-             the savings figure in lilac. `<span>` carries weight and
-             scale but NOT `foreground`, so a two-tone line cannot be one
-             `<text>`.
+             the savings figure in a lilac badge weight-graded by
+             `savingsGate` (quiet / outline / solid). `<span>` carries
+             weight and scale but NOT `foreground`, so a two-tone line
+             cannot be one `<text>`.
 
              The leading `<spacer>` is the row's left inset, and the
              height is stated rather than padded: `padding` is uniform, so
@@ -100,35 +112,76 @@
              figure directly, with `cross="center"` centring the control
              in it. -->
         <column key="results" gap="6">
-          <if test="{hasAvifResult}">
+          <if test="{showAvifRow}">
             <row key="avif-result" background="surface_subtle" radius="md" height="34" gap="8" cross="center">
               <spacer width="2" />
               <text size="sm" min-width="38"><span weight="medium">AVIF</span></text>
               <text size="sm" foreground="text_muted">{avifSize}</text>
               <spacer grow="1" />
-              <!-- The one pill outline available: a `<badge>` draws its
-                   own border where a panel cannot. One hue, never two by
-                   magnitude — a threshold would be invented, and at −89%
-                   vs −88% both rows land the same colour anyway, so the
-                   cue would go quiet exactly where comparing two formats
-                   is worth doing. -->
-              <badge variant="outline" foreground="success">{avifSavings}</badge>
+              <!-- The savings figure, weighted by how much this format
+                   saved (`savingsGate` in main.zig): borderless muted
+                   text under 30%, the stock outline from 30–70%, a solid
+                   lilac fill at 70%+. Three `<if>` arms, not one styled
+                   badge, because a `<badge>`'s colour channels take
+                   token NAMES and no binding — and the SDK forces the
+                   shape of each arm:
+                     · no `success` badge variant exists, and the fill
+                       ignores `background=` — only `variant="primary"`
+                       paints a fill, and it reads it from the `accent`
+                       style channel, so the win chip is `primary` with
+                       `accent`/`accent-foreground` aimed at the
+                       `success` pair;
+                     · only `outline` wears a border (there is no
+                       stroke-width attribute), so `keep` must be
+                       `outline` and the other two are borderless;
+                     · `ghost` is the borderless, fill-less arm for
+                       `quiet`.
+                   Each arm states `radius="sm"` (6) — without it a badge
+                   falls back to a height/2 full pill on its fixed 20pt
+                   frame; 6pt is the 30%-of-height corner that matches the
+                   result row. The `keep` arm also states
+                   `border-color="success"`, because `variant="outline"`
+                   pulls its ring from `tokens.colors.border` (grey) and
+                   `foreground` only colours the text. Keyed per arm like
+                   the status line's three marks. -->
+              <if test="{avifSavingsQuiet}">
+                <badge key="avif-badge-quiet" variant="ghost" radius="sm" foreground="text_muted">{avifSavings}</badge>
+              </if>
+              <if test="{avifSavingsKeep}">
+                <badge key="avif-badge-keep" variant="outline" radius="sm" foreground="success" border-color="success">{avifSavings}</badge>
+              </if>
+              <if test="{avifSavingsWin}">
+                <badge key="avif-badge-win" variant="primary" radius="sm" accent="success" accent-foreground="success_text">{avifSavings}</badge>
+              </if>
               <!-- `icon="download"`, NOT `icon="save"`: the registry's
                    `save` is a floppy disk — three paths with an inner
-                   label plate that collapses into mush at 14px. -->
-              <button size="sm" variant="ghost" icon="download" on-press="save_avif_as"
-                      disabled="{isSaving}" label="Save AVIF as…">Save</button>
+                   label plate that collapses into mush at 14px. Its own
+                   `<if>` so a reserved-but-pending row shows no Save. -->
+              <if test="{hasAvifResult}">
+                <button key="avif-save" size="sm" variant="ghost" icon="download" on-press="save_avif_as"
+                        disabled="{isSaving}" label="Save AVIF as…">Save</button>
+              </if>
             </row>
           </if>
-          <if test="{hasWebpResult}">
+          <if test="{showWebpRow}">
             <row key="webp-result" background="surface_subtle" radius="md" height="34" gap="8" cross="center">
               <spacer width="2" />
               <text size="sm" min-width="38"><span weight="medium">WebP</span></text>
               <text size="sm" foreground="text_muted">{webpSize}</text>
               <spacer grow="1" />
-              <badge variant="outline" foreground="success">{webpSavings}</badge>
-              <button size="sm" variant="ghost" icon="download" on-press="save_webp_as"
-                      disabled="{isSaving}" label="Save WebP as…">Save</button>
+              <if test="{webpSavingsQuiet}">
+                <badge key="webp-badge-quiet" variant="ghost" radius="sm" foreground="text_muted">{webpSavings}</badge>
+              </if>
+              <if test="{webpSavingsKeep}">
+                <badge key="webp-badge-keep" variant="outline" radius="sm" foreground="success" border-color="success">{webpSavings}</badge>
+              </if>
+              <if test="{webpSavingsWin}">
+                <badge key="webp-badge-win" variant="primary" radius="sm" accent="success" accent-foreground="success_text">{webpSavings}</badge>
+              </if>
+              <if test="{hasWebpResult}">
+                <button key="webp-save" size="sm" variant="ghost" icon="download" on-press="save_webp_as"
+                        disabled="{isSaving}" label="Save WebP as…">Save</button>
+              </if>
             </row>
           </if>
         </column>
@@ -225,7 +278,7 @@
     </if>
     <!-- A filled 7px dot, which no icon in the registry is: `circle-dot`
          draws a ring around one. A panel is the dot — `radius` clamps to
-         half the box, so `sm` (8) rounds a 7px square to a circle. -->
+         half the box, so `sm` (6) still rounds a 7px square to a circle. -->
     <if test="{isDone}">
       <panel key="done-dot" width="7" height="7" background="success" radius="sm" label="Done" />
     </if>

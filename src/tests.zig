@@ -1655,6 +1655,176 @@ test "formatSavings covers smaller, larger, and unchanged outputs" {
     try testing.expectEqualStrings("", main.formatSavings(arena, 0, 100));
 }
 
+test "savingsGate bands at 30% and 70% of savings" {
+    // percent saved = (1 - output/original) * 100; the gate splits it at
+    // 30 and 70, both boundaries landing in the HIGHER band.
+    try testing.expectEqual(main.SavingsGate.quiet, main.savingsGate(1000, 705)); // −29.5%
+    try testing.expectEqual(main.SavingsGate.keep, main.savingsGate(1000, 700)); // −30.0% exactly
+    try testing.expectEqual(main.SavingsGate.keep, main.savingsGate(1000, 301)); // −69.9%
+    try testing.expectEqual(main.SavingsGate.win, main.savingsGate(1000, 300)); // −70.0% exactly
+    // An output that GREW is the opposite of a win — it reads quiet, not
+    // keep, and never trips the threshold arithmetic into a bad band.
+    try testing.expectEqual(main.SavingsGate.quiet, main.savingsGate(1000, 1200)); // +20% larger
+    try testing.expectEqual(main.SavingsGate.quiet, main.savingsGate(1000, 1000)); // same size
+    // A zero original has no honest percentage; it must not divide by zero.
+    try testing.expectEqual(main.SavingsGate.quiet, main.savingsGate(0, 100));
+}
+
+test "the savings badge weight follows the savings gate" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // large.jpg is 5_846_465 bytes; each output size below is chosen to
+    // land squarely in one band.
+    const Case = struct { size: []const u8, pct: []const u8, gate: main.SavingsGate };
+    const cases = [_]Case{
+        .{ .size = "5000000", .pct = "−14%", .gate = .quiet },
+        .{ .size = "2900000", .pct = "−50%", .gate = .keep },
+        .{ .size = "900000", .pct = "−85%", .gate = .win },
+    };
+    for (cases) |case| {
+        var h = try Harness.create();
+        defer h.destroy();
+        try h.send(.{ .set_format = .avif });
+        try h.load(large_jpg, large_jpg_bytes);
+        try h.send(.smoosh);
+        try h.encodeOk(.avif, case.size);
+
+        try testing.expectEqualStrings(case.pct, h.model().avifSavings(arena));
+        try testing.expectEqual(case.gate == .quiet, h.model().avifSavingsQuiet());
+        try testing.expectEqual(case.gate == .keep, h.model().avifSavingsKeep());
+        try testing.expectEqual(case.gate == .win, h.model().avifSavingsWin());
+
+        // Exactly the badge for this gate is in the tree, carrying the
+        // percentage — the other two arms rendered nothing.
+        const tree = try buildTree(arena, h.model());
+        try testing.expect(findByText(tree.root, .badge, case.pct) != null);
+    }
+}
+
+test "no savings badge gate is true for a format that did not land" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "900000"); // a win
+    try h.encodeReply(.webp, false, "encode"); // WebP failed
+
+    try testing.expect(h.model().avifSavingsWin());
+    try testing.expect(!h.model().webpSavingsQuiet());
+    try testing.expect(!h.model().webpSavingsKeep());
+    try testing.expect(!h.model().webpSavingsWin());
+}
+
+test "a Both run reserves both result rows before either encode replies" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    // The instant encoding starts, both rows exist at full height: label
+    // present, size an em dash, no badge, no Save.
+    try testing.expect(h.model().showAvifRow());
+    try testing.expect(h.model().showWebpRow());
+    try testing.expectEqualStrings("—", h.model().avifSize(arena));
+    try testing.expectEqualStrings("—", h.model().webpSize(arena));
+    {
+        const tree = try buildTree(arena, h.model());
+        try testing.expect(findByText(tree.root, .text, "AVIF") != null);
+        try testing.expect(findByText(tree.root, .text, "WebP") != null);
+        try testing.expect(findByKind(tree.root, .badge) == null);
+        try testing.expect(findByLabel(tree.root, .button, "Save AVIF as…") == null);
+        try testing.expect(findByLabel(tree.root, .button, "Save WebP as…") == null);
+    }
+
+    // WebP lands first. Its row fills IN PLACE; the AVIF row is untouched
+    // — still reserved, still an em dash — so nothing inserts above it.
+    try h.encodeOk(.webp, "650400");
+    {
+        const tree = try buildTree(arena, h.model());
+        try testing.expectEqualStrings("—", h.model().avifSize(arena));
+        try testing.expectEqualStrings("635.2 KB", h.model().webpSize(arena));
+        try testing.expect(findByText(tree.root, .text, "AVIF") != null);
+        try testing.expect(findByLabel(tree.root, .button, "Save WebP as…") != null);
+        try testing.expect(findByLabel(tree.root, .button, "Save AVIF as…") == null);
+    }
+
+    // AVIF lands. Both rows are now real.
+    try h.encodeOk(.avif, "695500");
+    try testing.expectEqual(Status.done, h.model().status);
+    {
+        const tree = try buildTree(arena, h.model());
+        try testing.expect(findByLabel(tree.root, .button, "Save AVIF as…") != null);
+        try testing.expect(findByLabel(tree.root, .button, "Save WebP as…") != null);
+    }
+}
+
+test "a format that fails in a Both run keeps its row until settle, then drops it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.webp, "650400");
+
+    // AVIF is still encoding: its reserved row stays put — no mid-run
+    // collapse that would punt the WebP row that already landed.
+    try testing.expect(h.model().showAvifRow());
+    {
+        const tree = try buildTree(arena, h.model());
+        try testing.expect(findByText(tree.root, .text, "AVIF") != null);
+    }
+
+    // AVIF fails. The run settles (WebP succeeded), and only now does the
+    // AVIF row collapse — one reflow, off the common path.
+    try h.encodeReply(.avif, false, "encode");
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(!h.model().showAvifRow());
+    try testing.expect(h.model().showWebpRow());
+    {
+        const tree = try buildTree(arena, h.model());
+        try testing.expect(findByText(tree.root, .text, "AVIF") == null);
+        try testing.expect(findByText(tree.root, .text, "WebP") != null);
+    }
+}
+
+test "a single-format run reserves its one row while encoding" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .avif });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+
+    // The AVIF row is reserved; WebP was never part of this run.
+    try testing.expect(h.model().showAvifRow());
+    try testing.expect(!h.model().showWebpRow());
+    try testing.expectEqualStrings("—", h.model().avifSize(arena));
+    {
+        const tree = try buildTree(arena, h.model());
+        try testing.expect(findByText(tree.root, .text, "AVIF") != null);
+        try testing.expect(findByText(tree.root, .text, "WebP") == null);
+    }
+}
+
 test "result lines render only for the formats that landed" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -2787,9 +2957,11 @@ test "every drawn text pair clears 4.5:1, and the spinner clears 3:1" {
             .{ .name = "text on surface_subtle", .ink = c.text, .ground = c.surface_subtle },
             // The drop zone's hint; a result row's size figure.
             .{ .name = "text_muted on surface_subtle", .ink = c.text_muted, .ground = c.surface_subtle },
-            // The savings figure — the number the whole app exists to
-            // produce, and the only place lilac appears.
+            // The savings figure — lilac either as the outline badge's
+            // ink on the row, or (at 70%+ savings) knocked out of a solid
+            // lilac fill.
             .{ .name = "success on surface_subtle", .ink = c.success, .ground = c.surface_subtle },
+            .{ .name = "success_text on success", .ink = c.success_text, .ground = c.success },
             // The Smoosh button's label, knocked out of the peach fill.
             .{ .name = "accent_text on accent", .ink = c.accent_text, .ground = c.accent },
             // The failure mark. A 14px icon is non-text by WCAG and would

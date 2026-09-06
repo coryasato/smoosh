@@ -258,9 +258,10 @@ preview frame is what pays for everything else and is load-bearing.
   draws keep the house value for the CURRENT scheme instead of inheriting the light register's ink
   in a dark window.
 
-  Peach is the Smoosh button and nothing else — the only saturated fill in the window. Lilac
-  appears once per result row, on the savings figure. Sky is work in progress (the spinner). The
-  format segments stay neutral.
+  Peach is the Smoosh button and nothing else — the only saturated peach fill in the window.
+  Lilac is the savings figure on every result row, and at 70%+ savings it also fills that row's
+  badge solid (same hue, graded by weight). Sky is work in progress (the spinner). The format
+  segments stay neutral.
 - **Both schemes are WARM.** The board's dark neutrals lean blue-over-red by 4-6, which put cool
   surfaces under this scheme's warm ink and made dark read as a different app. The built ramp
   mirrors light's STRUCTURE instead of its values: a near-neutral ground with the warmth spent on
@@ -291,9 +292,21 @@ preview frame is what pays for everything else and is load-bearing.
   carrying a labelled Save overflowed the 420pt minimum by 40px. The preview frame pays: 168 → 144,
   and `imageio.max_thumbnail_edge` 160 → 140 — the cap that binds the thumbnail is now the LAYOUT
   (a longer edge than the frame overflows it), not the 256 KiB host-result budget.
-- **The savings figure is one hue, not two.** A magnitude threshold would be invented, and at
-  −89% vs −88% both rows land the same colour anyway — the cue goes quiet exactly where comparing
-  two formats is worth doing.
+- **A run RESERVES its result rows** (`showAvifRow`/`showWebpRow`, not `hasXResult`). For the whole
+  `.compressing` phase a row is drawn at full `height="34"` for every format in the run — size an
+  em dash, no badge, no Save — so on a "Both" run the two encodes finishing out of order fill their
+  own rows in place. Before this the faster format drew its row and the slower one then inserted
+  ABOVE it, punting it down a frame later. The reservation ends at settle: a format that failed
+  collapses its row then (one reflow, off the common path), so "a failed format shows no row; the
+  status bar names it" still holds.
+- **The savings badge is weight-graded by a savings threshold** (`savingsGate` in `main.zig`):
+  under 30% a borderless muted chip, 30–70% the outline it has always drawn, 70%+ a solid `success`
+  fill. One hue throughout — only the weight moves. This reverses the earlier "one hue, not two"
+  call: at −89% vs −88% two format rows do land the same gate, so the cue cannot compare AVIF to
+  WebP — but that comparison is deliberately not a goal (by the time both rows exist the encode is
+  done), and the badge instead answers the per-file "was this worth running". An output that grew
+  (`+N% larger`, `same size`) reads quiet, not keep. `foreground` on a `<badge>` takes no binding,
+  so the three weights are three keyed `<if>` arms, not one bound badge.
 - **`icon="download"`, NOT `icon="save"`.** The registry's `save` is a floppy disk — three paths
   with an inner label plate that collapses into mush at 14px. `download` is the arrow-into-tray
   glyph. The failure mark is `alert`, a circle with a bang, not a triangle.
@@ -304,7 +317,8 @@ drawing something that could not be built:
   `emitPanelWidgetChrome` always emits both and no attribute declines them, so the drop zone and
   preview frame get their wash-only treatment from `controls.panel.stroke_width = 0` and a zeroed
   `shadow.sm`. There is no dashed stroke anywhere in the SDK either. A `<badge>` DOES draw its own
-  border — the one pill outline available, and what the savings pill uses.
+  border, but ONLY `variant="outline"` — there is no badge stroke-width attribute — so the savings
+  badge's 30–70% weight is `outline` and the other two are borderless by construction.
 - **`<status-bar>` is a BAND, not a line.** It fills its frame with `surface`, draws its own top
   hairline, and insets text 14pt with no way to clear it (`padding="0"` falls back to the default).
   That is the filled-footer treatment this design rejected, and it broke the left edge. The status
@@ -326,9 +340,17 @@ drawing something that could not be built:
   segments take full ink, which is also what macOS does: the thumb marks the selection, not the ink.
 - **No per-widget shadow, and no letter-spacing.** The label stays "Format" rather than a
   tracked-out FORMAT.
-- **`background` takes a token NAME, not a hex.** Tinted pills in an arbitrary hue are out; only
-  `badge variant="destructive"` gets a translucent hue wash, and `destructive` is spoken for by the
-  failure mark.
+- **`background` takes a token NAME, not a hex** — and a `<badge>` ignores `background=` entirely.
+  A badge fill comes only from `variant`: `outline`/`ghost` are transparent, `destructive` is a
+  translucent wash (spoken for by the failure mark), and `default`/`primary` paint a solid fill
+  read from the `accent` STYLE channel (`accent_foreground` for the ink). So the savings badge's
+  70%+ "win" weight is `variant="primary" accent="success" accent-foreground="success_text"` — a
+  solid lilac chip with knockout ink — not `background="success"`, which renders as invisible
+  surface-on-surface text. Two more badge gotchas: a badge with no `radius` falls back to a
+  height/2 FULL pill on its fixed 20pt frame (every arm states `radius="sm"`, which is 6 — see the
+  radius bullet below), and `variant="outline"` pulls its ring from `tokens.colors.border` (grey) —
+  `foreground` only colours the text — so the 30–70% weight also needs `border-color="success"` to
+  ring in lilac.
 
 **Where the build left the board.** Read this before iterating — each is measured, not a drift.
 - **Light `text_muted` is `#6B6773`**, the value the drawn states use, not the `#75717C` the token
@@ -341,13 +363,20 @@ drawing something that could not be built:
   else's desktop the same field has nothing warm near it and 13 points of red-over-blue reads as
   grey. The ceiling is the track: past about `#F3EADB` for the cards it stops separating from them.
   The track also went three points DARKER, because warming the cards had squeezed it to ΔL* 3.81.
-- **The peach is lighter**, `#F3B89A` → `#F8CDB7`, six points of L*. The darker value read as a
-  muddy tan at this size against the warm ground; the one saturated fill in the window should feel
-  like the lightest thing in it.
+- **The peach is `#F2B79A` in both schemes**, deeper and slightly more saturated than the
+  `#F8CDB7` it replaced (which was itself `#F3B89A` + 6 L*). `#F8CDB7` cleared ΔL* ~11.8 on the
+  dark ground and read as a pale glowing bar with no body; `#F2B79A` drops ~5 L* and adds chroma so
+  the one saturated fill carries weight. This walks back the "muddy tan" objection to the darker
+  peach — at the button's size, against neutral desktops, and with one value serving both schemes,
+  body beats brightness. Still ONE value across light and dark: peach does not flip. Knockout ink
+  clears 8.1:1 either way.
 - **ONE outer radius, 10, on everything a hand lands on** — the segmented track, every button, and
   a result card. The board draws the track at 8 against a 10 button, and side by side that reads as
   a mistake rather than a distinction. The thumb keeps the board's one-step-in relationship (track
-  minus its own padding, so 8). Surfaces keep their own scale: preview frame 12, drop zone 16.
+  minus its own padding, so 8). Surfaces keep their own scale: preview frame 12, drop zone 16. The
+  `sm` step is 6, not 8: it is the savings badge's corner, and on the SDK's fixed 20pt badge frame
+  an 8pt corner reads as a pill where 6pt is the 30%-of-height rounded rect the 34pt result row
+  (10pt corner, 29%) sits it beside.
   **The track will still look slightly larger than the buttons and that is structural**: it is the
   segment height plus its padding, so it is always taller than the control inside it, and the same
   arc on a taller shape reads differently. Measured and confirmed identical — the probe was setting

@@ -103,10 +103,11 @@ pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 // dark window.
 //
 // One colour at a time: peach is the Smoosh button and nothing else — the
-// only saturated fill in the window. Lilac (`success`) appears once per
-// result row, on the savings figure. Sky (`info`) is work in progress: the
-// spinner. The format segments stay neutral. A fourth hue means something
-// else has gone wrong.
+// only saturated peach fill in the window. Lilac (`success`) is the
+// savings figure on every result row; at 70%+ savings it also fills that
+// row's badge solid — the same hue graded by weight, not a new colour.
+// Sky (`info`) is work in progress: the spinner. The format segments stay
+// neutral. A fourth hue means something else has gone wrong.
 
 /// `surface_pressed` is DARKER than `surface_subtle` in BOTH schemes,
 /// which is where this palette departs from the stock pack (there, dark's
@@ -150,12 +151,18 @@ fn palette(scheme: canvas.ColorScheme) canvas.ColorTokenOverrides {
             // row's size figure). The contrast test pins it.
             .text_muted = canvas.Color.rgb8(0x6B, 0x67, 0x73),
             .border = canvas.Color.rgba8(0x2A, 0x2A, 0x32, 26),
-            // #F8CDB7 — six points of L* above the sheet's #F3B89A.
-            // The darker peach read as a muddy tan at this size against
-            // the warm ground; the button is the one saturated fill in
-            // the window and should feel like the lightest thing in it,
-            // not the heaviest. Knockout ink clears 9.76:1 either way.
-            .accent = canvas.Color.rgb8(0xF8, 0xCD, 0xB7),
+            // #F2B79A — deeper and slightly more saturated than the
+            // #F8CDB7 this replaces. That lighter peach cleared ΔL* ~11.8
+            // against the dark ground and read as a pale glowing bar with
+            // no body; this drops ~5 L* and adds chroma so the one
+            // saturated fill in the window carries weight. It reverses an
+            // earlier call that rejected roughly this value (the sheet's
+            // #F3B89A) for the LIGHT window as a "muddy tan" — at the
+            // button's size, against neutral desktops, body beats
+            // brightness, and the same value has to work in dark. Still
+            // ONE value across both schemes: peach does not flip.
+            // Knockout ink clears 8.1:1 either way.
+            .accent = canvas.Color.rgb8(0xF2, 0xB7, 0x9A),
             .accent_text = canvas.Color.rgb8(0x2A, 0x2A, 0x32),
             .success = canvas.Color.rgb8(0x6A, 0x55, 0xB8),
             .success_text = canvas.Color.rgb8(0xFD, 0xFC, 0xFA),
@@ -195,10 +202,11 @@ fn palette(scheme: canvas.ColorScheme) canvas.ColorTokenOverrides {
             // problem.
             .text_muted = canvas.Color.rgb8(0x99, 0x94, 0x8F),
             .border = canvas.Color.rgba8(0xFF, 0xFF, 0xFF, 23),
-            // Peach is the one hue that does NOT flip: it is the app's
-            // identity, it is only ever a fill under dark ink, and it
-            // clears 4.5:1 against `accent_text` in both schemes.
-            .accent = canvas.Color.rgb8(0xF8, 0xCD, 0xB7),
+            // Peach is the one hue that does NOT flip: same value in
+            // both schemes (see the light block for why #F2B79A), only
+            // ever a fill under dark ink, and it clears 4.5:1 against
+            // `accent_text` in both.
+            .accent = canvas.Color.rgb8(0xF2, 0xB7, 0x9A),
             .accent_text = canvas.Color.rgb8(0x2A, 0x2A, 0x32),
             .success = canvas.Color.rgb8(0xC9, 0xB7, 0xF2),
             .success_text = canvas.Color.rgb8(0x1B, 0x1B, 0x21),
@@ -224,8 +232,15 @@ fn palette(scheme: canvas.ColorScheme) canvas.ColorTokenOverrides {
 /// button a 28pt one, so the same arc on the shorter shape looks larger.
 /// The thumb keeps the design's one-step-in relationship: track minus its
 /// own 2pt padding, which is 8.
+///
+/// `sm` is 6, not the scale's usual 8, and it is the savings badge's
+/// corner: the SDK fixes a badge at 20pt tall, so an 8pt corner is 40%
+/// of the height and reads as a pill, while the 10pt result row it sits
+/// in is a 29% corner. 6pt puts the badge at 30% — the same rounded-rect
+/// family as the row and the buttons. The only other `sm` consumer is
+/// the 7pt done-dot, which clamps to a circle at any radius over 3.5.
 const radii: canvas.RadiusTokenOverrides = .{
-    .sm = 8, // (unused by a surface — kept as the scale's bottom step)
+    .sm = 6, // the savings badge's corner (and the done-dot); no surface uses it
     .md = 10, // the segmented track, and a result card
     .lg = 12, // the preview frame
     .xl = 16, // the drop zone
@@ -676,31 +691,79 @@ pub const Model = struct {
         return model.webp_outcome == .ok;
     }
 
+    /// Whether this format's result row should occupy space right now.
+    /// True once its result is in — and ALSO the whole time the run is
+    /// `.compressing` and this format is part of it (`outcome != .none`),
+    /// which is what reserves the row at full height before the encode
+    /// replies. Without it, a "Both" run where WebP finishes first drew
+    /// the WebP row, then inserted the AVIF row ABOVE it and punted WebP
+    /// down on the next frame. With both rows reserved from the first
+    /// post-`smoosh` paint, whichever lands first fills its own row in
+    /// place and nothing moves. The reservation drops at settle
+    /// (`status` leaves `.compressing`): a format that FAILED collapses
+    /// its row then — one reflow, off the common path — which keeps "a
+    /// failed format shows no row; the status bar names it".
+    pub fn showAvifRow(model: *const Model) bool {
+        return model.hasAvifResult() or (model.status == .compressing and model.avif_outcome != .none);
+    }
+    pub fn showWebpRow(model: *const Model) bool {
+        return model.hasWebpResult() or (model.status == .compressing and model.webp_outcome != .none);
+    }
+
     // A result row is drawn in THREE registers — the format name in ink,
     // the output size muted, the savings figure in lilac inside a badge —
     // so it is three bindings, not one line. `<span>` carries weight and
     // scale but NOT `foreground`, so a multi-tone line can never be one
     // `<text>`; the split lives here rather than as markup gymnastics.
 
-    /// "700.2 KB". Empty unless AVIF landed this run.
+    /// "700.2 KB" once AVIF lands; an em dash while its reserved row is
+    /// still waiting on the encode; empty when there is no row.
     pub fn avifSize(model: *const Model, arena: std.mem.Allocator) []const u8 {
-        if (!model.hasAvifResult()) return "";
-        return formatBytes(arena, model.avif_size);
+        if (model.hasAvifResult()) return formatBytes(arena, model.avif_size);
+        return if (model.showAvifRow()) "—" else "";
     }
     /// "−88%" — or "+1% larger" for an output bigger than a tiny source.
     pub fn avifSavings(model: *const Model, arena: std.mem.Allocator) []const u8 {
         if (!model.hasAvifResult()) return "";
         return formatSavings(arena, model.original_size, model.avif_size);
     }
-    /// "655.3 KB". Empty unless WebP landed this run.
+    /// "655.3 KB" once WebP lands; an em dash while its reserved row is
+    /// still waiting on the encode; empty when there is no row.
     pub fn webpSize(model: *const Model, arena: std.mem.Allocator) []const u8 {
-        if (!model.hasWebpResult()) return "";
-        return formatBytes(arena, model.webp_size);
+        if (model.hasWebpResult()) return formatBytes(arena, model.webp_size);
+        return if (model.showWebpRow()) "—" else "";
     }
     /// "−89%". Empty unless WebP landed this run.
     pub fn webpSavings(model: *const Model, arena: std.mem.Allocator) []const u8 {
         if (!model.hasWebpResult()) return "";
         return formatSavings(arena, model.original_size, model.webp_size);
+    }
+
+    // The savings badge takes three weights by how much a format saved
+    // (`savingsGate` below): `quiet` under 30%, `keep` from 30 to under
+    // 70, `win` at 70 and over. `foreground` on a `<badge>` is a
+    // token-NAME attribute that takes no binding, so the gate cannot be
+    // one styled badge whose colour varies — it is three `<if>` arms in
+    // the markup, one predicate each, the same shape the status line's
+    // three marks use. Each predicate also carries the `hasXResult`
+    // guard so a gate is never true for a format that did not land.
+    pub fn avifSavingsQuiet(model: *const Model) bool {
+        return model.hasAvifResult() and savingsGate(model.original_size, model.avif_size) == .quiet;
+    }
+    pub fn avifSavingsKeep(model: *const Model) bool {
+        return model.hasAvifResult() and savingsGate(model.original_size, model.avif_size) == .keep;
+    }
+    pub fn avifSavingsWin(model: *const Model) bool {
+        return model.hasAvifResult() and savingsGate(model.original_size, model.avif_size) == .win;
+    }
+    pub fn webpSavingsQuiet(model: *const Model) bool {
+        return model.hasWebpResult() and savingsGate(model.original_size, model.webp_size) == .quiet;
+    }
+    pub fn webpSavingsKeep(model: *const Model) bool {
+        return model.hasWebpResult() and savingsGate(model.original_size, model.webp_size) == .keep;
+    }
+    pub fn webpSavingsWin(model: *const Model) bool {
+        return model.hasWebpResult() and savingsGate(model.original_size, model.webp_size) == .win;
     }
 
     // ---------------------------------------------------------- mutation
@@ -877,6 +940,29 @@ pub fn formatSavings(arena: std.mem.Allocator, original: u64, output: u64) []con
     if (percent >= 0.5) return std.fmt.allocPrint(arena, "−{d:.0}%", .{percent}) catch "";
     if (percent <= -0.5) return std.fmt.allocPrint(arena, "+{d:.0}% larger", .{-percent}) catch "";
     return "same size";
+}
+
+/// The savings badge's emphasis gate, by how much the output saved:
+/// `.quiet` under 30% — barely worth keeping, and anything that GREW,
+/// since "+12% larger" is the opposite of a win — `.keep` from 30 to
+/// under 70 (the outline the badge has always drawn), `.win` at 70 and
+/// over (a solid `success` chip that reads at a glance).
+///
+/// This is a magnitude threshold, which the palette's "one colour"
+/// note used to argue against: at −89% vs −88% two format rows land the
+/// same gate, so the cue goes quiet exactly where comparing formats is
+/// worth doing. That comparison is deliberately not a goal — by the time
+/// both rows exist the encode is done, and what the badge answers is the
+/// per-file "was this worth running". Same hue throughout; only weight
+/// moves. Boundaries are pinned by `savingsGate bands ...` in tests.zig.
+pub const SavingsGate = enum { quiet, keep, win };
+
+pub fn savingsGate(original: u64, output: u64) SavingsGate {
+    if (original == 0) return .quiet;
+    const percent = (1.0 - @as(f64, @floatFromInt(output)) / @as(f64, @floatFromInt(original))) * 100.0;
+    if (percent < 30.0) return .quiet;
+    if (percent < 70.0) return .keep;
+    return .win;
 }
 
 pub const Effects = native_sdk.Effects(Msg);
