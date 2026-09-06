@@ -1478,13 +1478,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .dialog_result => |result| {
             if (!result.ok) {
                 // Cancelled, or the panel itself failed — not an error
-                // state. The loop keeps running while the panel is open,
-                // so a file may have been DROPPED onto the window in the
-                // meantime; that load owns `status` from then on
-                // (`.loading`, `.ready` or `.failed`), and stomping it
-                // back here hid a real load failure behind a file card
-                // with no message. Only fall back when nothing landed.
-                if (!model.hasFile()) model.status = .idle;
+                // state. `.pick_file` set `.loading` optimistically; undo
+                // exactly that here.
+                //   - nothing loaded  -> back to `.idle`.
+                //   - a previous image still on screen (`hasPreview`, and
+                //     still `.loading`) -> back to `.ready`.
+                // Any OTHER `.loading`/`.failed` belongs to a real load
+                // that started since (a drop, or a pick that resolved):
+                // `beginLoad` cleared the preview, so `hasPreview` is
+                // false and that load keeps `status` — a failure included,
+                // which must not be stomped back to `.ready`.
+                if (!model.hasFile()) {
+                    model.status = .idle;
+                } else if (model.hasPreview() and model.status == .loading) {
+                    model.status = .ready;
+                }
                 return;
             }
             beginLoad(model, fx, result.bytes);
