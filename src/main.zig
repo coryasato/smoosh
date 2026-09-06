@@ -1385,12 +1385,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (!result.ok) {
                 // Unsupported or undecodable input.
                 return model.fail(
-                    "Not an image Smoosh can read. Try JPEG, PNG, HEIC or WebP.",
+                    "Not an image. Try JPEG, PNG, HEIC, WebP, TIFF or GIF.",
                     .{},
                 );
             }
             const info = parseProbeReply(result.bytes) orelse return model.fail(
-                "Not an image Smoosh can read. Try JPEG, PNG, HEIC or WebP.",
+                "Not an image. Try JPEG, PNG, HEIC, WebP, TIFF or GIF.",
                 .{},
             );
             model.source_width = info.width;
