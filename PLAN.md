@@ -413,17 +413,6 @@ user-triggered and billed, so it cannot be launched from inside a session.*
 ### 4. Deferred features — each its own session
 Real wants and one latent bug, none small enough to ride another change.
 
-- **"Saved to Desktop." for the special-cased writes.** The "Show in Finder" control has SHIPPED —
-  the footer reads `Done.` beside a hover-lit label that opens Finder with every output of the run
-  selected (`shell.reveal` → `NSWorkspace`, `src/workspace.zig`). It deliberately points at the
-  AUTOMATIC write and never follows a Save As: a user who drove a save panel already knows where
-  that copy went, and the button exists to unveil the write nobody was asked about.
-
-  What is still owed is the COPY: when the destination is not source-adjacent the line must read
-  `Saved to Desktop.` instead of `Done.` That string cannot exist until the writability-probe
-  destination split below lands, because until then everything is written beside the source. Build
-  it as one arm of that classification, not before.
-
 - **Read-only source folders, and the screenshot-that-vanishes bug.** Two coupled problems, both
   invisible from a Terminal `native dev` run (the responsible process is the terminal, which
   already holds the TCC grants) and both real once packaged.
@@ -452,7 +441,20 @@ Real wants and one latent bug, none small enough to ride another change.
   prompt. Verify against `native package`, not just `native dev`.
 
   Build order: (1) the read fix standalone — it removes the "file vanished" failure whatever the
-  destination logic is; (2) the writability-probe destination split; (3) the plist string.
+  destination logic is; (2) the writability-probe destination split; (3) the plist string; (4) the
+  status-line copy, which is the next item and only becomes writable once (2) exists.
+
+- **"Saved to Desktop." for the special-cased writes.** *Blocked by the item above — it is step 4 of
+  that session, not a session of its own.* The "Show in Finder" control has SHIPPED —
+  the footer reads `Done.` beside a hover-lit label that opens Finder with every output of the run
+  selected (`shell.reveal` → `NSWorkspace`, `src/workspace.zig`). It deliberately points at the
+  AUTOMATIC write and never follows a Save As: a user who drove a save panel already knows where
+  that copy went, and the button exists to unveil the write nobody was asked about.
+
+  What is still owed is the COPY: when the destination is not source-adjacent the line must read
+  `Saved to Desktop.` instead of `Done.` That string cannot exist until the writability-probe
+  destination split ABOVE lands, because until then everything is written beside the source. Build
+  it as one arm of that classification, not before.
 
 - **Clipboard paste (Cmd+V).** Not the text-clipboard effect: `fx.readClipboard` is text/plain and
   64 KiB. An image needs the rich-data pasteboard read (`runtime.readClipboardData` or equivalent —
