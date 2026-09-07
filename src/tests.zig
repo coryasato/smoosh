@@ -60,6 +60,13 @@ fn findByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8) 
     return null;
 }
 
+/// How many widgets of `kind` carry `text`. The reveal label needs a
+/// COUNT, not a hit: its two ink arms must never both be mounted.
+fn countByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8, total: *usize) void {
+    if (widget.kind == kind and std.mem.eql(u8, widget.text, text)) total.* += 1;
+    for (widget.children) |child| countByText(child, kind, text, total);
+}
+
 /// For icon-only controls (the per-format save buttons): no text content
 /// of their own, so their accessible name lives in `semantics.label`
 /// instead of `text`.
@@ -69,6 +76,12 @@ fn findByLabel(widget: canvas.Widget, kind: canvas.WidgetKind, label: []const u8
         if (findByLabel(child, kind, label)) |found| return found;
     }
     return null;
+}
+
+/// `countByText`'s counterpart for controls named by `semantics.label`.
+fn countByLabel(widget: canvas.Widget, kind: canvas.WidgetKind, label: []const u8, total: *usize) void {
+    if (widget.kind == kind and std.mem.eql(u8, widget.semantics.label, label)) total.* += 1;
+    for (widget.children) |child| countByLabel(child, kind, label, total);
 }
 
 /// For leaves with no text of their own to find them by (the preview
@@ -2384,6 +2397,282 @@ test "reset cancels the pending save dialog, so a stray answer cannot land" {
     try testing.expectEqualStrings("", h.model().path());
 }
 
+// --------------------------------------------------- Show in Finder
+//
+// The footer button that unveils the automatic write. `canReveal` gates
+// it; the `shell.reveal` payload is what Finder will select.
+
+/// The pending reveal request's payload — the newline-joined paths.
+fn revealPayload(h: *Harness) ![]const u8 {
+    const request = h.pendingHostNamed("shell.reveal") orelse return error.NoHostRequest;
+    return request.payload;
+}
+
+test "Show in Finder appears only once a run has landed a file" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try testing.expect(!h.model().canReveal()); // idle: nothing written
+    try h.load(large_jpg, large_jpg_bytes);
+    try testing.expect(!h.model().canReveal()); // loaded, not smooshed
+
+    try h.send(.smoosh);
+    try testing.expect(!h.model().canReveal()); // in flight, nothing on disk yet
+
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "812004");
+    try testing.expect(h.model().canReveal());
+}
+
+test "a Both run reveals both outputs, so Finder selects the pair" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "812004");
+
+    try h.send(.show_in_finder);
+    try testing.expectEqualStrings(
+        "/Users/someone/Pictures/large.avif\n/Users/someone/Pictures/large.webp",
+        try revealPayload(&h),
+    );
+}
+
+test "a partial run reveals only the format that landed" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+    try h.encodeReply(.webp, false, "encode");
+
+    // The run is `.done` with a warning, and the one file that exists is
+    // the one worth showing — a payload naming the WebP would point Finder
+    // at a file the encoder never wrote.
+    try testing.expect(h.model().canReveal());
+    try h.send(.show_in_finder);
+    try testing.expectEqualStrings("/Users/someone/Pictures/large.avif", try revealPayload(&h));
+}
+
+test "a run that landed nothing offers no Show in Finder" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeReply(.avif, false, "encode");
+    try h.encodeReply(.webp, false, "encode");
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expect(!h.model().canReveal());
+}
+
+test "re-smooshing withdraws Show in Finder until the new outputs land" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "812004");
+    try testing.expect(h.model().canReveal());
+
+    // Mid-round the previous outputs are gone from the model. Leaving the
+    // button up would let a press open Finder on the last run's files
+    // while this run's are still being written.
+    try h.send(.smoosh);
+    try testing.expect(!h.model().canReveal());
+}
+
+test "picking a new file withdraws Show in Finder" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "812004");
+
+    try h.pick("/Users/someone/Pictures/other.jpg");
+    try testing.expect(!h.model().canReveal());
+}
+
+test "reset withdraws Show in Finder" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+    try h.send(.reset);
+    try testing.expect(!h.model().canReveal());
+}
+
+test "Show in Finder keeps pointing at the auto-write after a Save As" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .avif });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+
+    try h.send(.save_avif_as);
+    try h.saveRoundOk("/Users/someone/Desktop/copy.avif");
+
+    // A user who drove a save panel already knows where that copy went.
+    // The button exists for the write nobody was asked about, so it must
+    // not follow the copy.
+    try h.send(.show_in_finder);
+    try testing.expectEqualStrings("/Users/someone/Pictures/large.avif", try revealPayload(&h));
+}
+
+test "the reveal label tracks the pointer, and both ink arms are one widget" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "812004");
+
+    try testing.expect(!h.model().reveal_hovered);
+    try h.send(.reveal_hover_on);
+    try testing.expect(h.model().reveal_hovered);
+    try h.send(.reveal_hover_off);
+    try testing.expect(!h.model().reveal_hovered);
+
+    // The two `<if>` arms share `key="reveal"` on purpose: the ink change
+    // has to be ONE widget changing colour, not two swapping places.
+    // With separate keys the id under the pointer changes at the moment
+    // of the swap, and the runtime's enter/leave pairing then delivers
+    // the vanished arm's leave straight after the enter that caused it —
+    // the label strobes under a resting pointer. Only one arm is ever
+    // mounted, so finding exactly one either way is the whole claim.
+    for ([_]bool{ false, true }) |hovered| {
+        h.model().reveal_hovered = hovered;
+        const tree = try buildTree(arena, h.model());
+        var count: usize = 0;
+        countByText(tree.root, .text, "Show in Finder", &count);
+        try testing.expectEqual(@as(usize, 1), count);
+    }
+}
+
+test "a new run takes the reveal label back to its resting ink" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // Single format, so the round actually FINISHES — a second `.smoosh`
+    // while `.compressing` is a no-op (`canSmoosh`) and would never reach
+    // the clear this test is about.
+    try h.send(.{ .set_format = .avif });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+    try h.send(.reveal_hover_on);
+    try testing.expect(h.model().reveal_hovered);
+
+    // The control is about to leave the view. The pointer cannot report a
+    // leave for a widget that no longer exists, so without this the label
+    // would come back lit the next time a run lands.
+    try h.send(.smoosh);
+    try testing.expect(!h.model().reveal_hovered);
+}
+
+test "each row's Save tracks its own pointer, independently of the other" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .both });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+    try h.encodeOk(.webp, "812004");
+
+    // Two flags, not one `?Output`: sliding the pointer from one row to
+    // the other dispatches an enter and a leave whose ORDER is not
+    // promised, and a single field would let the leave land second and
+    // mute the button the pointer is actually on.
+    try h.send(.avif_save_hover_on);
+    try testing.expect(h.model().avif_save_hovered);
+    try testing.expect(!h.model().webp_save_hovered);
+
+    try h.send(.webp_save_hover_on);
+    try h.send(.avif_save_hover_off);
+    try testing.expect(!h.model().avif_save_hovered);
+    try testing.expect(h.model().webp_save_hovered);
+
+    // One button per row in every hover combination — the two ink arms
+    // share a key so they are one widget changing colour, never two.
+    for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true }, .{ true, true } }) |state| {
+        h.model().avif_save_hovered = state[0];
+        h.model().webp_save_hovered = state[1];
+        const tree = try buildTree(arena, h.model());
+        for ([_][]const u8{ "Save AVIF as…", "Save WebP as…" }) |label| {
+            var count: usize = 0;
+            countByLabel(tree.root, .button, label, &count);
+            try testing.expectEqual(@as(usize, 1), count);
+        }
+    }
+}
+
+test "a new run un-hovers both Save buttons" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .avif });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+    try h.send(.avif_save_hover_on);
+
+    // Same reason the reveal label clears: the pointer cannot report a
+    // leave for a widget the next run is about to unmount.
+    try h.send(.smoosh);
+    try testing.expect(!h.model().avif_save_hovered);
+    try testing.expect(!h.model().webp_save_hovered);
+}
+
+test "a successful reveal says nothing, a failed one says the file has moved" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.{ .set_format = .avif });
+    try h.load(large_jpg, large_jpg_bytes);
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "717003");
+    try testing.expectEqualStrings("Done.", h.model().statusLine());
+
+    // Success: Finder coming forward IS the feedback.
+    try h.send(.show_in_finder);
+    const ok_request = h.pendingHostNamed("shell.reveal") orelse return error.NoHostRequest;
+    try h.fx().feedHostResult(ok_request.key, true, "");
+    try h.drain();
+    try testing.expectEqualStrings("Done.", h.model().statusLine());
+
+    // Failure: the host statted the path and found nothing there.
+    try h.send(.show_in_finder);
+    const bad_request = h.pendingHostNamed("shell.reveal") orelse return error.NoHostRequest;
+    try h.fx().feedHostResult(bad_request.key, false, "gone");
+    try h.drain();
+    try testing.expectEqualStrings("Those files aren’t there anymore.", h.model().statusLine());
+
+    // And the button stays: the model still holds a landed output, and a
+    // note about one press is not evidence the next press will fail.
+    try testing.expect(h.model().canReveal());
+}
+
 test "the destination extension names the format, not the source's" {
     var h = try Harness.create();
     defer h.destroy();
@@ -3009,6 +3298,63 @@ fn schemeTokens(scheme: canvas.ColorScheme) canvas.ColorTokens {
     return main.tokens(&model).colors;
 }
 
+/// `over` composited onto `under` — straight source-over alpha. The ghost
+/// hover wash is translucent by design, so what the eye actually judges is
+/// the composite, never the token's own colour.
+fn composite(over: canvas.Color, under: canvas.Color) canvas.Color {
+    const a: f32 = over.a;
+    return canvas.Color{
+        .r = over.r * a + under.r * (1 - a),
+        .g = over.g * a + under.g * (1 - a),
+        .b = over.b * a + under.b * (1 - a),
+        .a = 1,
+    };
+}
+
+test "a hovered ghost control separates from every surface it can sit on" {
+    for ([_]canvas.ColorScheme{ .light, .dark }) |scheme| {
+        var model = Model{};
+        model.color_scheme = scheme;
+        const t = main.tokens(&model);
+        const c = t.colors;
+        const ghost = t.controls.button_ghost;
+
+        const hover = ghost.hover_background orelse return error.GhostHoverUnstated;
+        const pressed = ghost.pressed_background orelse return error.GhostPressedUnstated;
+
+        // Reset and the appearance toggle are the ghost controls that
+        // still WASH (Show in Finder and both Saves carry `quiet-hover`),
+        // and they sit on `surface`. The house default washes with
+        // `surface_subtle`, which dark deliberately makes equal to
+        // `surface` — so without an override every ghost hover in the
+        // dark window was invisible.
+        //
+        // `surface_subtle` is checked too, though nothing washes on it
+        // today: it is the ground a Save button would land on the moment
+        // someone drops `quiet-hover`, and that collision is exactly how
+        // this started.
+        for ([_]struct { name: []const u8, ground: canvas.Color }{
+            .{ .name = "surface", .ground = c.surface },
+            .{ .name = "surface_subtle", .ground = c.surface_subtle },
+        }) |ground| {
+            const delta = @abs(lightness(composite(hover, ground.ground)) - lightness(ground.ground));
+            if (delta < 2.0) {
+                std.debug.print("{t}: a hovered ghost control is only {d:.2} L* off {s}\n", .{ scheme, delta, ground.name });
+                return error.GhostHoverInvisible;
+            }
+
+            // And a press has to be readable as a further step, or the
+            // moment of commitment looks identical to the hover it
+            // replaces.
+            const step = @abs(lightness(composite(pressed, ground.ground)) - lightness(composite(hover, ground.ground)));
+            if (step < 1.5) {
+                std.debug.print("{t}: press is only {d:.2} L* past hover on {s}\n", .{ scheme, step, ground.name });
+                return error.GhostPressNotDistinct;
+            }
+        }
+    }
+}
+
 test "every adjacent surface pair separates by at least 3 L* in both schemes" {
     for ([_]canvas.ColorScheme{ .light, .dark }) |scheme| {
         const c = schemeTokens(scheme);
@@ -3175,6 +3521,95 @@ test "the idle drop zone fits the smallest window" {
 
     const model = Model{};
     try expectFitsAtFloor(arena, &model);
+}
+
+// ------------------------------------------------- app.zon agreement
+//
+// A hand-authored root builds its own `AppInfo`, so every identity field
+// is stated twice — once in Zig, once in `app.zon` — and nothing in the
+// build makes them agree. `AppInfo.version` is what the RUNNING app
+// reports; `app.zon`'s is what `native check` and `native package` read.
+// They sat two releases apart (0.1.0 against 0.3.0) with no warning from
+// anything, which is why this is a test and not a comment.
+
+/// The value of `.<field> = "..."` in an `app.zon` source, or null.
+/// A deliberately small scanner: `app.zon` is ours, flat at the top
+/// level, and the alternative is a ZON parser for five string literals.
+fn zonField(source: []const u8, field: []const u8) ?[]const u8 {
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, ".{s} = \"", .{field}) catch return null;
+    const at = std.mem.indexOf(u8, source, needle) orelse return null;
+    const start = at + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, source, start, '"') orelse return null;
+    return source[start..end];
+}
+
+test "app.zon and AppInfo agree on every identity field" {
+    // Not a relative path: `app.zon` here is the anonymous import
+    // `build.zig` wires onto both modules. The module root is `src/`, so
+    // `@embedFile("../app.zon")` is refused ("embed of file outside
+    // package path"), and reading it at runtime would fail differently —
+    // the test binary runs from the cache dir, not the repo root.
+    const manifest = @embedFile("app.zon");
+
+    const pairs = [_]struct { zon: []const u8, zig: []const u8, value: []const u8 }{
+        .{ .zon = "version", .zig = "app_version", .value = main.app_version },
+        .{ .zon = "name", .zig = "app_name", .value = main.app_name },
+        .{ .zon = "display_name", .zig = "app_display_name", .value = main.app_display_name },
+        .{ .zon = "id", .zig = "app_bundle_id", .value = main.app_bundle_id },
+        .{ .zon = "description", .zig = "app_description", .value = main.app_description },
+    };
+
+    for (pairs) |pair| {
+        const declared = zonField(manifest, pair.zon) orelse {
+            std.debug.print("app.zon has no .{s} field for the scanner to read\n", .{pair.zon});
+            return error.ManifestFieldMissing;
+        };
+        if (!std.mem.eql(u8, declared, pair.value)) {
+            std.debug.print(
+                "app.zon .{s} is \"{s}\" but main.zig's {s} is \"{s}\" - bump both\n",
+                .{ pair.zon, declared, pair.zig, pair.value },
+            );
+            return error.ManifestDisagreesWithAppInfo;
+        }
+    }
+}
+
+test "the app version is the one the changelog's newest release names" {
+    const changelog = @embedFile("CHANGELOG.md");
+
+    // The first "## v" line is the newest release. A version bumped
+    // without a changelog entry ships a release nobody can read, which is
+    // the other half of the drift this file guards.
+    //
+    // MAJOR.MINOR only: the changelog heads its releases "v0.3" while the
+    // manifest carries a full "0.3.0". That is the house style and worth
+    // keeping — a patch that only fixes something does not always earn a
+    // heading, but a minor always does.
+    const at = std.mem.indexOf(u8, changelog, "\n## v") orelse return error.NoReleaseHeading;
+    const start = at + "\n## v".len;
+    var end = start;
+    while (end < changelog.len and (std.ascii.isDigit(changelog[end]) or changelog[end] == '.')) end += 1;
+    const newest = changelog[start..end];
+
+    const minor_end = blk: {
+        var seen: usize = 0;
+        for (main.app_version, 0..) |c, i| {
+            if (c != '.') continue;
+            seen += 1;
+            if (seen == 2) break :blk i;
+        }
+        break :blk main.app_version.len;
+    };
+    const app_minor = main.app_version[0..minor_end];
+
+    if (!std.mem.eql(u8, newest, app_minor)) {
+        std.debug.print(
+            "the app is {s} but the changelog's newest release is v{s} - add the entry, or bump\n",
+            .{ main.app_version, newest },
+        );
+        return error.ChangelogBehindVersion;
+    }
 }
 
 test "the appearance toggle flips the scheme and pins it against the OS" {

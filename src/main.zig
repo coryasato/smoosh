@@ -11,6 +11,7 @@ const native_sdk = @import("native_sdk");
 const imageio = @import("imageio.zig");
 const encoders = @import("encoders.zig");
 const chroma = @import("chroma.zig");
+const workspace = @import("workspace.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -39,6 +40,23 @@ const dev = builtin.mode == .Debug;
 
 pub const canvas_label = "main-canvas";
 const window_title = "Smoosh";
+
+/// The app's identity, stated here because a hand-authored root builds
+/// its own `AppInfo` — the CLI runner would derive these from `app.zon`
+/// at comptime, and this tree has no such path (same reason the window
+/// geometry is restated below).
+///
+/// **`app.zon` states every one of these a second time**, and nothing in
+/// the build makes them agree: `AppInfo.version` is what the RUNNING app
+/// reports about itself, `app.zon`'s is what `native check` and packaging
+/// read, and they sat two releases apart (0.1.0 against 0.3.0) without a
+/// single warning. `tests.zig` now parses `app.zon` and fails naming the
+/// field that drifted — bump one and the other is not optional.
+pub const app_version = "0.4.0";
+pub const app_name = "smoosh";
+pub const app_display_name = "Smoosh";
+pub const app_bundle_id = "dev.native_sdk.smoosh";
+pub const app_description = "A tiny native macOS app that compresses images into modern web formats.";
 // 540x400 is the floor for the tallest state — header, a 160px preview
 // card, the format row, the actions row and the status line — a smaller
 // window overflows it (`zero_canvas_layout`). `min_*` below stops a
@@ -289,7 +307,39 @@ pub fn tokens(model: *const Model) canvas.DesignTokens {
             // full-ink Reset competed with Smoosh beside it. 7 rather
             // than the buttons' 10 — a ghost control has no fill to
             // shape, so the radius only ever shows on its hover wash.
-            .button_ghost = .{ .radius = 10, .foreground = palette(scheme).text_muted },
+            .button_ghost = .{
+                .radius = 10,
+                .foreground = palette(scheme).text_muted,
+                // A TRANSLUCENT wash, and it has to be. The house hover
+                // fill for a quiet control is the flat `surface_subtle`
+                // token, which collides with two surfaces this app
+                // actually draws: every result row states
+                // `background="surface_subtle"`, so the Save buttons
+                // sitting on one washed to the exact colour already
+                // behind them and had no hover at all; and in DARK
+                // `surface` and `surface_subtle` are deliberately the
+                // same #28221C (see `palette`), which killed the hover on
+                // every ghost control in the window — Reset, Show in
+                // Finder and the appearance toggle included.
+                //
+                // Ink at ~8% composites over whatever is behind it, so
+                // one value covers white, cream and near-black without a
+                // per-surface table. It is the same device the `border`
+                // token already uses (ink at 26/255, white at 23/255).
+                //
+                // `pressed_background` is stated too, and is not
+                // optional: the quiet ladder falls back
+                // pressed -> active -> HOVER, so stating only the hover
+                // wash would make a press look identical to a hover.
+                .hover_background = if (scheme == .light)
+                    canvas.Color.rgba8(0x2A, 0x2A, 0x32, 20)
+                else
+                    canvas.Color.rgba8(0xFF, 0xFF, 0xFF, 20),
+                .pressed_background = if (scheme == .light)
+                    canvas.Color.rgba8(0x2A, 0x2A, 0x32, 40)
+                else
+                    canvas.Color.rgba8(0xFF, 0xFF, 0xFF, 40),
+            },
             // The segments are ghost toggle-buttons, so without this they
             // would inherit the muted ghost ink above. They take FULL
             // ink, all three of them — the design mutes the unselected
@@ -446,6 +496,11 @@ pub const Model = struct {
     /// `warning_message_buffer`: a save note and an encode warning are
     /// different facts, and folding them into one field would mean one
     /// silently overwriting the other.
+    ///
+    /// Save As is its main producer but not its only one: a failed "Show
+    /// in Finder" writes here too. Both are the same KIND of fact — the
+    /// freshest thing the user did, transient, cleared by the next run —
+    /// which is exactly what `statusLine` gives this slot priority for.
     save_message_buffer: [256]u8 = undefined,
     save_message_len: usize = 0,
 
@@ -455,6 +510,27 @@ pub const Model = struct {
     color_scheme: canvas.ColorScheme = .light,
     high_contrast: bool = false,
     reduce_motion: bool = false,
+    /// Pointer-hover state for the footer's "Show in Finder", and the
+    /// only reason the control is a `<row>` of `<text>` rather than a
+    /// `<button>`: the design wants hover to DIM THE LABEL, and no stock
+    /// control can. A ghost button's ink is one value in every state
+    /// (`buttonTextColorForWidget`'s `.ghost` arm reads no state
+    /// channel), `ControlVisualTokens` has no `hover_foreground`, and
+    /// markup's `foreground` takes a literal token name and refuses a
+    /// binding ("dynamic styling stays in Zig"). What markup DOES give is
+    /// `on-hover-enter`/`on-hover-leave`, so the hover becomes ordinary
+    /// Model state and the ink becomes two `<if>` arms — the same shape
+    /// the savings badge already uses, and for the same reason.
+    reveal_hovered: bool = false,
+
+    /// The same hover-ink treatment on each result row's Save, one flag
+    /// per row. TWO independent flags rather than one `?Output`: moving
+    /// the pointer straight from one row to the other dispatches an enter
+    /// and a leave whose order is not promised, and a single field would
+    /// let the leave land second and mute a button the pointer is on.
+    avif_save_hovered: bool = false,
+    webp_save_hovered: bool = false,
+
     /// Set once the user works the footer's appearance toggle. From then
     /// on `appearance_changed` stops moving `color_scheme` — a manual
     /// choice that the next OS flip silently undid would be worse than no
@@ -621,6 +697,26 @@ pub const Model = struct {
     /// file; the format that did not is named in the bar's own text.
     pub fn isDone(model: *const Model) bool {
         return model.status == .done;
+    }
+
+    /// Gates the footer's "Show in Finder" button.
+    ///
+    /// Keyed on the OUTPUTS rather than on `status == .done`, which
+    /// `finishIfComplete` keeps exactly equivalent (a run that lands no
+    /// file is `.failed`, never `.done`). The outputs are the right key
+    /// anyway: they are what the press SENDS, so gate and payload cannot
+    /// drift apart — a `status` gate would let a future outcome that is
+    /// `.done` without a path put up a button with nothing to reveal.
+    ///
+    /// A partially successful run qualifies: one file landed, and that
+    /// one is worth showing.
+    ///
+    /// It deliberately does NOT follow a Save As. A user who picked a
+    /// destination already knows where the copy went; this button exists
+    /// to unveil the automatic write beside the source, which is the one
+    /// nobody was asked about.
+    pub fn canReveal(model: *const Model) bool {
+        return model.hasAvifResult() or model.hasWebpResult();
     }
 
     // ------------------------------------------------- appearance toggle
@@ -871,6 +967,12 @@ pub const Model = struct {
         model.warning_message_len = 0;
         model.saving = null;
         model.save_message_len = 0;
+        // The control is about to leave the view. Without this it would
+        // come back hot the next time a run lands, because the pointer
+        // left a widget that no longer exists to report the leave.
+        model.reveal_hovered = false;
+        model.avif_save_hovered = false;
+        model.webp_save_hovered = false;
     }
 
     /// The single line of text `<status-bar>` renders — a Save As note
@@ -919,6 +1021,14 @@ pub const Msg = union(enum) {
     // ceiling sized for small payloads, not an arbitrary file).
     // `std.Io.Dir.copyFileAbsolute` has no such cap.
     save_as_result: native_sdk.EffectHostResult, // host copy-file callback
+    show_in_finder, // footer "Show in Finder" pressed
+    reveal_hover_on, // pointer entered "Show in Finder"
+    reveal_hover_off, // pointer left "Show in Finder"
+    avif_save_hover_on, // pointer entered the AVIF row's Save
+    avif_save_hover_off,
+    webp_save_hover_on, // pointer entered the WebP row's Save
+    webp_save_hover_off,
+    reveal_result: native_sdk.EffectHostResult, // host reveal callback — only its failure is used
     reset, // clear current image, return to idle
     toggle_color_scheme, // footer appearance toggle
     appearance_changed: AppearanceState, // `on_appearance` — the input to `tokens`
@@ -935,6 +1045,7 @@ pub const Msg = union(enum) {
         "encode_result",
         "save_as_dialog_result",
         "save_as_result",
+        "reveal_result",
         "appearance_changed",
     };
 };
@@ -1014,6 +1125,7 @@ const avif_encode_key: u64 = 8;
 const webp_encode_key: u64 = 9;
 const save_dialog_key: u64 = 12;
 const save_copy_key: u64 = 13;
+const reveal_key: u64 = 14;
 
 /// Host-call names our own `HostBridge` answers (see `main`). Not SDK
 /// vocabulary — we bind the seam, so we name it.
@@ -1021,6 +1133,9 @@ const host_open_file = "dialog.openFile";
 const host_file_size = "file.stat";
 const host_save_file = "dialog.saveFile";
 const host_file_copy = "file.copy";
+/// "Show in Finder" — see `src/workspace.zig` for why revealing a file
+/// needs a seam of our own at all.
+const host_reveal = "shell.reveal";
 /// The ImageIO reads and the encode, all answered OFF the loop thread (see
 /// `HostBridge`'s worker carrier). `probe` allocates no bitmap; `thumbnail`
 /// decodes a capped preview; `encode` decodes at full resolution, runs
@@ -1363,8 +1478,9 @@ fn defaultSaveName(model: *const Model, output: Output, buf: []u8) []const u8 {
     return buf[0..len];
 }
 
-/// Overwrites the save note. Unlike `fail`/`warn` there is never a second
-/// note to append beside it — only one round is ever in flight.
+/// Overwrites the transient note (see `save_message_buffer`). Unlike
+/// `fail`/`warn` there is never a second note to append beside it — only
+/// one round is ever in flight.
 fn setSaveMessage(model: *Model, comptime fmt: []const u8, args: anytype) void {
     const written = std.fmt.bufPrint(&model.save_message_buffer, fmt, args) catch return;
     model.save_message_len = written.len;
@@ -1741,6 +1857,50 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .payload = payload,
                 .on_result = Effects.hostMsg(.save_as_result),
             });
+        },
+
+        .reveal_hover_on => model.reveal_hovered = true,
+        .reveal_hover_off => model.reveal_hovered = false,
+        .avif_save_hover_on => model.avif_save_hovered = true,
+        .avif_save_hover_off => model.avif_save_hovered = false,
+        .webp_save_hover_on => model.webp_save_hovered = true,
+        .webp_save_hover_off => model.webp_save_hovered = false,
+
+        .show_in_finder => {
+            // Newline-joined, the same shape `file.copy` and the SDK's own
+            // multi-path dialog results use. A Both run sends both paths so
+            // Finder opens once with both files selected; a partial run
+            // sends the one that landed.
+            var payload_buffer: [platform.max_dialog_path_bytes * 2 + 1]u8 = undefined;
+            var len: usize = 0;
+            for ([_]Output{ .avif, .webp }) |output| {
+                if (outcomeOf(model, output) != .ok) continue;
+                const path = outputPathOf(model, output);
+                if (len > 0) {
+                    payload_buffer[len] = '\n';
+                    len += 1;
+                }
+                @memcpy(payload_buffer[len..][0..path.len], path);
+                len += path.len;
+            }
+            if (len == 0) return; // `canReveal` already gates the button
+            fx.hostRequest(.{
+                .key = reveal_key,
+                .name = host_reveal,
+                .payload = payload_buffer[0..len],
+                .on_result = Effects.hostMsg(.reveal_result),
+            });
+        },
+
+        // Success is silent: Finder coming forward with the files selected
+        // IS the feedback, and a "Shown." note would push a real Save As
+        // message off the status line for nothing. Only the failure — the
+        // file was moved or deleted between the write and the press —
+        // needs saying, because AppKit's own response to a dead URL is to
+        // do nothing at all.
+        .reveal_result => |result| {
+            if (result.ok) return;
+            setSaveMessage(model, "Those files aren’t there anymore.", .{});
         },
 
         .save_as_result => |result| {
@@ -2126,6 +2286,7 @@ const HostBridge = struct {
         if (std.mem.eql(u8, name, host_file_size)) return self.fileSize(key, payload);
         if (std.mem.eql(u8, name, host_save_file)) return self.saveFile(key, payload);
         if (std.mem.eql(u8, name, host_file_copy)) return self.copyFile(key, payload);
+        if (std.mem.eql(u8, name, host_reveal)) return self.revealPaths(key, payload);
         // The ImageIO reads and the encode return without answering — see
         // the worker carrier above.
         if (std.mem.eql(u8, name, host_image_probe)) return self.startWorker(key, .probe, payload);
@@ -2193,6 +2354,34 @@ const HostBridge = struct {
         self.reply(key, true, "");
     }
 
+    /// "Show in Finder". `payload` is one or more newline-joined absolute
+    /// paths, the same shape `copyFile` takes.
+    ///
+    /// Paths are STATTED here before the reveal, and a path that no longer
+    /// exists is dropped. That check is not defensive noise: it is the only
+    /// way this command can ever fail usefully.
+    /// `activateFileViewerSelectingURLs:` returns void and silently does
+    /// nothing for a URL with no file behind it, so without the stat a
+    /// press on a deleted output would look identical to a press that
+    /// worked — Finder simply would not appear. Dropping the dead paths
+    /// also means a Both run whose AVIF was deleted still reveals the WebP
+    /// rather than failing whole.
+    fn revealPaths(self: *HostBridge, key: u64, payload: []const u8) void {
+        var paths: [workspace.max_paths][]const u8 = undefined;
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, payload, '\n');
+        while (it.next()) |path| {
+            if (path.len == 0) continue;
+            if (count == paths.len) break;
+            _ = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch continue;
+            paths[count] = path;
+            count += 1;
+        }
+        if (count == 0) return self.reply(key, false, "gone");
+        if (!workspace.reveal(paths[0..count])) return self.reply(key, false, "reveal failed");
+        self.reply(key, true, "");
+    }
+
     fn reply(self: *HostBridge, key: u64, ok: bool, bytes: []const u8) void {
         self.app_state.effects.feedHostResult(key, ok, bytes) catch {};
     }
@@ -2206,11 +2395,11 @@ const HostBridge = struct {
 
 pub fn main(init: std.process.Init) !void {
     const app_info: platform.AppInfo = .{
-        .app_name = "smoosh",
-        .display_name = "Smoosh",
-        .version = "0.1.0",
-        .description = "A tiny native macOS app that compresses images into modern web formats.",
-        .bundle_id = "dev.native_sdk.smoosh",
+        .app_name = app_name,
+        .display_name = app_display_name,
+        .version = app_version,
+        .description = app_description,
+        .bundle_id = app_bundle_id,
         .window_title = window_title,
         .main_window = .{
             .id = 1,

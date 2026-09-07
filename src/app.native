@@ -158,8 +158,44 @@
                    label plate that collapses into mush at 14px. Its own
                    `<if>` so a reserved-but-pending row shows no Save. -->
               <if test="{hasAvifResult}">
-                <button key="avif-save" size="sm" variant="ghost" icon="download" on-press="save_avif_as"
-                        disabled="{isSaving}" label="Save AVIF as…">Save</button>
+                <!-- The same hover treatment the footer's "Show in
+                     Finder" wears, and here it costs nothing structural:
+                     `foreground` is a generic style attribute, so a stock
+                     `<button>` keeps its icon, its disabled state and its
+                     button role while only the INK swaps.
+
+                     `background="surface_subtle"` is what removes every
+                     fill, and it has to be the background rather than
+                     `quiet-hover`: that knob silences the HOVER wash only
+                     (by design — "press feedback, the focus ring, cursor
+                     intent and hit testing keep their own channels"), so
+                     a press still painted `surface_pressed` under the
+                     label. An authored background outranks the whole
+                     ladder instead — `buttonFillColor`'s ghost arm ends in
+                     `widgetBackgroundColor`, which returns
+                     `style.background orelse fallback` before any state is
+                     consulted. Aimed at the ROW'S OWN token, so every
+                     state paints the colour already behind it, and the two
+                     move together if the row is ever recoloured.
+
+                     BOTH ARMS CARRY THE SAME KEY and both hover handlers.
+                     Key is widget identity, so this is one button
+                     changing ink, not two swapping places — with separate
+                     keys the id under the pointer changes at the swap and
+                     the runtime's enter/leave pairing strobes the label.
+                     See the footer control for the full account. -->
+                <if test="{avif_save_hovered}">
+                  <button key="avif-save" size="sm" variant="ghost" icon="download" foreground="text"
+                          background="surface_subtle" on-press="save_avif_as"
+                          on-hover-enter="avif_save_hover_on" on-hover-leave="avif_save_hover_off"
+                          disabled="{isSaving}" label="Save AVIF as…">Save</button>
+                </if>
+                <if test="{not avif_save_hovered}">
+                  <button key="avif-save" size="sm" variant="ghost" icon="download" foreground="text_muted"
+                          background="surface_subtle" on-press="save_avif_as"
+                          on-hover-enter="avif_save_hover_on" on-hover-leave="avif_save_hover_off"
+                          disabled="{isSaving}" label="Save AVIF as…">Save</button>
+                </if>
               </if>
             </row>
           </if>
@@ -179,8 +215,18 @@
                 <badge key="webp-badge-win" variant="primary" radius="sm" accent="success" accent-foreground="success_text">{webpSavings}</badge>
               </if>
               <if test="{hasWebpResult}">
-                <button key="webp-save" size="sm" variant="ghost" icon="download" on-press="save_webp_as"
-                        disabled="{isSaving}" label="Save WebP as…">Save</button>
+                <if test="{webp_save_hovered}">
+                  <button key="webp-save" size="sm" variant="ghost" icon="download" foreground="text"
+                          background="surface_subtle" on-press="save_webp_as"
+                          on-hover-enter="webp_save_hover_on" on-hover-leave="webp_save_hover_off"
+                          disabled="{isSaving}" label="Save WebP as…">Save</button>
+                </if>
+                <if test="{not webp_save_hovered}">
+                  <button key="webp-save" size="sm" variant="ghost" icon="download" foreground="text_muted"
+                          background="surface_subtle" on-press="save_webp_as"
+                          on-hover-enter="webp_save_hover_on" on-hover-leave="webp_save_hover_off"
+                          disabled="{isSaving}" label="Save WebP as…">Save</button>
+                </if>
               </if>
             </row>
           </if>
@@ -295,7 +341,74 @@
          one id, one colour, so the mark beside it carries the tone and
          automation addresses the line as one thing. A `<text>` keeps
          every part of that. -->
-    <text key="status-line" size="sm" foreground="text_muted" grow="1">{statusLine}</text>
+    <text key="status-line" size="sm" foreground="text_muted">{statusLine}</text>
+    <!-- "Show in Finder": the auto-write's only affordance. Smoosh writes
+         beside the source without asking, and until this button existed
+         nothing in the window ever said where that was.
+
+         A `ghost` button, which the widget layer draws as content only —
+         no fill, no stroke — so it reads as the link it is rather than as
+         a third command competing with Reset and Smoosh. There is no
+         `link` variant in `WidgetVariant`; `ghost` is the text-button
+         face.
+
+         No height of its own, matching `scheme-toggle` beside it: that
+         button already sets this row's height, and giving this one the
+         `height="30"` the action row uses would grow the footer and eat
+         into the layout floor `tests.zig` pins.
+
+         Conditional, and keyed — same shape as `done-dot` above. This is
+         one control that exists in one state, not two alternative widgets
+         for one control, so it has one stable id. -->
+    <if test="{canReveal}">
+      <!-- NOT a `<button>`, and the only hand-assembled control in the
+           app. The design is a link whose LABEL brightens under the
+           pointer, and no stock control can do that: a ghost button's ink
+           is one value in every state (`buttonTextColorForWidget`'s
+           `.ghost` arm reads no hover or pressed channel),
+           `ControlVisualTokens` has no `hover_foreground`, and markup's
+           `foreground` takes a literal token name and refuses a binding —
+           "dynamic styling stays in Zig". A button's hover WASH is all it
+           would offer, and a wash is what this design rejected.
+
+           So the hover becomes model state (`on-hover-enter` /
+           `on-hover-leave` are real markup events, and binding them makes
+           an element hover-hittable without claiming presses) and the ink
+           becomes two `<if>` arms — the same shape the savings badge
+           above uses, for the same reason.
+
+           BOTH ARMS CARRY THE SAME KEY, and that is the load-bearing
+           detail. Key is widget identity, so the two arms are one widget
+           whose ink changes rather than two widgets swapping places.
+           Different keys would make the id under the pointer change at
+           the moment of the swap, and the runtime pairs every enter with
+           a leave it captured BEFORE dispatching (`ui_app.zig`: "an enter
+           whose own handler unmounts the element still has its leave to
+           deliver") — so the enter that turns hover ON would be followed
+           by the vanished arm's leave turning it straight off again, and
+           the label would strobe under a resting pointer.
+
+           A `<text>` and not a container, because a container would bring
+           chrome this does not want: a pressable `<row>` paints
+           `listItemFillColor`'s hover wash and refuses `quiet-hover`
+           (`hit_target = false` in the element registry), and a `<panel>`
+           takes `quiet-hover` but draws its own fill and hairline. Text
+           paints neither. -->
+      <if test="{reveal_hovered}">
+        <text key="reveal" size="sm" foreground="text" label="Show in Finder"
+              on-press="show_in_finder"
+              on-hover-enter="reveal_hover_on" on-hover-leave="reveal_hover_off">Show in Finder</text>
+      </if>
+      <if test="{not reveal_hovered}">
+        <text key="reveal" size="sm" foreground="text_muted" label="Show in Finder"
+              on-press="show_in_finder"
+              on-hover-enter="reveal_hover_on" on-hover-leave="reveal_hover_off">Show in Finder</text>
+      </if>
+    </if>
+    <!-- Takes the slack the status text used to hold, so the button sits
+         against the end of the message ("Done. Show in Finder") instead
+         of at the far right of the row. -->
+    <spacer grow="1" />
     <!-- The appearance toggle. It offers the OTHER scheme — `moon` while
          light, `sun` while dark — so the glyph names what a press
          produces. Icon-only, so `label` is its accessible name, and both

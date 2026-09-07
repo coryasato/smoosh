@@ -3,6 +3,18 @@
 For the engineering record — the decisions still in force, and the measurements the encoder work was
 held to — see [PLAN.md](PLAN.md) and [docs/phase-b-baseline.md](docs/phase-b-baseline.md).
 
+## v0.4 — 2026-09-07
+
+Smoosh saves your compressed images beside the original automatically, and until now nothing in the
+window ever said where that was. Now it does.
+
+- **"Show in Finder" next to the finished message.** Opens the folder Smoosh wrote to with the new
+  files already selected — both of them after a "Both" run. It points at the automatic save, not at
+  a copy you saved somewhere yourself, since that is the one you chose the location for.
+- Hovering a label now brightens it instead of drawing a grey box behind it, on both the Save
+  buttons and the new one.
+- Hovering any quiet button in dark mode showed no response at all. It does now.
+
 ## v0.3 — 2026-08-29
 
 Smoosh runs on a Mac with nothing installed. The AVIF and WebP encoders are built into the app now

@@ -37,11 +37,18 @@ const vendor_archives = [_][]const u8{
     "third_party/libwebp/lib/libsharpyuv.a",
 };
 
-/// Frameworks `src/imageio.zig` rides in on. The SDK adds these to the
-/// exe itself via its private `linkPlatform`, but not to the test
-/// artifact — stating them here is what lets `src/imageio_tests.zig` run
-/// under `native test` at all.
-const frameworks = [_][]const u8{ "ImageIO", "CoreGraphics", "CoreFoundation" };
+/// Frameworks `src/imageio.zig` rides in on, plus the two
+/// `src/workspace.zig` needs for "Show in Finder". The SDK adds the
+/// ImageIO set to the exe itself via its private `linkPlatform`, but not
+/// to the test artifact — stating them here is what lets
+/// `src/imageio_tests.zig` run under `native test` at all.
+///
+/// AppKit is `NSWorkspace`, Foundation is the `NSString`/`NSURL`/`NSArray`
+/// the reveal call is built out of. AppKit re-exports Foundation, so the
+/// link would succeed without it; it is named anyway because the code
+/// calls into it directly and a framework you use is a framework you
+/// state.
+const frameworks = [_][]const u8{ "ImageIO", "CoreGraphics", "CoreFoundation", "AppKit", "Foundation" };
 
 /// The C shim over the struct-heavy libavif / libwebp encode APIs
 /// (`src/encoders.zig`'s header explains why it is C and not Zig
@@ -49,6 +56,11 @@ const frameworks = [_][]const u8{ "ImageIO", "CoreGraphics", "CoreFoundation" };
 /// both vendored header roots go on the include path — of BOTH modules,
 /// same reason the archives do.
 const encode_shim = "src/encode.c";
+
+/// Repo-root files the tests `@embedFile` to check the app against its own
+/// manifest and changelog. The string is both the path and the name
+/// `@embedFile` uses.
+const embedded_files = [_][]const u8{ "app.zon", "CHANGELOG.md" };
 const header_paths = [_][]const u8{
     "third_party/libavif/include",
     "third_party/libwebp/include",
@@ -81,6 +93,23 @@ pub fn build(b: *std.Build) void {
         &.{ exe_mod, test_mod };
     for (mods) |mod| {
         for (vendor_archives) |archive| mod.addObjectFile(b.path(archive));
+
+        // `app.zon` and `CHANGELOG.md` reachable to `@embedFile`, for the
+        // tests that pin the app's identity and version against them.
+        // Both live at the REPO ROOT while the module root is `src/`, and
+        // `@embedFile("../app.zon")` is refused outright ("embed of file
+        // outside package path"). An anonymous import is the supported way
+        // to hand a module a file it could not otherwise reach; the name
+        // given here is the string `@embedFile` takes.
+        //
+        // Only `src/tests.zig` references them, and it compiles into the
+        // test artifact alone, so the exe carries no changelog. They are
+        // wired on both modules for the same reason everything else in
+        // this loop is (see above) — a test-artifact-only import would
+        // still have to survive the de-duplicated single-module case.
+        for (embedded_files) |file| {
+            mod.addAnonymousImport(file, .{ .root_source_file = b.path(file) });
+        }
 
         // The encode shim and the headers it needs. `addCSourceFile` pulls
         // in the C compiler and libc for this module; the archives above

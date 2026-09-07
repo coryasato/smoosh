@@ -413,6 +413,17 @@ user-triggered and billed, so it cannot be launched from inside a session.*
 ### 4. Deferred features — each its own session
 Real wants and one latent bug, none small enough to ride another change.
 
+- **"Saved to Desktop." for the special-cased writes.** The "Show in Finder" control has SHIPPED —
+  the footer reads `Done.` beside a hover-lit label that opens Finder with every output of the run
+  selected (`shell.reveal` → `NSWorkspace`, `src/workspace.zig`). It deliberately points at the
+  AUTOMATIC write and never follows a Save As: a user who drove a save panel already knows where
+  that copy went, and the button exists to unveil the write nobody was asked about.
+
+  What is still owed is the COPY: when the destination is not source-adjacent the line must read
+  `Saved to Desktop.` instead of `Done.` That string cannot exist until the writability-probe
+  destination split below lands, because until then everything is written beside the source. Build
+  it as one arm of that classification, not before.
+
 - **Read-only source folders, and the screenshot-that-vanishes bug.** Two coupled problems, both
   invisible from a Terminal `native dev` run (the responsible process is the terminal, which
   already holds the TCC grants) and both real once packaged.
@@ -471,6 +482,9 @@ workflow it is usually wanted for is the CLI's job (below). Revisit only if an o
 to be a one-liner.
 
 ## A Smoosh CLI — beyond the app
+**LAST. Deferred behind everything above** — do not pick this up unless the owner asks for it by
+name.
+
 Not part of the desktop app and not on its roadmap: a second, tiny binary that shares the image
 core. `smoosh hello.jpg` writes `hello.avif` and `hello.webp` next to the source and exits.
 

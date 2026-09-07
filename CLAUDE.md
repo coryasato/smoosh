@@ -201,6 +201,11 @@ says how much you are over.
 - **No `fx.spawn` anywhere** — the app runs no subprocess.
 - Hot-reload on `.native` files (Debug builds, via `.markup.watch_path`)
 - `on_drop` (`UiApp.Options`, SDK 0.8.2+) for real window-wide file drops.
+- `on-hover-enter` / `on-hover-leave` (markup events, codes 11/12) for the hover-lit controls —
+  see "Hover ink" below.
+- A hand-bound `shell.reveal` host command over `-[NSWorkspace activateFileViewerSelectingURLs:]`
+  (`src/workspace.zig`), for "Show in Finder". The SDK exposes no workspace or open-URL API at all,
+  and the app spawns no subprocess, so `open -R` is not available either.
 - `Options.tokens_fn` + `Options.on_appearance` for the app-owned palette — `tokens` (static) is
   NOT used, because the colour scheme is model state the footer's toggle can also move. Claiming
   either opts out of the SDK's automatic system-appearance theming, which is why the Model carries
@@ -209,6 +214,50 @@ says how much you are over.
   a gpu_surface, so `gpu_surfaces` stays; `file_drops` is a real `app_manifest.CapabilityKind`
   string, confirmed by reading the SDK source (nothing in the runtime currently reads it as a gate —
   it's honest metadata, not a switch). Permissions are just `command` + `view`.
+
+## Hover ink, and the three painters
+The design wants hover to BRIGHTEN A LABEL, never to wash a box. That is not a thing any stock
+control can do, and the workarounds cost a day to rediscover — so, in order:
+
+**No control has a hover ink channel.** `ControlVisualTokens` has `hover_background` but no
+`hover_foreground`, and `buttonTextColorForWidget`'s `.secondary, .outline, .ghost` arm returns
+`visual.foreground orelse tokens.colors.text` with no state branch at all. Markup cannot supply one
+either: `foreground` is a *style token attribute* and rejects an expression outright
+(`style_token_literal_message` — "dynamic styling stays in Zig").
+
+**So the ink is two `<if>` arms, and THEY MUST SHARE A KEY.** Key is widget identity. With one key
+the arms are a single widget changing colour; with two they are separate widgets swapping, the id
+under the pointer changes at the moment of the swap, and `ui_app.zig` pairs every enter with a leave
+it captured *before* dispatching ("an enter whose own handler unmounts the element still has its
+leave to deliver") — so the enter that lights the label is followed by the vanished arm's leave
+turning it straight off. The label strobes under a resting pointer. `tests.zig` pins the count at
+one widget per control in every hover combination.
+
+**Removing the fill depends on which painter the element gets**, and the three differ:
+
+| element | painter | authored `background` | `quiet-hover` |
+|---|---|---|---|
+| `<row>` / `<column>` | `emitLayoutContainerBackground` → `listItemFillColor` | REST branch only — hover ignores it | refused (`hit_target = false`) |
+| `<panel>` | `surfaceStateBackground` | all states | allowed, but the panel draws its own fill and hairline |
+| `<button>` | `buttonFillColor` → `widgetBackgroundColor` | all states, ahead of the ladder | allowed, but silences HOVER only |
+| `<text>` | none | — | — |
+
+Two consequences worth stating outright: `quiet-hover` does not touch PRESS (by design — press
+feedback, the focus ring and cursor intent keep their own channels), so a ghost button that must
+show nothing on click needs an authored `background`, not the knob; and binding `on-press` to a
+container makes it pressable, which brings the wash ladder with it.
+
+`app.native` carries all of this at each site. The footer's reveal label is bare `<text>` — the one
+hand-assembled control in the app, because no stock control could be a link. Both Save buttons stay
+stock `<button>`s: `foreground` is a generic style attribute, so only the ink swaps.
+
+**`surface_subtle` is doing two jobs, and they collide.** It is the house hover fill for every quiet
+control AND this app's card background, so a ghost button on a result row washed to the colour
+already behind it. Dark makes it worse: `surface` and `surface_subtle` are deliberately the same
+`#28221C`, so the house wash was invisible on EVERY ghost control in the dark window. `tokens` states
+`button_ghost.hover_background`/`pressed_background` as translucent ink washes instead — they
+composite over any ground — and a test pins the separation in both schemes on both surfaces.
+
 
 ## Conventions
 - Zig core (`src/main.zig`) — no TypeScript in this tree.
