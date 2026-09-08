@@ -52,7 +52,7 @@ const window_title = "Smoosh";
 /// read, and they sat two releases apart (0.1.0 against 0.3.0) without a
 /// single warning. `tests.zig` now parses `app.zon` and fails naming the
 /// field that drifted — bump one and the other is not optional.
-pub const app_version = "0.4.0";
+pub const app_version = "0.5.0";
 pub const app_name = "smoosh";
 pub const app_display_name = "Smoosh";
 pub const app_bundle_id = "dev.native_sdk.smoosh";
@@ -434,6 +434,31 @@ pub const EncodeOutcome = enum {
     }
 };
 
+/// WHERE a run's outputs go, decided once per file by the writability
+/// probe at the end of the load chain (`file.destination`) and fixed for
+/// the run. It is decided UP FRONT rather than retried after a failed
+/// write on purpose: a blanket "the write failed, try somewhere else"
+/// cannot tell a read-only screenshot staging directory apart from a
+/// read-only USB stick or a full disk, and would drop files where nobody
+/// asked for them.
+pub const Destination = enum {
+    /// Beside the source, `photo.jpg` -> `photo.avif`. The ordinary case
+    /// and the only one before the probe existed: the source's folder
+    /// takes a write.
+    beside_source,
+    /// The source's folder is read-only AND the source is a screenshot
+    /// (`looksLikeScreenshot`) — so it is one macOS itself parked
+    /// somewhere unwritable, and the screenshot folder is where its owner
+    /// already expects to find it. `dest_dir` names that folder.
+    desktop,
+    /// The source's folder is read-only and nothing suggests where else
+    /// the user would want the files — a read-only volume, a disc image,
+    /// `/Applications`. The outputs are encoded into the app cache
+    /// (`dest_dir`) and Save As is the only way out; nothing is claimed
+    /// to have been saved anywhere the user can keep.
+    ask,
+};
+
 pub const Model = struct {
     // file
     path_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
@@ -450,6 +475,17 @@ pub const Model = struct {
     /// compares against. Only the READ moves.
     stash_path_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
     stash_path_len: usize = 0,
+    /// Where this file's outputs go — see `Destination`. Decided by
+    /// `destination_result` before `.ready`, so it is settled by the time
+    /// Smoosh can be pressed, and re-decided per file.
+    destination: Destination = .beside_source,
+    /// The DIRECTORY `destination` names, when that is not the source's
+    /// own. Empty for `.beside_source`, in which case `outputPath` keeps
+    /// the source's directory exactly as it always did. `update` can
+    /// never derive either of these itself — the Desktop needs `$HOME`
+    /// and the cache needs `app_dirs`, both of which live in the bridge.
+    dest_dir_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
+    dest_dir_len: usize = 0,
     original_size: u64 = 0,
     // preview
     image_id: u64 = 0,
@@ -579,6 +615,10 @@ pub const Model = struct {
         "stash_path_buffer",
         "stash_path_len",
         "readPath",
+        "destination",
+        "dest_dir_buffer",
+        "dest_dir_len",
+        "destDir",
         "original_size",
         "source_width",
         "source_height",
@@ -624,6 +664,11 @@ pub const Model = struct {
     pub fn readPath(model: *const Model) []const u8 {
         if (model.stash_path_len == 0) return model.path();
         return model.stash_path_buffer[0..model.stash_path_len];
+    }
+    /// The directory outputs are written into, or empty for "beside the
+    /// source" — `outputPath` reads it exactly that way.
+    pub fn destDir(model: *const Model) []const u8 {
+        return model.dest_dir_buffer[0..model.dest_dir_len];
     }
     pub fn errorMessage(model: *const Model) []const u8 {
         return model.error_message_buffer[0..model.error_message_len];
@@ -740,6 +785,11 @@ pub const Model = struct {
     /// to unveil the automatic write beside the source, which is the one
     /// nobody was asked about.
     pub fn canReveal(model: *const Model) bool {
+        // `.ask` wrote into the app cache, not anywhere the user asked
+        // for. Revealing that would hand them a Finder window onto a
+        // purgeable directory and imply the run had saved something —
+        // exactly the claim the status line is refusing to make.
+        if (model.destination == .ask) return false;
         return model.hasAvifResult() or model.hasWebpResult();
     }
 
@@ -938,6 +988,12 @@ pub const Model = struct {
         model.stash_path_len = len;
     }
 
+    fn setDestDir(model: *Model, text: []const u8) void {
+        const len = @min(text.len, model.dest_dir_buffer.len);
+        @memcpy(model.dest_dir_buffer[0..len], text[0..len]);
+        model.dest_dir_len = len;
+    }
+
     /// Every `.failed` transition goes through here, so "`.failed` is
     /// always paired with an error message" holds by construction: it is
     /// never set without a message beside it.
@@ -1029,8 +1085,24 @@ pub const Model = struct {
             .compressing => "Smooshing…",
             // A partially successful run is `.done` — the result lines
             // show what landed, and the status bar is the only place the
-            // format that did NOT land can be named.
-            .done => if (model.warning_message_len > 0) model.warningMessage() else "Done.",
+            // format that did NOT land can be named. A lost format is
+            // more urgent than WHERE the rest went, so the warning still
+            // wins the line.
+            .done => if (model.warning_message_len > 0)
+                model.warningMessage()
+            else switch (model.destination) {
+                // The files are beside the source, where the user is
+                // already looking. Naming that would be noise — and
+                // "Saved to Desktop." on a file in Pictures would be a
+                // lie, which is the whole reason this is a switch.
+                .beside_source => "Done.",
+                .desktop => "Saved to Desktop.",
+                // Nothing the user can keep has been written: the outputs
+                // are in a cache the OS may purge, and Save As is the way
+                // out. The line has to say so, because "Done." over a
+                // read-only folder would be the worst lie available.
+                .ask => "That folder is read-only — save a copy.",
+            },
             .failed => model.errorMessage(),
         };
     }
@@ -1044,6 +1116,7 @@ pub const Msg = union(enum) {
     stat_result: native_sdk.EffectHostResult, // host file-size callback -> original_size
     probe_result: native_sdk.EffectHostResult, // host ImageIO properties callback -> dimensions, UTI, megapixel check
     thumbnail_result: native_sdk.EffectHostResult, // host ImageIO thumbnail callback -> the preview pixels
+    destination_result: native_sdk.EffectHostResult, // `file.destination` callback -> where this run's outputs go, then `.ready`
     set_format: Format, // format chip pressed
     smoosh, // "Smoosh" clicked
     encode_result: native_sdk.EffectHostResult, // `image.encode` worker callback, one per format — carries the output size
@@ -1079,6 +1152,7 @@ pub const Msg = union(enum) {
         "stat_result",
         "probe_result",
         "thumbnail_result",
+        "destination_result",
         "encode_result",
         "save_as_dialog_result",
         "save_as_result",
@@ -1164,6 +1238,7 @@ const save_dialog_key: u64 = 12;
 const save_copy_key: u64 = 13;
 const reveal_key: u64 = 14;
 const stash_key: u64 = 15;
+const destination_key: u64 = 16;
 
 /// Host-call names our own `HostBridge` answers (see `main`). Not SDK
 /// vocabulary — we bind the seam, so we name it.
@@ -1174,6 +1249,10 @@ const host_file_copy = "file.copy";
 /// Captures an ephemeral source's bytes into the app cache dir before
 /// anything reads them — see `isEphemeralSource` and `HostBridge.stashFile`.
 const host_file_stash = "file.stash";
+/// Answers whether the source's own folder takes a write, and names the
+/// two directories `update` cannot derive itself (the screenshot folder
+/// and the app cache's outbox) — see `HostBridge.destinationFor`.
+const host_destination = "file.destination";
 /// "Show in Finder" — see `src/workspace.zig` for why revealing a file
 /// needs a seam of our own at all.
 const host_reveal = "shell.reveal";
@@ -1337,11 +1416,16 @@ fn outputPathOf(model: *const Model, output: Output) []const u8 {
 }
 
 /// `/a/b/photo.jpg` + `.avif` -> `/a/b/photo.avif` — the output lands next
-/// to the source. The extension search is scoped to the last path
-/// component so a dot in a PARENT directory can never be mistaken for
-/// one; a name with no dot of its own just gets the extension appended.
-/// Returns null only when the result would not fit the buffer.
-fn outputPath(buffer: []u8, source: []const u8, extension: []const u8) ?[]const u8 {
+/// to the source when `dest_dir` is empty. A non-empty `dest_dir` REPLACES
+/// the source's directory and keeps only the name (`/desktop` here gives
+/// `/desktop/photo.avif`), which is how the two rescue destinations write
+/// somewhere else without a second path builder.
+///
+/// The extension search is scoped to the last path component so a dot in a
+/// PARENT directory can never be mistaken for one; a name with no dot of
+/// its own just gets the extension appended. Returns null only when the
+/// result would not fit the buffer.
+fn outputPath(buffer: []u8, source: []const u8, dest_dir: []const u8, extension: []const u8) ?[]const u8 {
     const name_start = if (std.mem.lastIndexOfScalar(u8, source, '/')) |slash| slash + 1 else 0;
     const stem_end = blk: {
         const dot = std.mem.lastIndexOfScalar(u8, source[name_start..], '.') orelse break :blk source.len;
@@ -1349,10 +1433,17 @@ fn outputPath(buffer: []u8, source: []const u8, extension: []const u8) ?[]const 
         if (dot == 0) break :blk source.len;
         break :blk name_start + dot;
     };
-    if (stem_end + extension.len > buffer.len) return null;
-    @memcpy(buffer[0..stem_end], source[0..stem_end]);
-    @memcpy(buffer[stem_end..][0..extension.len], extension);
-    return buffer[0 .. stem_end + extension.len];
+    if (dest_dir.len == 0) {
+        if (stem_end + extension.len > buffer.len) return null;
+        @memcpy(buffer[0..stem_end], source[0..stem_end]);
+        @memcpy(buffer[stem_end..][0..extension.len], extension);
+        return buffer[0 .. stem_end + extension.len];
+    }
+    // A trailing slash on the directory would double up; every producer
+    // here sends one without, but the join must not depend on that.
+    const dir = if (dest_dir[dest_dir.len - 1] == '/') dest_dir[0 .. dest_dir.len - 1] else dest_dir;
+    const stem = source[name_start..stem_end];
+    return std.fmt.bufPrint(buffer, "{s}/{s}{s}", .{ dir, stem, extension }) catch null;
 }
 
 /// `image.encode`'s request payload: `"<format>\x00<source>\x00<uti>\x00<dest>"`.
@@ -1383,7 +1474,7 @@ fn beginEncode(model: *Model, fx: *Effects, output: Output) void {
         .avif => &model.avif_path_buffer,
         .webp => &model.webp_path_buffer,
     };
-    const destination = outputPath(buffer, model.path(), extension) orelse
+    const destination = outputPath(buffer, model.path(), model.destDir(), extension) orelse
         return setOutcome(model, output, .encode_failed);
     // A `.webp` source encoded to WebP would read and overwrite itself.
     // "Overwrite silently" is about a previous OUTPUT, never the source.
@@ -1431,6 +1522,47 @@ fn beginEncode(model: *Model, fx: *Effects, output: Output) void {
     });
 }
 
+/// The half of a write-failure sentence that says what to do about it —
+/// shared by the per-format text and by the collapsed one below, so the
+/// two can never give contradictory advice about the same failure.
+///
+/// The generic "check the folder's permissions" is only true for
+/// `.beside_source`. Aimed at the Desktop it is actively misleading: a
+/// denial there is TCC, not a mode bit — the folder IS writable and the
+/// app was refused by Privacy & Security — so a user following that
+/// advice inspects Get Info on Desktop, finds nothing wrong, and is
+/// stuck. Aimed at the app's own cache it is meaningless, because the
+/// folder is ours and the user cannot act on its permissions at all.
+///
+/// All three are kept short deliberately: the `<status-bar>` is one line
+/// that elides rather than wraps, and the clause that says what to do is
+/// the half worth keeping when something has to go.
+fn writeFailureAdvice(destination: Destination) []const u8 {
+    return switch (destination) {
+        .beside_source => "check the folder's permissions.",
+        .desktop => "check Privacy & Security.",
+        // Nothing about permissions to offer: this is the app's own cache
+        // directory, so a failure here is the disk or the OS having purged
+        // it mid-run, neither of which is a folder the user can fix.
+        .ask => "the disk may be full.",
+    };
+}
+
+/// The whole sentence for a run where BOTH formats failed to write —
+/// one shared cause said once (see the join). Its second clause matches
+/// `writeFailureAdvice`'s for the same destination; only the opening
+/// differs, because "Couldn't write to that folder — check the folder's
+/// permissions." says folder twice.
+fn writeFailureCollapsed(destination: Destination) []const u8 {
+    return switch (destination) {
+        .beside_source => "Couldn't write to that folder — check its permissions.",
+        // NAMING the Desktop matters: the user never chose it, so "that
+        // folder" would point at something they have no reason to think of.
+        .desktop => "Couldn't write to your Desktop — check Privacy & Security.",
+        .ask => "Couldn't write the compressed files — the disk may be full.",
+    };
+}
+
 /// One failed format's user-facing sentence. Written into `buffer` (caller
 /// owned) for the cases that must name the file; the rest are static.
 fn failureText(model: *const Model, output: Output, buffer: []u8) []const u8 {
@@ -1440,12 +1572,14 @@ fn failureText(model: *const Model, output: Output, buffer: []u8) []const u8 {
             .avif => "Skipped AVIF — the source is already an AVIF file.",
             .webp => "Skipped WebP — the source is already a WebP file.",
         },
-        // Names the source file, which is also where the output was
-        // headed.
+        // What to DO about it depends entirely on where the write was
+        // aimed, so the advice follows `destination` rather than being one
+        // generic sentence. Getting this wrong sends the user somewhere
+        // they will find nothing amiss — see each arm.
         .write_failed => std.fmt.bufPrint(
             buffer,
-            "Couldn't save the {s} — check the folder's permissions.",
-            .{label},
+            "Couldn't save the {s} — {s}",
+            .{ label, writeFailureAdvice(model.destination) },
         ) catch "Couldn't save the compressed file.",
         // Deliberately short and non-technical; the encoder's stderr is
         // not surfaced.
@@ -1478,7 +1612,7 @@ fn finishIfComplete(model: *Model) void {
         // genuinely could not be produced.
         if (avif_failed and webp_failed) {
             if (model.avif_outcome == .write_failed or model.webp_outcome == .write_failed)
-                return model.fail("Couldn't write to that folder — check its permissions.", .{});
+                return model.fail("{s}", .{writeFailureCollapsed(model.destination)});
             if (model.avif_outcome == .same_path)
                 return model.fail("{s}", .{failureText(model, .webp, &webp_buffer)});
             if (model.webp_outcome == .same_path)
@@ -1643,6 +1777,60 @@ pub fn isEphemeralSource(path: []const u8) bool {
     }
     return std.mem.indexOf(u8, path, "/TemporaryItems/") != null or
         std.mem.indexOf(u8, path, "/.TemporaryItems/") != null;
+}
+
+/// True when the source is a macOS screenshot — the ONE case where the
+/// app is willing to write somewhere the user did not point at. Pure over
+/// the path text, like `isEphemeralSource`.
+///
+/// The justification for the special case is narrow and worth stating: a
+/// screenshot in an unwritable folder is one macOS itself parked there,
+/// not one the user filed. Its owner already expects to find it in the
+/// screenshot folder, so putting the compressed copies there too is
+/// following the file rather than guessing. NOTHING ELSE gets this
+/// treatment — an ordinary photo on a read-only volume goes to `.ask`.
+///
+/// Two signals, either sufficient:
+///  - the BASENAME starts with "Screenshot", macOS's own default naming;
+///  - the path runs through `screencaptureui`'s staging directory, which
+///    covers a drag off the floating thumbnail whatever the file is named.
+///
+/// The residual is a LOCALIZED screenshot name — a German system writes
+/// "Bildschirmfoto 2026-09-08 um 10.14.02.png", which the first signal
+/// misses. Such a file dragged from the thumbnail still matches the
+/// second; one already filed in an unwritable folder falls to `.ask`, and
+/// gets a Save As instead of a wrong guess. That is the safe direction to
+/// be wrong in, and reading the real localized prefix means a
+/// `CFBundleCopyLocalizedString` binding this app has no other use for.
+pub fn looksLikeScreenshot(path: []const u8) bool {
+    if (std.mem.indexOf(u8, path, "screencaptureui") != null) return true;
+    const name_start = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| slash + 1 else 0;
+    return std.mem.startsWith(u8, path[name_start..], "Screenshot");
+}
+
+/// `file.destination`'s answer: `"<0|1>\x00<screenshot dir>\x00<outbox dir>"`.
+/// The flag is whether the SOURCE's own folder took a probe write; the two
+/// directories are the fallbacks, always sent so `update` can pick between
+/// them without a second round trip. NUL-delimited for the same reason
+/// `encodePayload` is: both fields are paths, and a path may contain a
+/// newline.
+pub const DestinationInfo = struct {
+    source_dir_writable: bool,
+    screenshot_dir: []const u8,
+    outbox_dir: []const u8,
+};
+
+pub fn parseDestinationReply(bytes: []const u8) ?DestinationInfo {
+    var it = std.mem.splitScalar(u8, bytes, 0);
+    const flag = it.next() orelse return null;
+    if (flag.len != 1 or (flag[0] != '0' and flag[0] != '1')) return null;
+    const screenshot_dir = it.next() orelse return null;
+    const outbox_dir = it.next() orelse return null;
+    return .{
+        .source_dir_writable = flag[0] == '1',
+        .screenshot_dir = screenshot_dir,
+        .outbox_dir = outbox_dir,
+    };
 }
 
 /// Starts the load chain for a path that just arrived — from the open
@@ -1837,6 +2025,46 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.image_id = preview_image_id;
             model.preview_width = preview.width;
             model.preview_height = preview.height;
+            // The last hop before `.ready`: WHERE this file's outputs can
+            // go. It runs at load rather than at the Smoosh press so the
+            // answer is in hand before the button is live, and it probes
+            // the SOURCE's folder (`path()`, never `readPath()`) — the
+            // stash lives in a cache directory that is always writable
+            // and would answer the wrong question.
+            fx.hostRequest(.{
+                .key = destination_key,
+                .name = host_destination,
+                .payload = model.path(),
+                .on_result = Effects.hostMsg(.destination_result),
+            });
+        },
+
+        // Chooses between the three `Destination` arms. `update` decides,
+        // not the bridge: the bridge reports only what it alone can know
+        // (did the folder take a write, and where are the two fallback
+        // directories), and the policy over those facts stays pure and
+        // testable here.
+        .destination_result => |result| {
+            model.destination = .beside_source;
+            model.dest_dir_len = 0;
+            if (result.ok) {
+                if (parseDestinationReply(result.bytes)) |info| {
+                    if (!info.source_dir_writable) {
+                        if (looksLikeScreenshot(model.path())) {
+                            model.destination = .desktop;
+                            model.setDestDir(info.screenshot_dir);
+                        } else {
+                            model.destination = .ask;
+                            model.setDestDir(info.outbox_dir);
+                        }
+                    }
+                }
+            }
+            // A probe that could not run at all is NOT a load failure —
+            // it degrades to the behaviour that predates it. The write is
+            // still attempted beside the source and still reports
+            // `.write_failed` with the folder-permissions message if it
+            // cannot land, which is exactly where this started.
             model.status = .ready;
         },
 
@@ -1862,6 +2090,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.cancel(stat_key);
             fx.cancel(probe_key);
             fx.cancel(thumbnail_key);
+            fx.cancel(destination_key);
             fx.cancel(avif_encode_key);
             fx.cancel(webp_encode_key);
             fx.cancel(save_dialog_key);
@@ -2084,6 +2313,8 @@ const HostBridge = struct {
     /// `stashFile`'s answer is a PATH, which `reply_buf` (sized for a
     /// decimal byte count) cannot hold.
     var stash_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+    /// `destinationFor`'s answer carries two paths and a flag.
+    var destination_reply_buf: [platform.max_dialog_path_bytes * 2 + 4]u8 = undefined;
 
     // ------------------------------------------------------ worker carrier
 
@@ -2413,6 +2644,7 @@ const HostBridge = struct {
         if (std.mem.eql(u8, name, host_save_file)) return self.saveFile(key, payload);
         if (std.mem.eql(u8, name, host_file_copy)) return self.copyFile(key, payload);
         if (std.mem.eql(u8, name, host_file_stash)) return self.stashFile(key, payload);
+        if (std.mem.eql(u8, name, host_destination)) return self.destinationFor(key, payload);
         if (std.mem.eql(u8, name, host_reveal)) return self.revealPaths(key, payload);
         // The ImageIO reads and the encode return without answering — see
         // the worker carrier above.
@@ -2498,12 +2730,18 @@ const HostBridge = struct {
     /// a user staring at the cache directory would expect to find. The
     /// extension is NOT what any read keys on — `image.probe` sniffs the
     /// container out of the bytes.
-    fn stashFile(self: *HostBridge, key: u64, source: []const u8) void {
-        // `std.c.getenv` rather than an `Environ`: a hand-authored root
-        // never receives the runner's env map (see CLAUDE.md's "File
-        // acquisition, honestly"), and this links libc regardless.
-        const home_z = std.c.getenv("HOME") orelse return self.reply(key, false, "no home");
-        const home = std.mem.span(home_z);
+    /// `$HOME`, or null when the process has none. `std.c.getenv` rather
+    /// than an `Environ`: a hand-authored root never receives the runner's
+    /// env map (see CLAUDE.md's "File acquisition, honestly"), and this
+    /// links libc regardless.
+    fn homeDir() ?[]const u8 {
+        const home_z = std.c.getenv("HOME") orelse return null;
+        return std.mem.span(home_z);
+    }
+
+    /// `<cache>/<child>` for this app, e.g. `~/Library/Caches/smoosh/staged`.
+    fn cacheSubdir(child: []const u8, buffer: []u8) ?[]const u8 {
+        const home = homeDir() orelse return null;
         var dir_buf: [platform.max_dialog_path_bytes]u8 = undefined;
         const cache_dir = native_sdk.app_dirs.resolveOne(
             .{ .name = "smoosh" },
@@ -2511,11 +2749,14 @@ const HostBridge = struct {
             .{ .home = home },
             .cache,
             &dir_buf,
-        ) catch |err| return self.reply(key, false, @errorName(err));
+        ) catch return null;
+        return std.fmt.bufPrint(buffer, "{s}/{s}", .{ cache_dir, child }) catch null;
+    }
 
+    fn stashFile(self: *HostBridge, key: u64, source: []const u8) void {
         var staged_buf: [platform.max_dialog_path_bytes]u8 = undefined;
-        const staged_dir = std.fmt.bufPrint(&staged_buf, "{s}/staged", .{cache_dir}) catch
-            return self.reply(key, false, "cache path too long");
+        const staged_dir = cacheSubdir("staged", &staged_buf) orelse
+            return self.reply(key, false, "no cache dir");
         // Best-effort: a first run has nothing to delete, and a stash left
         // by a crashed run is exactly what this is clearing.
         std.Io.Dir.cwd().deleteTree(self.io, staged_dir) catch {};
@@ -2530,6 +2771,73 @@ const HostBridge = struct {
             return self.reply(key, false, @errorName(err));
         };
         self.reply(key, true, destination);
+    }
+
+    /// Answers `"<0|1>\x00<screenshot dir>\x00<outbox dir>"` for the source
+    /// path in `payload` — the three facts `update` needs to pick a
+    /// `Destination` and cannot work out itself.
+    ///
+    /// The flag comes from a REAL WRITE, not from a mode bit: create a
+    /// uniquely-named temp file in the source's own directory and unlink
+    /// it. Nothing short of that is honest here — a directory can be
+    /// mode 0755 and owned by you and still refuse the write (a read-only
+    /// mount, a full disk, a sandbox denial, an ACL), and every one of
+    /// those is a case this exists to catch. The probe file is created
+    /// truncating rather than exclusive, and removed immediately: a crash
+    /// between the two leaves one zero-byte dotfile behind, and exclusive
+    /// creation would then report that still-writable folder as read-only
+    /// forever. Nothing but this command writes a file of that name, so
+    /// clobbering one costs nothing.
+    ///
+    /// The outbox is created eagerly because `.ask` needs somewhere for
+    /// the encode to land, and creating it here means `beginEncode` never
+    /// has to. The screenshot directory is NOT created: it is `~/Desktop`,
+    /// which exists, and if it somehow does not the write reports its own
+    /// failure rather than this command inventing a folder.
+    fn destinationFor(self: *HostBridge, key: u64, source: []const u8) void {
+        const dir_end = std.mem.lastIndexOfScalar(u8, source, '/') orelse
+            return self.reply(key, false, "no directory");
+        // A source at the volume root ("/photo.jpg") has an empty parent
+        // by this slicing; "/" is the directory it means.
+        const source_dir = if (dir_end == 0) source[0..1] else source[0..dir_end];
+
+        var probe_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        const probe_path = std.fmt.bufPrint(
+            &probe_buf,
+            "{s}/.smoosh-write-probe-{d}",
+            .{ source_dir, std.c.getpid() },
+        ) catch return self.reply(key, false, "probe path too long");
+        const writable = blk: {
+            const file = std.Io.Dir.cwd().createFile(self.io, probe_path, .{}) catch
+                break :blk false;
+            file.close(self.io);
+            std.Io.Dir.cwd().deleteFile(self.io, probe_path) catch {};
+            break :blk true;
+        };
+
+        // Both fallbacks are sent on every answer, writable or not: they
+        // are constants for the process, and one round trip that carries
+        // everything beats a second one at the moment a decision is made.
+        const home = homeDir() orelse "";
+        var screenshot_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        const screenshot_dir = if (home.len == 0)
+            ""
+        else
+            std.fmt.bufPrint(&screenshot_buf, "{s}/Desktop", .{home}) catch "";
+
+        var outbox_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        const outbox_dir = blk: {
+            const dir = cacheSubdir("outbox", &outbox_buf) orelse break :blk "";
+            std.Io.Dir.cwd().createDirPath(self.io, dir) catch break :blk "";
+            break :blk dir;
+        };
+
+        const reply_text = std.fmt.bufPrint(&destination_reply_buf, "{s}\x00{s}\x00{s}", .{
+            if (writable) "1" else "0",
+            screenshot_dir,
+            outbox_dir,
+        }) catch return self.reply(key, false, "reply too long");
+        self.reply(key, true, reply_text);
     }
 
     /// "Show in Finder". `payload` is one or more newline-joined absolute

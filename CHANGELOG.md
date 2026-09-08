@@ -3,11 +3,30 @@
 For the engineering record — the decisions still in force, and the measurements the encoder work was
 held to — see [PLAN.md](PLAN.md) and [docs/phase-b-baseline.md](docs/phase-b-baseline.md).
 
-## Unreleased
+## v0.5 — 2026-09-08
+
+Screenshots. Dragging one straight off its floating thumbnail is the fastest way to get a screenshot
+into Smoosh, and it used to fail twice over — macOS moves the file out from under the app seconds
+later, and the folder it hands the drag from cannot be written to. Both are fixed. The second fix is
+the bigger one: Smoosh now works out where your compressed files can go *before* it starts, so it
+never finishes the work and then discovers it has nowhere to put it.
 
 - **A screenshot dragged straight off its floating thumbnail now smooshes.** macOS serves that drag
   from a staging folder it empties seconds later, so the image previewed fine and then failed to
   compress. Smoosh takes its own copy of the file the moment it arrives, and works from that.
+- **Images in folders Smoosh can't write to no longer just fail.** The folder is checked when you
+  open the file, not after the compression is finished:
+  - A **screenshot** in such a folder is saved to your Desktop instead, and the status line says
+    `Saved to Desktop.` rather than a bare "Done." — you are never left guessing where a file went.
+  - **Anything else** is compressed but not filed anywhere on its own: the line reads
+    `That folder is read-only — save a copy.`, and each result's Save button puts it where you want
+    it. Smoosh will not guess a folder for your files.
+- **When a save fails, the message says what to actually check.** Denying Smoosh access to your
+  Desktop used to be reported as a folder-permissions problem, which sends you to Get Info to find
+  nothing wrong — it now points at Privacy & Security instead.
+- **The app icon sits flush in the Dock.** It used to render as a square tile with a smaller rounded
+  square floating inside it, because macOS does not round off app icons the way iOS does — the
+  artwork has to be its own shape. Now it matches every other Mac app.
 
 ## v0.4 — 2026-09-07
 
