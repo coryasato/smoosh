@@ -10,9 +10,14 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 web formats (AVIF and/or WebP) without leaving your desktop.
 
 ## Status
-**v0.3 — feature-complete and zero-dependency.** Pick or drop an image, choose AVIF/WebP/Both,
-Smoosh auto-saves next to the source; each landed result row carries its own save icon to copy that
-one file elsewhere. Ships as an ad-hoc-signed `.app`.
+**v0.5 — feature-complete and zero-dependency.** Pick or drop an image, choose AVIF/WebP/Both,
+Smoosh writes the outputs itself and says where they went; each landed result row carries its own
+save icon to copy that one file elsewhere. Ships as an ad-hoc-signed `.app`.
+
+**Where the outputs go is decided per file, before the run** — beside the source when that folder
+takes a write, the Desktop for a screenshot stranded somewhere read-only, and nowhere-but-Save-As
+otherwise (see `Destination` in `src/main.zig`). An ephemeral source is copied into the app cache
+first, so a screenshot dragged off its floating thumbnail survives macOS deleting it mid-run.
 
 The whole pipeline runs in-process: Apple ImageIO reads (`src/imageio.zig`), vendored static
 libavif/libaom/libwebp write (`src/encoders.zig` over `src/encode.c`), and the encode runs on a
@@ -203,12 +208,6 @@ and `native check` are necessary and never sufficient.
   only, so this is a deliberate trade.
 - **arm64 only.** The vendored archives are non-fat arm64-macos; producing an x86_64 or universal
   build is unexplored. A genuine gap the moment the `.app` is handed to anyone else.
-- **The app icon does not sit flush in the Dock.** `assets/icon.png` is opaque RGB with no alpha
-  channel (PNG color type 2), and the artwork draws its rounded square inside a full-bleed square
-  background. macOS does not mask app icons the way iOS does, so it renders as a square tile with a
-  smaller squircle floating inside it rather than flush like other Mac apps. The fix is the
-  artwork, not the code: an RGBA source whose squircle IS the icon bounds, with transparency
-  around it and Apple's standard margin.
 - **Launch time has never been measured.**
 
 ## Roadmap
@@ -410,42 +409,120 @@ session in §4), and **launch time**.
 *Suggested: **Opus 5, high**, or run `/code-review ultra` for the correctness sweep — it is
 user-triggered and billed, so it cannot be launched from inside a session.*
 
+### App icon — settled, and the numbers that keep it settled
+`assets/icon.png` is RGBA on Apple's macOS template: a **1024² canvas with the artwork occupying
+824² centred, i.e. a 100px transparent margin on all four sides** (80.5%). Measured from the
+packaged `AppIcon.icns`, all ten rungs 16→1024 carry alpha at the right dimensions.
+
+macOS does NOT mask app icons the way iOS does, so this margin is the whole mechanism: an
+opaque full-bleed square renders as a square tile with a smaller squircle floating inside it,
+which is exactly what the earlier art did. **Any replacement must keep the 824/1024 ratio and the
+transparency** — `design/icon-original.png` is the pre-fix source, kept for comparison. Nothing in
+`build.zig` or `app.zon` is involved beyond the path; the geometry is the entire contract.
+
 ### 4. Deferred features — each its own session
-Real wants and one latent bug, none small enough to ride another change.
+One real want. The latent bug this list carried (the screenshot that vanished mid-run) and the
+read-only-folder problem coupled to it are both fixed; the app-icon item is done too.
 
 - **Read-only source folders, and the screenshot-that-vanishes bug.** Two coupled problems, both
   invisible from a Terminal `native dev` run (the responsible process is the terminal, which
   already holds the TCC grants) and both real once packaged.
 
-  *The read bug (priority).* The `image.encode` worker re-reads the source path fresh —
-  `imageio.decode(path)`, with no full-res buffer retained between the preview and the Smoosh
-  press. A macOS screenshot dropped from its floating thumbnail is served from a `screencapture`
-  staging dir; a few seconds later macOS moves it to `~/Desktop` or, if the thumbnail was
-  dismissed, deletes it. So the encode fails to decode a file that previewed fine. Fix: at
-  `.ready`, classify the source, and for a staging/temp source copy the bytes into the app cache
-  dir (`app_dirs.cache`) once and point probe / thumbnail / encode at the copy. Normal sources are
-  untouched.
+  *The read bug — **SHIPPED** (step 1 of the build order below).* An ephemeral source is now copied
+  into the app cache dir before anything reads it. `isEphemeralSource` (pure, in `main.zig`)
+  classifies the path; an ephemeral one gets one extra hop ahead of the stat — the `file.stash`
+  host command, which deletes and remakes `Library/Caches/smoosh/staged`, copies the bytes in, and
+  answers with the copy's path. `Model.readPath()` is what `image.probe`, `image.thumbnail` and
+  `image.encode`'s SOURCE field read; `Model.path()` stays the original, and remains what the file
+  card names, what `outputPath` derives the destination from, and what `beginEncode`'s `same_path`
+  guard compares against. Only the read moves. Ordinary sources are untouched and issue no stash at
+  all.
 
-  *The write destination.* Output is written beside the source. Beside a screenshot's staging path
-  that fails (`.write_failed`), and beside a read-only USB / `/Applications` / a full disk it also
-  fails — do NOT blanket-retry a guessed folder, which mixes those cases and drops files where
-  nobody asked. Instead classify UP FRONT with a writability probe at `.ready` (create + delete a
-  temp sibling): writable → sibling, as today; not writable AND the source looks like a screenshot
-  (name `Screenshot *`, or a screencapture path) → the screenshot folder (default `~/Desktop`;
-  reading a custom `com.apple.screencapture location` needs a `CFPreferencesCopyAppValue` binding
-  since the app spawns no subprocess — defer it, land on Desktop meanwhile); not writable and not a
-  screenshot → Save As. Report the path actually written; a status note ONLY when it is not
-  source-adjacent (a silent Desktop fallback on a Pictures file would be a lie).
+  *The write destination — **SHIPPED** (steps 2 and 4).* Classified UP FRONT rather than retried
+  after a failed write, because a blanket retry cannot tell a screenshot's staging directory apart
+  from a read-only USB stick and would drop files where nobody asked. The last hop of the load chain
+  is `file.destination`, which probes the SOURCE's folder with a real create-and-unlink (nothing
+  short of a real write is honest — a folder can be mode 0755 and yours and still refuse, on a
+  read-only mount, a full disk, an ACL or a sandbox denial) and returns that flag plus the two
+  directories `update` cannot derive itself. `update` owns the policy over those facts, as
+  `Model.Destination`:
+  - **`.beside_source`** — the folder took the write. Today's behaviour, `destDir` empty.
+  - **`.desktop`** — read-only AND `looksLikeScreenshot` (basename `Screenshot*`, or a
+    `screencaptureui` path). `outputPath` keeps the NAME and replaces the DIRECTORY.
+  - **`.ask`** — read-only, nothing else. Outputs are encoded into `Caches/smoosh/outbox` and Save As
+    is the only way out; `canReveal` is false and the status line refuses to claim a save.
 
-  *Packaging.* `NSDesktopFolderUsageDescription` in `app.zon`, or the Desktop write fails with no
-  prompt. Verify against `native package`, not just `native dev`.
+  A failed or malformed probe reply is NOT a load failure — it degrades to `.beside_source`, i.e.
+  exactly the behaviour that predates the probe, and a write that then cannot land still reports
+  `.write_failed` with the folder-permissions message.
 
-  Build order: (1) the read fix standalone — it removes the "file vanished" failure whatever the
-  destination logic is; (2) the writability-probe destination split; (3) the plist string; (4) the
-  status-line copy, which is the next item and only becomes writable once (2) exists.
+  Still deferred inside this: a CUSTOM `com.apple.screencapture location` is not read (that needs a
+  `CFPreferencesCopyAppValue` binding, since the app spawns no subprocess), so `.desktop` is
+  literally `~/Desktop`. And `looksLikeScreenshot` does not chase LOCALIZED screenshot names — a
+  German "Bildschirmfoto …" already filed in a read-only folder falls to `.ask` and gets a Save As
+  rather than a wrong guess, which is the safe direction to be wrong in.
 
-- **"Saved to Desktop." for the special-cased writes.** *Blocked by the item above — it is step 4 of
-  that session, not a session of its own.* The "Show in Finder" control has SHIPPED —
+  *Packaging (step 3) — **NOT NEEDED for correctness; the premise was wrong**.* This item read
+  "`NSDesktopFolderUsageDescription` in `app.zon`, or the Desktop write fails with no prompt."
+  Both halves are false, and both were checked rather than reasoned about.
+
+  **Measured** on macOS 26.6.2, against a packaged ad-hoc `.app` (`native package --target macos`)
+  with the grant reset between runs (`tccutil reset SystemPolicyDesktopFolder dev.native_sdk.smoosh`)
+  — the packaged app is the responsible process, which is what makes this the real test and a
+  `native dev` run useless for it:
+  - The bundle carries NO usage-description key (confirmed by reading the generated
+    `Contents/Info.plist`), and macOS still PROMPTS: *"Smoosh.app" would like to access files in
+    your Desktop folder.* The key is not a gate for the Desktop folder — unlike camera/microphone,
+    where a missing key is fatal. All it would add is the explanatory sentence under the title,
+    which is currently absent.
+  - **Allow** → both outputs land on the Desktop.
+  - **Don't Allow** → nothing is written and the run reports `.failed` with "Couldn't write to that
+    folder — check its permissions." (the both-formats collapse branch). No false "Saved to
+    Desktop." over files that do not exist.
+
+  So this is a COPY nicety, not a blocker, and the destination split ships without it.
+
+  If the reason line is ever wanted: the key still cannot be stated in `app.zon` —
+  `tooling/package.zig`'s `macosInfoPlist` builds `Contents/Info.plist` from a fixed template whose
+  only privacy strings come from `macosPrivacyUsageDescriptions`, hardcoded to the `microphone` and
+  `system_audio` permissions; there is no arbitrary-key passthrough in `app_manifest/types.zig` and
+  no user plist fragment is read. `build.zig` cannot reach it either, since packaging is CLI-side.
+  The cheap route is a post-package `plutil -insert`, and it needs NO re-sign: `codesign -dv` on the
+  packaged bundle reports `Info.plist=not bound` and `Sealed Resources=none`, because the ad-hoc
+  signature is linker-signed and covers only the Mach-O. The proper route is an SDK passthrough,
+  which is not this repo's to make.
+
+  *The write-failure sentence follows the destination — **SHIPPED**.* The generic "check the
+  folder's permissions" is only true for `.beside_source`. Aimed at the Desktop it was actively
+  misleading (a TCC denial is not a `chmod` problem — the folder IS writable and the app was
+  refused by Privacy & Security, so the user inspects Get Info, finds nothing wrong, and is stuck);
+  aimed at the app's own cache it was meaningless, since the user cannot act on our cache
+  directory's permissions at all. Two fns now carry it — `writeFailureAdvice` for the per-format
+  sentence and `writeFailureCollapsed` for the both-failed one — and their remedies agree per
+  destination, pinned separately because they can drift independently:
+
+  | destination | one format | both formats |
+  |---|---|---|
+  | `.beside_source` | `Couldn't save the AVIF — check the folder's permissions.` | `Couldn't write to that folder — check its permissions.` |
+  | `.desktop` | `Couldn't save the AVIF — check Privacy & Security.` | `Couldn't write to your Desktop — check Privacy & Security.` |
+  | `.ask` | `Couldn't save the AVIF — the disk may be full.` | `Couldn't write the compressed files — the disk may be full.` |
+
+  The collapsed forms are not the per-format sentence with the label removed: "Couldn't write to
+  that folder — check the folder's permissions." says folder twice, and the Desktop one NAMES the
+  Desktop because the user never chose it and "that folder" would point at nothing they have in
+  mind. A test pins every one of the six at or under the status line's ~65 characters — the bar
+  elides rather than wraps, and the clause that says what to do is the half that would be lost.
+
+  Build order: (1) the read fix standalone — **done**; (2) the writability-probe destination split —
+  **done**; (3) the plist string — **dropped, premise disproved above**; (4) the status-line copy —
+  **done**. This item is closed.
+
+- **"Saved to Desktop." for the special-cased writes — SHIPPED** (step 4 of the item above).
+  `statusLine`'s `.done` arm now switches on `Destination`: `Done.` beside the source,
+  `Saved to Desktop.` for the screenshot rescue, and `That folder is read-only — save a copy.` for
+  `.ask`, which deliberately refuses to claim a save that did not happen. A lost format still wins
+  the line over any of them — the loss is what the user has to act on. For the record, the
+  "Show in Finder" control had already SHIPPED —
   the footer reads `Done.` beside a hover-lit label that opens Finder with every output of the run
   selected (`shell.reveal` → `NSWorkspace`, `src/workspace.zig`). It deliberately points at the
   AUTOMATIC write and never follows a Save As: a user who drove a save panel already knows where
@@ -467,12 +544,6 @@ Real wants and one latent bug, none small enough to ride another change.
   chain. Tests feed a fake host result for each payload shape. *Own session — the pasteboard type
   negotiation is the whole task and can spill into platform-layer work.*
 
-- **App icon Dock shape.** Diagnosis is under "Known limitations" (the source is opaque RGB with
-  the squircle floating inside a full-bleed square; macOS does not mask app icons). Session
-  deliverable: regenerate the icon from art on Apple's macOS template — 1024² canvas, artwork in a
-  ~824² superellipse with the standard margin and shadow, transparency around it — then verify
-  every rung 16→1024 in the Dock and Finder. The art is the owner's; the code change is only the
-  asset `app.zon` points at. *Own session — an asset task, not a Zig one.*
 
 **Not planned — Dock-icon / Finder drop.** macOS delivers Dock-icon drops and "Open With" through
 `application:openURLs:` (an `odoc` Apple Event), a different channel from the drag machinery

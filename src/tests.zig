@@ -656,6 +656,16 @@ const Harness = struct {
         try self.drain();
     }
 
+    /// Answers the `file.stash` hop an EPHEMERAL source starts (see
+    /// `main.isEphemeralSource`). `cache_path` is where the bridge copied
+    /// the bytes; from here the chain is the ordinary one, reading that
+    /// copy instead of the original.
+    fn stash(self: *Harness, cache_path: []const u8) !void {
+        const request = self.pendingHostNamed("file.stash") orelse return error.NoHostRequest;
+        try self.fx().feedHostResult(request.key, true, cache_path);
+        try self.drain();
+    }
+
     fn stat(self: *Harness, size: []const u8) !void {
         const request = self.fx().pendingHostAt(0) orelse return error.NoHostRequest;
         try testing.expectEqualStrings("file.stat", request.name);
@@ -692,6 +702,29 @@ const Harness = struct {
         try self.drain();
     }
 
+    /// Answers the `file.destination` writability probe — the last hop of
+    /// the load chain, and what moves the model to `.ready`. The default
+    /// is the ordinary case: the source's own folder takes a write, so
+    /// the outputs land beside it.
+    fn destinationOk(self: *Harness) !void {
+        try self.destinationRaw(true, "1\x00/Users/someone/Desktop\x00/Users/someone/Library/Caches/smoosh/outbox");
+    }
+
+    /// The read-only-folder form: the probe could not write beside the
+    /// source, and here are the two directories `update` chooses between.
+    fn destinationReadOnly(self: *Harness) !void {
+        // `ok` is TRUE: the probe ran and answered. The flag is what says
+        // the folder refused the write — a failed REQUEST is the separate
+        // "could not ask" case, which degrades to `.beside_source`.
+        try self.destinationRaw(true, "0\x00/Users/someone/Desktop\x00/Users/someone/Library/Caches/smoosh/outbox");
+    }
+
+    fn destinationRaw(self: *Harness, ok: bool, reply: []const u8) !void {
+        const request = self.pendingHostNamed("file.destination") orelse return error.NoHostRequest;
+        try self.fx().feedHostResult(request.key, ok, reply);
+        try self.drain();
+    }
+
     // ------------------------------------------------------------ encoding
     //
     // Each format is one `image.encode` host request, payload
@@ -707,6 +740,7 @@ const Harness = struct {
         try self.stat(size);
         try self.probe(4000, 3000);
         try self.thumbnail(140, 105);
+        try self.destinationOk();
     }
 
     fn encodeLabel(format: Format) []const u8 {
@@ -842,7 +876,19 @@ test "picking a file lands the real path, its size, and a preview" {
     // The pixels ride the result, so this lands as a registered image
     // with no temp file and no second decode.
     try h.thumbnail(105, 140);
+    // ...and the chain is NOT done: one more hop asks where this file's
+    // outputs may go, so the answer is in hand before Smoosh is live.
+    // It probes the SOURCE's folder.
+    try testing.expectEqual(Status.loading, h.model().status);
+    const dest_request = h.pendingHostNamed("file.destination") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(path, dest_request.payload);
+    try h.destinationOk();
+
     try testing.expectEqual(Status.ready, h.model().status);
+    try testing.expectEqual(main.Destination.beside_source, h.model().destination);
+    // Beside the source means no directory override at all — the empty
+    // `destDir` is what `outputPath` reads as "keep the source's folder".
+    try testing.expectEqualStrings("", h.model().destDir());
     try testing.expect(h.model().image_id != 0);
     try testing.expect(h.model().hasPreview());
     try testing.expectEqual(@as(u32, 105), h.model().preview_width);
@@ -956,6 +1002,447 @@ test "a new pick drops the previous file's preview before it can load" {
     const tree = try buildTree(arena, h.model());
     _ = try expectByText(tree.root, .text, "not-an-image.jpg");
     try testing.expect(findByKind(tree.root, .image) == null);
+}
+
+// --------------------------------------------- ephemeral sources (stash)
+//
+// A screenshot dragged straight off its floating thumbnail is served from
+// a `screencapture` staging directory that macOS empties seconds later.
+// The load chain reads the file three times — probe, thumbnail, and the
+// encode worker's full-resolution decode — and the third read is the one
+// the user waits for, so the source has to be captured up front. These
+// pin the split that makes that safe: the READ moves to the copy, the
+// WRITE stays beside the original.
+
+test "isEphemeralSource classifies the OS-owned staging roots, and nothing else" {
+    // Every one of these is somewhere the OS may empty out from under a
+    // load. `/private` spellings appear because `/tmp` and `/var` are
+    // symlinks into `/private` on macOS and a drop may carry either.
+    const ephemeral = [_][]const u8{
+        // The real shape: `screencapture`'s staging directory.
+        "/var/folders/qh/8b1x_3ld0kz9/T/TemporaryItems/NSIRD_screencaptureui_9aT2vX/Screenshot 2026-09-08 at 10.14.02.png",
+        "/private/var/folders/qh/8b1x_3ld0kz9/T/screenshot.png",
+        "/tmp/shot.png",
+        "/private/tmp/shot.png",
+        "/var/tmp/shot.png",
+        "/private/var/tmp/shot.png",
+        // A drag promise staged at an external volume's root, which sits
+        // under none of the prefixes above.
+        "/Volumes/Photos/.TemporaryItems/folders.501/photo.jpg",
+        "/Volumes/Photos/TemporaryItems/photo.jpg",
+    };
+    for (ephemeral) |path| {
+        testing.expect(main.isEphemeralSource(path)) catch |err| {
+            std.debug.print("expected ephemeral: {s}\n", .{path});
+            return err;
+        };
+    }
+
+    // Ordinary sources, including the near-misses: a directory merely
+    // NAMED like a staging root, and one that only contains the word.
+    const durable = [_][]const u8{
+        "/Users/someone/Pictures/photo.jpg",
+        "/Users/someone/Desktop/Screenshot 2026-09-08 at 10.14.02.png",
+        "/Volumes/Backup/archive/photo.jpg",
+        "/Users/someone/tmp/photo.jpg",
+        "/Users/someone/var/folders/photo.jpg",
+        "/Users/someone/Pictures/TemporaryItems.jpg",
+    };
+    for (durable) |path| {
+        testing.expect(!main.isEphemeralSource(path)) catch |err| {
+            std.debug.print("expected durable: {s}\n", .{path});
+            return err;
+        };
+    }
+}
+
+test "an ordinary source is never copied — the chain starts at the stat" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    // Not "no stash pending" by slot luck: the FIRST request is the stat,
+    // so nothing was inserted ahead of it.
+    const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stat", request.name);
+    try testing.expect(h.pendingHostNamed("file.stash") == null);
+    // With no stash, `readPath` IS `path` — the same slice, not a copy of
+    // it, so nothing downstream has to know which case it is in.
+    try testing.expectEqualStrings(h.model().path(), h.model().readPath());
+}
+
+test "a screenshot dropped from its thumbnail is copied before anything reads it" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_screencaptureui_9aT2vX/Screenshot 2026-09-08 at 10.14.02.png";
+    try h.drop(staged);
+
+    // The stash goes FIRST, ahead of the stat: by the time a stat could
+    // answer, the file may already have been moved to ~/Desktop.
+    const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stash", request.name);
+    // It names the ORIGINAL — the bridge is what is being asked to copy it.
+    try testing.expectEqualStrings(staged, request.payload);
+    try testing.expect(h.pendingHostNamed("file.stat") == null);
+    try testing.expectEqual(Status.loading, h.model().status);
+}
+
+test "once stashed, every read goes to the copy while the file stays the original" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/Screenshot 2026-09-08 at 10.14.02.png";
+    const cached = "/Users/someone/Library/Caches/smoosh/staged/Screenshot 2026-09-08 at 10.14.02.png";
+    try h.drop(staged);
+    try h.stash(cached);
+
+    // The stat reads the COPY too. Statting the original would fail the
+    // load for the wrong reason once macOS has moved it.
+    const stat_request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stat", stat_request.name);
+    try testing.expectEqualStrings(cached, stat_request.payload);
+    try h.stat("184320");
+
+    const probe_request = h.pendingHostNamed("image.probe") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(cached, probe_request.payload);
+    try h.probe(2880, 1800);
+
+    const thumb_request = h.pendingHostNamed("image.thumbnail") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(cached, thumb_request.payload);
+    try h.thumbnail(140, 87);
+
+    // The writability probe reads the ORIGINAL's folder, not the stash's:
+    // the cache is always writable and would answer the wrong question.
+    const dest_request = h.pendingHostNamed("file.destination") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(staged, dest_request.payload);
+    try h.destinationOk();
+
+    try testing.expectEqual(Status.ready, h.model().status);
+    // The MODEL's file is still the one the user dropped. The card names
+    // it, and the destination is derived from it — a card reading
+    // "staged/..." would be a lie about what was opened.
+    try testing.expectEqualStrings(staged, h.model().path());
+    try testing.expectEqualStrings(cached, h.model().readPath());
+
+    const tree = try buildTree(arena, h.model());
+    _ = try expectByText(tree.root, .text, "Screenshot 2026-09-08 at 10.14.02.png");
+}
+
+test "the encode reads the stash and writes beside the original" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.png";
+    const cached = "/Users/someone/Library/Caches/smoosh/staged/shot.png";
+    try h.drop(staged);
+    try h.stash(cached);
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+
+    const request = h.encodeRequest(.avif) orelse return error.NoHostRequest;
+    var it = std.mem.splitScalar(u8, request.payload, 0);
+    _ = it.next(); // format
+    const source = it.next() orelse return error.MalformedPayload;
+    // The whole point of the stash: the worker's full-resolution decode is
+    // the read most likely to find the original already gone.
+    try testing.expectEqualStrings(cached, source);
+    // ...and the destination is unmoved. Writing into the cache directory
+    // would put the user's output somewhere the OS may purge.
+    try testing.expectEqualStrings("/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.avif", try h.encodeDest(.avif));
+}
+
+test "a stash that fails is an unreadable file, and stops the chain there" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.drop("/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.png");
+    const request = h.pendingHostNamed("file.stash") orelse return error.NoHostRequest;
+    try h.fx().feedHostResult(request.key, false, "FileNotFound");
+    try h.drain();
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expectEqualStrings("Can't read that file.", h.model().errorMessage());
+    // Deliberately no fall-through to the original: if the copy could not
+    // be taken, the original is the thing disappearing, and proceeding
+    // would only move the same failure to the encode.
+    try testing.expect(h.pendingHostNamed("file.stat") == null);
+}
+
+test "a durable file loaded after a stashed one reads itself, not the leftover copy" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.drop("/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.png");
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/shot.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+    try h.destinationOk();
+
+    const durable = "/Users/someone/Pictures/photo.jpg";
+    try h.pick(durable);
+    // Without the reset in `setPath`, this load's probe would have read
+    // the PREVIOUS image out of the cache and previewed the wrong file.
+    try testing.expectEqualStrings(durable, h.model().readPath());
+    const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stat", request.name);
+    try testing.expectEqualStrings(durable, request.payload);
+}
+
+test "reset forgets the stash along with the file" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.drop("/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.png");
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/shot.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+
+    try h.send(.reset);
+    try testing.expect(!h.model().hasFile());
+    try testing.expectEqualStrings("", h.model().readPath());
+}
+
+// ------------------------------------------- the write destination split
+//
+// Where a run's outputs go is decided ONCE per file, by a real write
+// probe at the end of the load chain, and fixed for the run. A blanket
+// "the write failed, try somewhere else" cannot tell a screenshot's
+// staging directory apart from a read-only USB stick, so the classifying
+// happens up front and each arm is pinned here.
+
+test "looksLikeScreenshot matches macOS's own naming and its staging path" {
+    const yes = [_][]const u8{
+        "/Users/someone/Desktop/Screenshot 2026-09-08 at 10.14.02.png",
+        // Dragged off the floating thumbnail: named anything, but the
+        // path runs through screencaptureui's staging directory.
+        "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_screencaptureui_9aT2vX/anything.png",
+        "/Volumes/ReadOnly/Screenshot.png",
+    };
+    for (yes) |path| {
+        testing.expect(main.looksLikeScreenshot(path)) catch |err| {
+            std.debug.print("expected screenshot: {s}\n", .{path});
+            return err;
+        };
+    }
+
+    const no = [_][]const u8{
+        "/Users/someone/Pictures/photo.jpg",
+        // The word appears in a PARENT directory, not the name.
+        "/Users/someone/Screenshot Archive/photo.jpg",
+        // Case matters: this is a user's own file, not macOS's naming.
+        "/Users/someone/Pictures/screenshot.png",
+        // The localized name this deliberately does not chase — it falls
+        // to `.ask` and gets a Save As rather than a wrong guess.
+        "/Volumes/ReadOnly/Bildschirmfoto 2026-09-08 um 10.14.02.png",
+    };
+    for (no) |path| {
+        testing.expect(!main.looksLikeScreenshot(path)) catch |err| {
+            std.debug.print("expected not a screenshot: {s}\n", .{path});
+            return err;
+        };
+    }
+}
+
+test "a writable source folder keeps writing beside the source" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load("/Users/someone/Pictures/photo.jpg", "204800");
+    try testing.expectEqual(main.Destination.beside_source, h.model().destination);
+
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+    try testing.expectEqualStrings("/Users/someone/Pictures/photo.avif", try h.encodeDest(.avif));
+    try h.encodeOk(.avif, "102400");
+
+    // No note about the location: the files are where the user is already
+    // looking, and saying so would be noise.
+    try testing.expectEqualStrings("Done.", h.model().statusLine());
+    try testing.expect(h.model().canReveal());
+}
+
+test "a screenshot in a read-only folder is rescued to the Desktop, and says so" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_screencaptureui_x/Screenshot 2026-09-08 at 10.14.02.png";
+    try h.drop(staged);
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/Screenshot 2026-09-08 at 10.14.02.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+    try h.destinationReadOnly();
+
+    try testing.expectEqual(main.Destination.desktop, h.model().destination);
+    try testing.expectEqualStrings("/Users/someone/Desktop", h.model().destDir());
+
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+    // The NAME is kept and the DIRECTORY replaced — the file keeps its
+    // identity, it just lands where its owner expects to find it.
+    try testing.expectEqualStrings(
+        "/Users/someone/Desktop/Screenshot 2026-09-08 at 10.14.02.avif",
+        try h.encodeDest(.avif),
+    );
+    try h.encodeOk(.avif, "102400");
+
+    // The write was not source-adjacent, so the line must say where it
+    // went. A silent Desktop write would be the app moving a user's file
+    // without telling them.
+    try testing.expectEqualStrings("Saved to Desktop.", h.model().statusLine());
+    // ...and Show in Finder still applies: this IS the automatic write
+    // nobody was asked about, which is exactly what that button unveils.
+    try testing.expect(h.model().canReveal());
+}
+
+test "an ordinary file in a read-only folder is not guessed at — it asks" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Volumes/ReadOnly/photo.jpg");
+    try h.stat("204800");
+    try h.probe(4000, 3000);
+    try h.thumbnail(140, 105);
+    try h.destinationReadOnly();
+
+    // NOT the Desktop. Nothing about this file says its owner would want
+    // it there, and dropping it on the Desktop anyway is the failure mode
+    // the whole split exists to avoid.
+    try testing.expectEqual(main.Destination.ask, h.model().destination);
+    try testing.expectEqualStrings("/Users/someone/Library/Caches/smoosh/outbox", h.model().destDir());
+
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+    try testing.expectEqualStrings(
+        "/Users/someone/Library/Caches/smoosh/outbox/photo.avif",
+        try h.encodeDest(.avif),
+    );
+    try h.encodeOk(.avif, "102400");
+
+    // The bytes exist and the size is real, so the result row is honest —
+    // but nothing the user can keep has been saved, and the line says so
+    // rather than claiming "Done."
+    try testing.expect(h.model().hasAvifResult());
+    try testing.expectEqualStrings("That folder is read-only — save a copy.", h.model().statusLine());
+    // Revealing the cache would imply the run had saved something, and
+    // point Finder at a directory the OS may purge.
+    try testing.expect(!h.model().canReveal());
+}
+
+test "Save As is still the way out of an ask run" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Volumes/ReadOnly/photo.jpg");
+    try h.stat("204800");
+    try h.probe(4000, 3000);
+    try h.thumbnail(140, 105);
+    try h.destinationReadOnly();
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "102400");
+
+    // The existing Save As round copies `outputPathOf`, which now names
+    // the cache file — so the machinery needs no special case at all.
+    try h.send(.save_avif_as);
+    try h.saveDialog("/Users/someone/Desktop/photo.avif");
+    const copy = h.pendingHostNamed("file.copy") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(
+        "/Users/someone/Library/Caches/smoosh/outbox/photo.avif\n/Users/someone/Desktop/photo.avif",
+        copy.payload,
+    );
+    try h.saveCopy(true);
+}
+
+test "a probe that could not run leaves the pre-probe behaviour untouched" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("204800");
+    try h.probe(4000, 3000);
+    try h.thumbnail(140, 105);
+    try h.destinationRaw(false, "no directory");
+
+    // Not a load failure: the file is fine, only the question about it
+    // went unanswered. The write is still attempted beside the source and
+    // still reports its own failure if it cannot land.
+    try testing.expectEqual(Status.ready, h.model().status);
+    try testing.expectEqual(main.Destination.beside_source, h.model().destination);
+    try testing.expectEqualStrings("", h.model().destDir());
+}
+
+test "a malformed probe answer is treated as unanswered, not as read-only" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("204800");
+    try h.probe(4000, 3000);
+    try h.thumbnail(140, 105);
+    // Well-formed enough to arrive, not well-formed enough to trust.
+    try h.destinationRaw(true, "yes\x00/Users/someone/Desktop\x00/cache");
+
+    try testing.expectEqual(Status.ready, h.model().status);
+    try testing.expectEqual(main.Destination.beside_source, h.model().destination);
+}
+
+test "the destination is re-decided per file, not carried over" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Volumes/ReadOnly/photo.jpg");
+    try h.stat("204800");
+    try h.probe(4000, 3000);
+    try h.thumbnail(140, 105);
+    try h.destinationReadOnly();
+    try testing.expectEqual(main.Destination.ask, h.model().destination);
+
+    // A second file from a writable folder must not inherit the first's
+    // rescue directory — that would silently write into the cache.
+    try h.load("/Users/someone/Pictures/photo.jpg", "204800");
+    try testing.expectEqual(main.Destination.beside_source, h.model().destination);
+    try testing.expectEqualStrings("", h.model().destDir());
+
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+    try testing.expectEqualStrings("/Users/someone/Pictures/photo.avif", try h.encodeDest(.avif));
+}
+
+test "a lost format still wins the status line over the destination note" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_screencaptureui_x/Screenshot 1.png";
+    try h.drop(staged);
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/Screenshot 1.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+    try h.destinationReadOnly();
+
+    try h.send(.{ .set_format = .both });
+    try h.send(.smoosh);
+    try h.encodeOk(.avif, "102400");
+    try h.encodeReply(.webp, false, "encode");
+
+    // Both facts are true — it saved to the Desktop AND lost WebP — and
+    // only one line is available. The loss is the one the user has to act
+    // on, so it keeps the line.
+    try testing.expectEqual(Status.done, h.model().status);
+    try testing.expect(h.model().warningMessage().len > 0);
+    try testing.expectEqualStrings(h.model().warningMessage(), h.model().statusLine());
 }
 
 test "a preview that will not decode fails instead of silently showing nothing" {
@@ -1089,6 +1576,7 @@ test "reset frees the effect keys so the next pick is not rejected" {
     try h.stat("200");
     try h.probe(4000, 3000);
     try h.thumbnail(140, 79);
+    try h.destinationOk();
 
     try testing.expectEqual(Status.ready, h.model().status);
     try testing.expectEqualStrings("/Users/someone/Pictures/second.jpg", h.model().path());
@@ -1459,6 +1947,142 @@ test "both formats failing to WRITE collapse to one folder-permission sentence" 
     // The old concatenation carried "permissions" twice — the mutation check.
     const first = std.mem.indexOf(u8, message, "permissions").?;
     try testing.expect(std.mem.indexOf(u8, message[first + 1 ..], "permissions") == null);
+}
+
+test "a Desktop write refused by TCC points at Privacy & Security, not permissions" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_screencaptureui_x/Screenshot 1.png";
+    try h.drop(staged);
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/Screenshot 1.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+    try h.destinationReadOnly();
+    try testing.expectEqual(main.Destination.desktop, h.model().destination);
+
+    try h.send(.{ .set_format = .both });
+    try h.send(.smoosh);
+    // Measured live: denying the macOS Desktop prompt fails both writes.
+    try h.encodeReply(.avif, false, "write");
+    try h.encodeReply(.webp, false, "write");
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    // The folder IS writable — the app was refused by TCC — so
+    // "check the folder's permissions" would send the user to Get Info on
+    // Desktop to find nothing wrong.
+    try testing.expectEqualStrings(
+        "Couldn't write to your Desktop — check Privacy & Security.",
+        h.model().errorMessage(),
+    );
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "permission") == null);
+}
+
+test "one format failing to write to the Desktop gives the same remedy" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_screencaptureui_x/Screenshot 1.png";
+    try h.drop(staged);
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/Screenshot 1.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+    try h.destinationReadOnly();
+
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+    try h.encodeReply(.avif, false, "write");
+
+    // The per-format sentence and the collapsed one must never send the
+    // user to different places for the same cause.
+    try testing.expectEqualStrings(
+        "Couldn't save the AVIF — check Privacy & Security.",
+        h.model().errorMessage(),
+    );
+}
+
+test "a cache write failure blames the disk, not a folder the user cannot fix" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Volumes/ReadOnly/photo.jpg");
+    try h.stat("204800");
+    try h.probe(4000, 3000);
+    try h.thumbnail(140, 105);
+    try h.destinationReadOnly();
+    try testing.expectEqual(main.Destination.ask, h.model().destination);
+
+    try h.send(.{ .set_format = .both });
+    try h.send(.smoosh);
+    try h.encodeReply(.avif, false, "write");
+    try h.encodeReply(.webp, false, "write");
+
+    // The destination is the app's OWN cache directory. Advising the user
+    // to check its permissions would be advice they cannot act on.
+    try testing.expectEqualStrings(
+        "Couldn't write the compressed files — the disk may be full.",
+        h.model().errorMessage(),
+    );
+    try testing.expect(std.mem.indexOf(u8, h.model().errorMessage(), "permission") == null);
+
+    // The single-format form carries the same remedy. Pinned separately
+    // because it comes from a different fn (`writeFailureAdvice`, not
+    // `writeFailureCollapsed`) and can drift from it independently.
+    var single = try Harness.create();
+    defer single.destroy();
+    try single.pick("/Volumes/ReadOnly/photo.jpg");
+    try single.stat("204800");
+    try single.probe(4000, 3000);
+    try single.thumbnail(140, 105);
+    try single.destinationReadOnly();
+    try single.send(.{ .set_format = .webp });
+    try single.send(.smoosh);
+    try single.encodeReply(.webp, false, "write");
+    try testing.expectEqualStrings(
+        "Couldn't save the WebP — the disk may be full.",
+        single.model().errorMessage(),
+    );
+}
+
+test "every write-failure sentence fits the status line" {
+    // The `<status-bar>` takes no `wrap` by design: it is one honest line
+    // that ELIDES. A remedy clause pushed off the end is the specific
+    // regression this pins — the reason the collapsed form exists at all.
+    const max_status_chars = 65;
+    for ([_]main.Destination{ .beside_source, .desktop, .ask }) |destination| {
+        var h = try Harness.create();
+        defer h.destroy();
+
+        try h.load("/Users/someone/Pictures/photo.jpg", "204800");
+        h.model().destination = destination;
+        try h.send(.{ .set_format = .both });
+        try h.send(.smoosh);
+        try h.encodeReply(.avif, false, "write");
+        try h.encodeReply(.webp, false, "write");
+
+        const collapsed = h.model().errorMessage();
+        testing.expect(collapsed.len <= max_status_chars) catch |err| {
+            std.debug.print("{s} collapsed is {d} chars: {s}\n", .{ @tagName(destination), collapsed.len, collapsed });
+            return err;
+        };
+        // ...and the per-format form, which is the longer of the two for
+        // the destination whose advice clause is longest.
+        var h2 = try Harness.create();
+        defer h2.destroy();
+        try h2.load("/Users/someone/Pictures/photo.jpg", "204800");
+        h2.model().destination = destination;
+        try h2.send(.{ .set_format = .avif });
+        try h2.send(.smoosh);
+        try h2.encodeReply(.avif, false, "write");
+
+        const single = h2.model().errorMessage();
+        testing.expect(single.len <= max_status_chars) catch |err| {
+            std.debug.print("{s} single is {d} chars: {s}\n", .{ @tagName(destination), single.len, single });
+            return err;
+        };
+    }
 }
 
 test "onKey: Enter smooshes, 1/2/3 pick the format, everything else is ignored" {
@@ -2046,6 +2670,7 @@ test "picking a new file clears the previous file's results" {
     try h.stat("204800");
     try h.probe(4000, 3000);
     try h.thumbnail(140, 105);
+    try h.destinationOk();
     try testing.expectEqual(Status.ready, h.model().status);
 }
 
@@ -3023,6 +3648,7 @@ test "a real drop lands the real path, its size, and a preview" {
     try h.stat("1024");
     try h.probe(800, 600);
     try h.thumbnail(140, 105);
+    try h.destinationOk();
 
     try testing.expectEqual(Status.ready, h.model().status);
     try testing.expect(h.model().hasPreview());
