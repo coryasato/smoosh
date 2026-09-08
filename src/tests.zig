@@ -656,6 +656,16 @@ const Harness = struct {
         try self.drain();
     }
 
+    /// Answers the `file.stash` hop an EPHEMERAL source starts (see
+    /// `main.isEphemeralSource`). `cache_path` is where the bridge copied
+    /// the bytes; from here the chain is the ordinary one, reading that
+    /// copy instead of the original.
+    fn stash(self: *Harness, cache_path: []const u8) !void {
+        const request = self.pendingHostNamed("file.stash") orelse return error.NoHostRequest;
+        try self.fx().feedHostResult(request.key, true, cache_path);
+        try self.drain();
+    }
+
     fn stat(self: *Harness, size: []const u8) !void {
         const request = self.fx().pendingHostAt(0) orelse return error.NoHostRequest;
         try testing.expectEqualStrings("file.stat", request.name);
@@ -956,6 +966,208 @@ test "a new pick drops the previous file's preview before it can load" {
     const tree = try buildTree(arena, h.model());
     _ = try expectByText(tree.root, .text, "not-an-image.jpg");
     try testing.expect(findByKind(tree.root, .image) == null);
+}
+
+// --------------------------------------------- ephemeral sources (stash)
+//
+// A screenshot dragged straight off its floating thumbnail is served from
+// a `screencapture` staging directory that macOS empties seconds later.
+// The load chain reads the file three times — probe, thumbnail, and the
+// encode worker's full-resolution decode — and the third read is the one
+// the user waits for, so the source has to be captured up front. These
+// pin the split that makes that safe: the READ moves to the copy, the
+// WRITE stays beside the original.
+
+test "isEphemeralSource classifies the OS-owned staging roots, and nothing else" {
+    // Every one of these is somewhere the OS may empty out from under a
+    // load. `/private` spellings appear because `/tmp` and `/var` are
+    // symlinks into `/private` on macOS and a drop may carry either.
+    const ephemeral = [_][]const u8{
+        // The real shape: `screencapture`'s staging directory.
+        "/var/folders/qh/8b1x_3ld0kz9/T/TemporaryItems/NSIRD_screencaptureui_9aT2vX/Screenshot 2026-09-08 at 10.14.02.png",
+        "/private/var/folders/qh/8b1x_3ld0kz9/T/screenshot.png",
+        "/tmp/shot.png",
+        "/private/tmp/shot.png",
+        "/var/tmp/shot.png",
+        "/private/var/tmp/shot.png",
+        // A drag promise staged at an external volume's root, which sits
+        // under none of the prefixes above.
+        "/Volumes/Photos/.TemporaryItems/folders.501/photo.jpg",
+        "/Volumes/Photos/TemporaryItems/photo.jpg",
+    };
+    for (ephemeral) |path| {
+        testing.expect(main.isEphemeralSource(path)) catch |err| {
+            std.debug.print("expected ephemeral: {s}\n", .{path});
+            return err;
+        };
+    }
+
+    // Ordinary sources, including the near-misses: a directory merely
+    // NAMED like a staging root, and one that only contains the word.
+    const durable = [_][]const u8{
+        "/Users/someone/Pictures/photo.jpg",
+        "/Users/someone/Desktop/Screenshot 2026-09-08 at 10.14.02.png",
+        "/Volumes/Backup/archive/photo.jpg",
+        "/Users/someone/tmp/photo.jpg",
+        "/Users/someone/var/folders/photo.jpg",
+        "/Users/someone/Pictures/TemporaryItems.jpg",
+    };
+    for (durable) |path| {
+        testing.expect(!main.isEphemeralSource(path)) catch |err| {
+            std.debug.print("expected durable: {s}\n", .{path});
+            return err;
+        };
+    }
+}
+
+test "an ordinary source is never copied — the chain starts at the stat" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    // Not "no stash pending" by slot luck: the FIRST request is the stat,
+    // so nothing was inserted ahead of it.
+    const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stat", request.name);
+    try testing.expect(h.pendingHostNamed("file.stash") == null);
+    // With no stash, `readPath` IS `path` — the same slice, not a copy of
+    // it, so nothing downstream has to know which case it is in.
+    try testing.expectEqualStrings(h.model().path(), h.model().readPath());
+}
+
+test "a screenshot dropped from its thumbnail is copied before anything reads it" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_screencaptureui_9aT2vX/Screenshot 2026-09-08 at 10.14.02.png";
+    try h.drop(staged);
+
+    // The stash goes FIRST, ahead of the stat: by the time a stat could
+    // answer, the file may already have been moved to ~/Desktop.
+    const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stash", request.name);
+    // It names the ORIGINAL — the bridge is what is being asked to copy it.
+    try testing.expectEqualStrings(staged, request.payload);
+    try testing.expect(h.pendingHostNamed("file.stat") == null);
+    try testing.expectEqual(Status.loading, h.model().status);
+}
+
+test "once stashed, every read goes to the copy while the file stays the original" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/Screenshot 2026-09-08 at 10.14.02.png";
+    const cached = "/Users/someone/Library/Caches/smoosh/staged/Screenshot 2026-09-08 at 10.14.02.png";
+    try h.drop(staged);
+    try h.stash(cached);
+
+    // The stat reads the COPY too. Statting the original would fail the
+    // load for the wrong reason once macOS has moved it.
+    const stat_request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stat", stat_request.name);
+    try testing.expectEqualStrings(cached, stat_request.payload);
+    try h.stat("184320");
+
+    const probe_request = h.pendingHostNamed("image.probe") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(cached, probe_request.payload);
+    try h.probe(2880, 1800);
+
+    const thumb_request = h.pendingHostNamed("image.thumbnail") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(cached, thumb_request.payload);
+    try h.thumbnail(140, 87);
+
+    try testing.expectEqual(Status.ready, h.model().status);
+    // The MODEL's file is still the one the user dropped. The card names
+    // it, and the destination is derived from it — a card reading
+    // "staged/..." would be a lie about what was opened.
+    try testing.expectEqualStrings(staged, h.model().path());
+    try testing.expectEqualStrings(cached, h.model().readPath());
+
+    const tree = try buildTree(arena, h.model());
+    _ = try expectByText(tree.root, .text, "Screenshot 2026-09-08 at 10.14.02.png");
+}
+
+test "the encode reads the stash and writes beside the original" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.png";
+    const cached = "/Users/someone/Library/Caches/smoosh/staged/shot.png";
+    try h.drop(staged);
+    try h.stash(cached);
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+
+    const request = h.encodeRequest(.avif) orelse return error.NoHostRequest;
+    var it = std.mem.splitScalar(u8, request.payload, 0);
+    _ = it.next(); // format
+    const source = it.next() orelse return error.MalformedPayload;
+    // The whole point of the stash: the worker's full-resolution decode is
+    // the read most likely to find the original already gone.
+    try testing.expectEqualStrings(cached, source);
+    // ...and the destination is unmoved. Writing into the cache directory
+    // would put the user's output somewhere the OS may purge.
+    try testing.expectEqualStrings("/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.avif", try h.encodeDest(.avif));
+}
+
+test "a stash that fails is an unreadable file, and stops the chain there" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.drop("/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.png");
+    const request = h.pendingHostNamed("file.stash") orelse return error.NoHostRequest;
+    try h.fx().feedHostResult(request.key, false, "FileNotFound");
+    try h.drain();
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expectEqualStrings("Can't read that file.", h.model().errorMessage());
+    // Deliberately no fall-through to the original: if the copy could not
+    // be taken, the original is the thing disappearing, and proceeding
+    // would only move the same failure to the encode.
+    try testing.expect(h.pendingHostNamed("file.stat") == null);
+}
+
+test "a durable file loaded after a stashed one reads itself, not the leftover copy" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.drop("/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.png");
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/shot.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+
+    const durable = "/Users/someone/Pictures/photo.jpg";
+    try h.pick(durable);
+    // Without the reset in `setPath`, this load's probe would have read
+    // the PREVIOUS image out of the cache and previewed the wrong file.
+    try testing.expectEqualStrings(durable, h.model().readPath());
+    const request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stat", request.name);
+    try testing.expectEqualStrings(durable, request.payload);
+}
+
+test "reset forgets the stash along with the file" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.drop("/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.png");
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/shot.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+
+    try h.send(.reset);
+    try testing.expect(!h.model().hasFile());
+    try testing.expectEqualStrings("", h.model().readPath());
 }
 
 test "a preview that will not decode fails instead of silently showing nothing" {

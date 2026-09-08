@@ -417,14 +417,15 @@ Real wants and one latent bug, none small enough to ride another change.
   invisible from a Terminal `native dev` run (the responsible process is the terminal, which
   already holds the TCC grants) and both real once packaged.
 
-  *The read bug (priority).* The `image.encode` worker re-reads the source path fresh —
-  `imageio.decode(path)`, with no full-res buffer retained between the preview and the Smoosh
-  press. A macOS screenshot dropped from its floating thumbnail is served from a `screencapture`
-  staging dir; a few seconds later macOS moves it to `~/Desktop` or, if the thumbnail was
-  dismissed, deletes it. So the encode fails to decode a file that previewed fine. Fix: at
-  `.ready`, classify the source, and for a staging/temp source copy the bytes into the app cache
-  dir (`app_dirs.cache`) once and point probe / thumbnail / encode at the copy. Normal sources are
-  untouched.
+  *The read bug — **SHIPPED** (step 1 of the build order below).* An ephemeral source is now copied
+  into the app cache dir before anything reads it. `isEphemeralSource` (pure, in `main.zig`)
+  classifies the path; an ephemeral one gets one extra hop ahead of the stat — the `file.stash`
+  host command, which deletes and remakes `Library/Caches/smoosh/staged`, copies the bytes in, and
+  answers with the copy's path. `Model.readPath()` is what `image.probe`, `image.thumbnail` and
+  `image.encode`'s SOURCE field read; `Model.path()` stays the original, and remains what the file
+  card names, what `outputPath` derives the destination from, and what `beginEncode`'s `same_path`
+  guard compares against. Only the read moves. Ordinary sources are untouched and issue no stash at
+  all.
 
   *The write destination.* Output is written beside the source. Beside a screenshot's staging path
   that fails (`.write_failed`), and beside a read-only USB / `/Applications` / a full disk it also
@@ -441,8 +442,14 @@ Real wants and one latent bug, none small enough to ride another change.
   prompt. Verify against `native package`, not just `native dev`.
 
   Build order: (1) the read fix standalone — it removes the "file vanished" failure whatever the
-  destination logic is; (2) the writability-probe destination split; (3) the plist string; (4) the
-  status-line copy, which is the next item and only becomes writable once (2) exists.
+  destination logic is — **done**; (2) the writability-probe destination split; (3) the plist
+  string; (4) the status-line copy, which is the next item and only becomes writable once (2)
+  exists.
+
+  What (2) still owes, given (1): the stash moved the READ, not the write, so a screenshot dropped
+  from its thumbnail now decodes and encodes cleanly and then fails at the write — `.write_failed`,
+  beside a staging path nothing is allowed to write to. That is the honest failure rather than the
+  old "couldn't decode it" one, and it is exactly the case the writability probe resolves.
 
 - **"Saved to Desktop." for the special-cased writes.** *Blocked by the item above — it is step 4 of
   that session, not a session of its own.* The "Show in Finder" control has SHIPPED —

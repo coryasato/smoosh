@@ -438,6 +438,18 @@ pub const Model = struct {
     // file
     path_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
     path_len: usize = 0,
+    /// Where the IMAGE COMMANDS read from, when that is not `path_buffer`.
+    /// Empty for an ordinary source, and then `readPath` falls through to
+    /// `path()` — the two are the same file and nothing is copied.
+    ///
+    /// Non-empty only for an EPHEMERAL source (`isEphemeralSource`), where
+    /// it names a copy of the bytes in the app cache dir that `file.stash`
+    /// made at load. `path_buffer` still holds the ORIGINAL path, and must:
+    /// it is what the file card names, what `outputPath` derives the
+    /// destination from, and what `beginEncode`'s `same_path` guard
+    /// compares against. Only the READ moves.
+    stash_path_buffer: [platform.max_dialog_path_bytes]u8 = undefined,
+    stash_path_len: usize = 0,
     original_size: u64 = 0,
     // preview
     image_id: u64 = 0,
@@ -564,6 +576,9 @@ pub const Model = struct {
     pub const view_unbound = .{
         "path_buffer",
         "path_len",
+        "stash_path_buffer",
+        "stash_path_len",
+        "readPath",
         "original_size",
         "source_width",
         "source_height",
@@ -600,6 +615,15 @@ pub const Model = struct {
 
     pub fn path(model: *const Model) []const u8 {
         return model.path_buffer[0..model.path_len];
+    }
+    /// The path every ImageIO read goes through — `image.probe`,
+    /// `image.thumbnail`, and the source field of `image.encode`. The
+    /// cache stash when there is one, the picked path otherwise. See
+    /// `stash_path_buffer` for why the write side deliberately does NOT
+    /// use this.
+    pub fn readPath(model: *const Model) []const u8 {
+        if (model.stash_path_len == 0) return model.path();
+        return model.stash_path_buffer[0..model.stash_path_len];
     }
     pub fn errorMessage(model: *const Model) []const u8 {
         return model.error_message_buffer[0..model.error_message_len];
@@ -901,6 +925,17 @@ pub const Model = struct {
         const len = @min(text.len, model.path_buffer.len);
         @memcpy(model.path_buffer[0..len], text[0..len]);
         model.path_len = len;
+        // A new file's reads start at the new file. The previous stash (if
+        // there was one) is about to be deleted by the next `file.stash`
+        // anyway; leaving its path here would point this load's probe at
+        // the PREVIOUS image.
+        model.stash_path_len = 0;
+    }
+
+    fn setStashPath(model: *Model, text: []const u8) void {
+        const len = @min(text.len, model.stash_path_buffer.len);
+        @memcpy(model.stash_path_buffer[0..len], text[0..len]);
+        model.stash_path_len = len;
     }
 
     /// Every `.failed` transition goes through here, so "`.failed` is
@@ -1005,6 +1040,7 @@ pub const Msg = union(enum) {
     pick_file, // dropzone clicked
     dialog_result: native_sdk.EffectHostResult, // host open-dialog callback
     dropped_file: []const u8, // on_drop callback — a file dragged onto the window
+    stash_result: native_sdk.EffectHostResult, // `file.stash` callback -> the cache copy's path, then on to the stat
     stat_result: native_sdk.EffectHostResult, // host file-size callback -> original_size
     probe_result: native_sdk.EffectHostResult, // host ImageIO properties callback -> dimensions, UTI, megapixel check
     thumbnail_result: native_sdk.EffectHostResult, // host ImageIO thumbnail callback -> the preview pixels
@@ -1039,6 +1075,7 @@ pub const Msg = union(enum) {
     pub const view_unbound = .{
         "dialog_result",
         "dropped_file",
+        "stash_result",
         "stat_result",
         "probe_result",
         "thumbnail_result",
@@ -1126,6 +1163,7 @@ const webp_encode_key: u64 = 9;
 const save_dialog_key: u64 = 12;
 const save_copy_key: u64 = 13;
 const reveal_key: u64 = 14;
+const stash_key: u64 = 15;
 
 /// Host-call names our own `HostBridge` answers (see `main`). Not SDK
 /// vocabulary — we bind the seam, so we name it.
@@ -1133,6 +1171,9 @@ const host_open_file = "dialog.openFile";
 const host_file_size = "file.stat";
 const host_save_file = "dialog.saveFile";
 const host_file_copy = "file.copy";
+/// Captures an ephemeral source's bytes into the app cache dir before
+/// anything reads them — see `isEphemeralSource` and `HostBridge.stashFile`.
+const host_file_stash = "file.stash";
 /// "Show in Finder" — see `src/workspace.zig` for why revealing a file
 /// needs a seam of our own at all.
 const host_reveal = "shell.reveal";
@@ -1372,7 +1413,10 @@ fn beginEncode(model: *Model, fx: *Effects, output: Output) void {
     }
 
     var payload_buffer: [platform.max_dialog_path_bytes * 2 + 128]u8 = undefined;
-    const payload = encodePayload(&payload_buffer, output, model.path(), model.sourceUti(), destination) orelse
+    // The SOURCE is `readPath` (the stash, when there is one) and the
+    // DESTINATION is derived from `path()`. That asymmetry is the whole
+    // point of the stash — see `Model.stash_path_buffer`.
+    const payload = encodePayload(&payload_buffer, output, model.readPath(), model.sourceUti(), destination) orelse
         return setOutcome(model, output, .encode_failed);
 
     setOutcome(model, output, .pending);
@@ -1559,11 +1603,60 @@ pub fn onKey(keyboard: canvas.WidgetKeyboardEvent) ?Msg {
     return null;
 }
 
+/// True for a source sitting somewhere macOS may empty out from under us
+/// between the preview and the Smoosh press. Pure over the path text, so
+/// `update` can call it: no stat, no existence check, no `Io`.
+///
+/// The case this exists for is a screenshot dragged straight off its
+/// floating thumbnail. `screencapture` serves that drag from a staging
+/// directory under the per-user Darwin temp container, and a few seconds
+/// later the OS MOVES the file to ~/Desktop — or deletes it outright, if
+/// the thumbnail was dismissed. The load chain reads the file three times
+/// (probe, thumbnail, then the encode worker's full-resolution decode) and
+/// the third read is the one the user waits for, so an image that
+/// previewed perfectly would fail to encode. The window is seconds wide
+/// and entirely outside our control; the only fix is to own the bytes.
+///
+/// Deliberately COARSE — every listed root is a place the OS owns, and a
+/// stash of a file that would in fact have survived costs one copy of an
+/// image already capped at 100 MB. Being wrong the other way costs the
+/// user their smoosh.
+///
+/// `/private` prefixes appear because `/tmp` and `/var` are symlinks into
+/// `/private` on macOS and different producers hand out different spellings
+/// of the same directory — a drop may carry either. `TemporaryItems`
+/// (`.TemporaryItems` on a non-boot volume) is matched anywhere in the
+/// path: it is the staging directory Finder and AppKit use for a drag
+/// promise, and on an external volume it lives at the volume root rather
+/// than under any of these prefixes.
+pub fn isEphemeralSource(path: []const u8) bool {
+    const roots = [_][]const u8{
+        "/tmp/",
+        "/private/tmp/",
+        "/var/tmp/",
+        "/private/var/tmp/",
+        "/var/folders/",
+        "/private/var/folders/",
+    };
+    for (roots) |root| {
+        if (std.mem.startsWith(u8, path, root)) return true;
+    }
+    return std.mem.indexOf(u8, path, "/TemporaryItems/") != null or
+        std.mem.indexOf(u8, path, "/.TemporaryItems/") != null;
+}
+
 /// Starts the load chain for a path that just arrived — from the open
 /// panel (`.dialog_result`'s ok branch) or a real window drop
 /// (`.dropped_file`). Both land here because the chain itself doesn't
 /// care where the path came from: `stat_result` -> `probe_result` ->
 /// `thumbnail_result` -> `.ready` is the same either way.
+///
+/// An EPHEMERAL source gets one extra hop in front: `file.stash` copies
+/// the bytes into the app cache dir and answers with the copy's path,
+/// which `.stash_result` records before starting that same chain. The
+/// stat runs against the stash for the same reason everything else does —
+/// by then the original may already be gone, and a size read off a file
+/// that no longer exists would fail the load for the wrong reason.
 fn beginLoad(model: *Model, fx: *Effects, path: []const u8) void {
     model.status = .loading;
     model.setPath(path);
@@ -1572,10 +1665,25 @@ fn beginLoad(model: *Model, fx: *Effects, path: []const u8) void {
     // exists.
     model.clearResults();
     model.clearPreview();
+    if (isEphemeralSource(path)) {
+        fx.hostRequest(.{
+            .key = stash_key,
+            .name = host_file_stash,
+            .payload = model.path(),
+            .on_result = Effects.hostMsg(.stash_result),
+        });
+        return;
+    }
+    beginStat(model, fx);
+}
+
+/// The load chain proper, from the stat on. Split out of `beginLoad` so
+/// the stash hop can rejoin it without duplicating the request.
+fn beginStat(model: *Model, fx: *Effects) void {
     fx.hostRequest(.{
         .key = stat_key,
         .name = host_file_size,
-        .payload = model.path(),
+        .payload = model.readPath(),
         .on_result = Effects.hostMsg(.stat_result),
     });
 }
@@ -1620,6 +1728,20 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // dropped-file are indistinguishable to `update` past this point.
         .dropped_file => |dropped_path| beginLoad(model, fx, dropped_path),
 
+        // The ephemeral-source hop (see `beginLoad`). A failure here is
+        // reported as an unreadable file, which is exactly what it is: the
+        // copy failed because the source was already gone, or because the
+        // cache dir could not be resolved or written. Deliberately NOT a
+        // fall-through to reading the original — if the stash could not be
+        // taken, the original is the thing that is disappearing, and going
+        // on would just move the same failure to the encode, minutes of
+        // user attention later.
+        .stash_result => |result| {
+            if (!result.ok) return model.fail("Can't read that file.", .{});
+            model.setStashPath(result.bytes);
+            beginStat(model, fx);
+        },
+
         .stat_result => |result| {
             const size = if (result.ok)
                 std.fmt.parseInt(u64, result.bytes, 10) catch null
@@ -1643,7 +1765,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.hostRequest(.{
                 .key = probe_key,
                 .name = host_image_probe,
-                .payload = model.path(),
+                .payload = model.readPath(),
                 .on_result = Effects.hostMsg(.probe_result),
             });
         },
@@ -1688,7 +1810,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.hostRequest(.{
                 .key = thumbnail_key,
                 .name = host_image_thumbnail,
-                .payload = model.path(),
+                .payload = model.readPath(),
                 .on_result = Effects.hostMsg(.thumbnail_result),
             });
         },
@@ -1736,6 +1858,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // families — staged images, channels, ptys — reject a busy key,
             // and Smoosh issues none of them.
             fx.cancel(dialog_key);
+            fx.cancel(stash_key);
             fx.cancel(stat_key);
             fx.cancel(probe_key);
             fx.cancel(thumbnail_key);
@@ -1958,6 +2081,9 @@ const HostBridge = struct {
     var dialog_path_buf: [platform.max_dialog_paths_bytes]u8 = undefined;
     var save_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
     var reply_buf: [128]u8 = undefined;
+    /// `stashFile`'s answer is a PATH, which `reply_buf` (sized for a
+    /// decimal byte count) cannot hold.
+    var stash_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
 
     // ------------------------------------------------------ worker carrier
 
@@ -2286,6 +2412,7 @@ const HostBridge = struct {
         if (std.mem.eql(u8, name, host_file_size)) return self.fileSize(key, payload);
         if (std.mem.eql(u8, name, host_save_file)) return self.saveFile(key, payload);
         if (std.mem.eql(u8, name, host_file_copy)) return self.copyFile(key, payload);
+        if (std.mem.eql(u8, name, host_file_stash)) return self.stashFile(key, payload);
         if (std.mem.eql(u8, name, host_reveal)) return self.revealPaths(key, payload);
         // The ImageIO reads and the encode return without answering — see
         // the worker carrier above.
@@ -2352,6 +2479,57 @@ const HostBridge = struct {
             return self.reply(key, false, @errorName(err));
         };
         self.reply(key, true, "");
+    }
+
+    /// Copies an ephemeral source into the app cache dir and answers with
+    /// the copy's absolute path. `payload` is the source path. Synchronous
+    /// on the loop thread like the other file commands: the input is capped
+    /// at 100 MB, and the whole reason this exists is that the source is
+    /// disappearing — handing the copy to a worker would add exactly the
+    /// delay being raced.
+    ///
+    /// Only ONE stash is kept. The directory is deleted whole and remade on
+    /// every call, so the cache holds at most one image and a load that
+    /// never gets smooshed leaves nothing behind past the next load. It is
+    /// `Library/Caches`, which the OS may purge at any time — safe here,
+    /// because the stash is only read during the seconds a load is live.
+    ///
+    /// The source's own basename is kept: it costs nothing, and it is what
+    /// a user staring at the cache directory would expect to find. The
+    /// extension is NOT what any read keys on — `image.probe` sniffs the
+    /// container out of the bytes.
+    fn stashFile(self: *HostBridge, key: u64, source: []const u8) void {
+        // `std.c.getenv` rather than an `Environ`: a hand-authored root
+        // never receives the runner's env map (see CLAUDE.md's "File
+        // acquisition, honestly"), and this links libc regardless.
+        const home_z = std.c.getenv("HOME") orelse return self.reply(key, false, "no home");
+        const home = std.mem.span(home_z);
+        var dir_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        const cache_dir = native_sdk.app_dirs.resolveOne(
+            .{ .name = "smoosh" },
+            .macos,
+            .{ .home = home },
+            .cache,
+            &dir_buf,
+        ) catch |err| return self.reply(key, false, @errorName(err));
+
+        var staged_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        const staged_dir = std.fmt.bufPrint(&staged_buf, "{s}/staged", .{cache_dir}) catch
+            return self.reply(key, false, "cache path too long");
+        // Best-effort: a first run has nothing to delete, and a stash left
+        // by a crashed run is exactly what this is clearing.
+        std.Io.Dir.cwd().deleteTree(self.io, staged_dir) catch {};
+        std.Io.Dir.cwd().createDirPath(self.io, staged_dir) catch |err| {
+            return self.reply(key, false, @errorName(err));
+        };
+
+        const name_start = if (std.mem.lastIndexOfScalar(u8, source, '/')) |slash| slash + 1 else 0;
+        const destination = std.fmt.bufPrint(&stash_path_buf, "{s}/{s}", .{ staged_dir, source[name_start..] }) catch
+            return self.reply(key, false, "stash path too long");
+        std.Io.Dir.copyFileAbsolute(source, destination, self.io, .{}) catch |err| {
+            return self.reply(key, false, @errorName(err));
+        };
+        self.reply(key, true, destination);
     }
 
     /// "Show in Finder". `payload` is one or more newline-joined absolute

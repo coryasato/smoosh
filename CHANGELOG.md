@@ -3,6 +3,12 @@
 For the engineering record — the decisions still in force, and the measurements the encoder work was
 held to — see [PLAN.md](PLAN.md) and [docs/phase-b-baseline.md](docs/phase-b-baseline.md).
 
+## Unreleased
+
+- **A screenshot dragged straight off its floating thumbnail now smooshes.** macOS serves that drag
+  from a staging folder it empties seconds later, so the image previewed fine and then failed to
+  compress. Smoosh takes its own copy of the file the moment it arrives, and works from that.
+
 ## v0.4 — 2026-09-07
 
 Smoosh saves your compressed images beside the original automatically, and until now nothing in the
