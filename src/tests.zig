@@ -216,7 +216,7 @@ test "the empty state offers a drop zone that picks a file" {
     // unbound panel would swallow the click into dead space.
     var model: Model = .{};
     const empty = try buildTree(arena, &model);
-    _ = try expectByText(empty.root, .text, "Drop an image here — or click to choose");
+    _ = try expectByText(empty.root, .text, "Drop an image here — or paste, or click to choose");
     // The copy itself is not pressable: the press falls through to the
     // nearest pressable ancestor, which is the panel.
     const zone = findPanelDispatching(empty, empty.root, .pick_file) orelse {
@@ -228,7 +228,7 @@ test "the empty state offers a drop zone that picks a file" {
     // ...and it is gone the moment a file lands, replaced by the file card.
     var ready = readyModel();
     const card = try buildTree(arena, &ready);
-    try testing.expect(findByText(card.root, .text, "Drop an image here — or click to choose") == null);
+    try testing.expect(findByText(card.root, .text, "Drop an image here — or paste, or click to choose") == null);
     _ = try expectByText(card.root, .text, "photo.jpg");
 }
 
@@ -653,6 +653,31 @@ const Harness = struct {
     /// no dialog round trip to answer), and starts the same load chain.
     fn drop(self: *Harness, path: []const u8) !void {
         try self.send(.{ .dropped_file = path });
+        try self.drain();
+    }
+
+    /// `pick`/`drop`'s counterpart for Cmd+V. Dispatches the `.paste`
+    /// Msg `onCommand` would have produced, then answers the
+    /// `clipboard.paste` host command with the bridge's NUL-joined
+    /// reply. `read` empty is the Finder-copy shape (an ordinary path,
+    /// which then takes the ordinary load chain); non-empty is the
+    /// raw-bytes shape, where the bridge has already written the pixels
+    /// into the cache.
+    fn paste(self: *Harness, nominal: []const u8, read: []const u8) !void {
+        try self.send(.paste);
+        var buf: [1024]u8 = undefined;
+        const reply = std.fmt.bufPrint(&buf, "{s}\x00{s}", .{ nominal, read }) catch unreachable;
+        const request = self.pendingHostNamed("clipboard.paste") orelse return error.NoHostRequest;
+        try self.fx().feedHostResult(request.key, true, reply);
+        try self.drain();
+    }
+
+    /// Answers the `clipboard.paste` hop as a failure — the empty or
+    /// text-only pasteboard.
+    fn pasteEmpty(self: *Harness) !void {
+        try self.send(.paste);
+        const request = self.pendingHostNamed("clipboard.paste") orelse return error.NoHostRequest;
+        try self.fx().feedHostResult(request.key, false, "no image on the pasteboard");
         try self.drain();
     }
 
@@ -2084,6 +2109,215 @@ test "every write-failure sentence fits the status line" {
         };
     }
 }
+
+// ============================================================ clipboard paste
+//
+// Cmd+V arrives through a different channel from every other key in this
+// app — a registered chrome `Shortcut` and `on_command`, not `on_key`;
+// `main.zig`'s `app_shortcuts` says why the canvas can never see the
+// chord. Both payload shapes the pasteboard can carry are pinned here
+// against a fake host result, which is the whole seam `update` sees.
+
+test "the paste shortcut is a registered Cmd+V that maps to one Msg" {
+    // A binding the platform would reject installs nothing and the key
+    // silently does nothing at runtime — validate it here rather than
+    // discovering it by pressing Cmd+V in a build.
+    try testing.expectEqual(@as(usize, 1), main.app_shortcuts.len);
+    const shortcut = main.app_shortcuts[0];
+    try native_sdk.platform.validateShortcut(shortcut);
+    try testing.expectEqualStrings("v", shortcut.key);
+    // `primary`, not `command`: the platform's own name for "the
+    // shortcut modifier", which is Command here and Control elsewhere.
+    try testing.expect(shortcut.modifiers.primary);
+
+    try testing.expect(main.onCommand(shortcut.id).? == .paste);
+    try testing.expect(main.onCommand("app.something-else") == null);
+    try testing.expect(main.onCommand("") == null);
+}
+
+test "onKey leaves Cmd+V alone, so the two key channels cannot both fire" {
+    // `onKey` already refuses every modified key; this pins the one that
+    // now matters. A `.paste` from here as well would run the paste
+    // twice on hosts that deliver both.
+    try testing.expect(main.onKey(.{ .phase = .key_down, .key = "v", .modifiers = .{ .super = true } }) == null);
+    try testing.expect(main.onKey(.{ .phase = .key_down, .key = "v" }) == null);
+}
+
+test "parsePasteReply splits the two paths, and rejects a reply that is not ours" {
+    const both = main.parsePasteReply("/Users/someone/Desktop/Pasted Image.png\x00/cache/staged/Pasted Image.png").?;
+    try testing.expectEqualStrings("/Users/someone/Desktop/Pasted Image.png", both.nominal);
+    try testing.expectEqualStrings("/cache/staged/Pasted Image.png", both.read);
+
+    // The Finder-copy shape: the separator is still written, the second
+    // field is just empty.
+    const one = main.parsePasteReply("/Users/someone/Pictures/cat.jpg\x00").?;
+    try testing.expectEqualStrings("/Users/someone/Pictures/cat.jpg", one.nominal);
+    try testing.expectEqualStrings("", one.read);
+
+    // No separator at all is not "an empty read" — it is a reply the
+    // bridge did not write, and treating it as a path would start a load
+    // on garbage.
+    try testing.expect(main.parsePasteReply("/Users/someone/Pictures/cat.jpg") == null);
+    try testing.expect(main.parsePasteReply("") == null);
+    try testing.expect(main.parsePasteReply("\x00/cache/staged/x.png") == null);
+}
+
+test "pasting a file copied in Finder is indistinguishable from picking it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const path = "/Users/someone/Pictures/cat.jpg";
+    try h.paste(path, "");
+
+    // No stash hop, and every read goes straight at the file: an ordinary
+    // durable path, so there is nothing to copy.
+    try testing.expect(h.pendingHostNamed("file.stash") == null);
+    const stat_request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stat", stat_request.name);
+    try testing.expectEqualStrings(path, stat_request.payload);
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+    try h.destinationOk();
+
+    try testing.expectEqual(Status.ready, h.model().status);
+    try testing.expectEqualStrings(path, h.model().path());
+    try testing.expectEqualStrings(path, h.model().readPath());
+
+    const tree = try buildTree(arena, h.model());
+    _ = try expectByText(tree.root, .text, "cat.jpg");
+}
+
+test "a pasted file that is itself ephemeral still gets stashed first" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // A screenshot copied in Finder out of the staging directory is as
+    // perishable as one dragged from it. The paste hands the path to the
+    // same `beginLoad` a drop does, so the ephemeral check still runs.
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_x/shot.png";
+    try h.paste(staged, "");
+
+    const request = h.pendingHostNamed("file.stash") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(staged, request.payload);
+}
+
+test "pasting raw pixels reads the cache copy and files the outputs on the Desktop" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // What the bridge answers for a Cmd-Ctrl-Shift-4 screenshot: the
+    // pixels written into the cache, and an invented Desktop name that
+    // is never itself written — only its directory is real.
+    const nominal = "/Users/someone/Desktop/Pasted Image.png";
+    const cached = "/Users/someone/Library/Caches/smoosh/staged/Pasted Image.png";
+    try h.paste(nominal, cached);
+
+    // No second copy: the bridge already wrote the bytes, so the
+    // `file.stash` hop is skipped even though the model carries a stash.
+    try testing.expect(h.pendingHostNamed("file.stash") == null);
+
+    const stat_request = h.fx().pendingHostAt(0) orelse return error.NoHostRequest;
+    try testing.expectEqualStrings("file.stat", stat_request.name);
+    try testing.expectEqualStrings(cached, stat_request.payload);
+    try h.stat("184320");
+
+    const probe_request = h.pendingHostNamed("image.probe") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(cached, probe_request.payload);
+    try h.probe(2880, 1800);
+
+    const thumb_request = h.pendingHostNamed("image.thumbnail") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(cached, thumb_request.payload);
+    try h.thumbnail(140, 87);
+
+    // The writability probe asks about the DESKTOP, not the cache — the
+    // same reason the ephemeral stash probes the original's folder.
+    const dest_request = h.pendingHostNamed("file.destination") orelse return error.NoHostRequest;
+    try testing.expectEqualStrings(nominal, dest_request.payload);
+    try h.destinationOk();
+
+    try testing.expectEqual(Status.ready, h.model().status);
+    try testing.expectEqualStrings(nominal, h.model().path());
+    try testing.expectEqualStrings(cached, h.model().readPath());
+
+    const tree = try buildTree(arena, h.model());
+    _ = try expectByText(tree.root, .text, "Pasted Image.png");
+
+    // And the outputs land beside the nominal name, which is the whole
+    // point of inventing one: on the Desktop, not in the purgeable cache.
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+    var it = std.mem.splitScalar(u8, (h.encodeRequest(.avif) orelse return error.NoHostRequest).payload, 0);
+    _ = it.next();
+    try testing.expectEqualStrings(cached, it.next() orelse return error.MalformedPayload);
+    try testing.expectEqualStrings("/Users/someone/Desktop/Pasted Image.avif", try h.encodeDest(.avif));
+}
+
+test "a clipboard with no image says so and leaves the loaded file alone" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.load(large_jpg, large_jpg_bytes);
+    try testing.expectEqual(Status.ready, h.model().status);
+
+    try h.pasteEmpty();
+
+    // A named failure, not a silent no-op: the user pressed a key and is
+    // owed an answer.
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expectEqualStrings("No image on the clipboard.", h.model().errorMessage());
+    // Nothing was acquired, so nothing was replaced — the card the user
+    // was looking at is still there behind the message.
+    try testing.expectEqualStrings(large_jpg, h.model().path());
+    try testing.expect(h.model().hasPreview());
+}
+
+test "a malformed paste reply fails the same way an empty clipboard does" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.paste);
+    const request = h.pendingHostNamed("clipboard.paste") orelse return error.NoHostRequest;
+    // `ok` but not one of ours. Starting a load on it would stat garbage.
+    try h.fx().feedHostResult(request.key, true, "not a paste reply");
+    try h.drain();
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expectEqualStrings("No image on the clipboard.", h.model().errorMessage());
+    try testing.expect(h.pendingHostNamed("file.stat") == null);
+}
+
+test "a paste in flight at reset is cancelled outright, not merely ignored" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.send(.paste);
+    const request = h.pendingHostNamed("clipboard.paste") orelse return error.NoHostRequest;
+
+    try h.send(.reset);
+    try h.drain();
+
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expectEqual(@as(usize, 0), h.fx().pendingHostCount());
+
+    // The pasteboard read is synchronous, but the raw-bytes shape writes
+    // a file before it answers — long enough for a Reset to land first.
+    // The cancel releases the slot, so that answer has nowhere to go and
+    // cannot resurrect a file the user just cleared.
+    try testing.expectError(error.EffectNotFound, h.fx().feedHostResult(request.key, true, "/Users/someone/Desktop/Pasted Image.png\x00/cache/staged/Pasted Image.png"));
+    try h.drain();
+    try testing.expectEqual(Status.idle, h.model().status);
+    try testing.expect(!h.model().hasFile());
+}
+
 
 test "onKey: Enter smooshes, 1/2/3 pick the format, everything else is ignored" {
     const K = struct {

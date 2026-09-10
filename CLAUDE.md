@@ -132,6 +132,10 @@ that hides until the other artifact is built.
   full-resolution buffer cannot ride the 256 KiB host result, and its one caller (the
   `image.encode` worker) is already off the loop thread. `decode` applies the EXIF orientation BY
   HAND, through three scalar CTM calls rather than `CGContextConcatCTM`; the header says why.
+- `src/pasteboard.zig` — the NSPasteboard seam, `workspace.zig`'s sibling and written to the same
+  rules. Backs `clipboard.paste`. Its header records why the SDK's own `readClipboardData` cannot
+  serve this (its macOS mime map resolves text types ONLY, and caps at 64 KiB regardless) and why
+  the pasted bytes never enter the process — `-[NSData writeToFile:atomically:]` does the copy.
 - `src/chroma.zig` — the source-container chroma table plus the hand-rolled JPEG SOF parser, which
   is how `avifenc --yuv auto`'s behaviour survives decoding everything to RGBA. Pure over bytes.
 - `src/encoders.zig` — the Zig-to-encoder seam, the mirror of `imageio.zig`. `encodeAvif`/
@@ -203,6 +207,17 @@ says how much you are over.
 - `on_drop` (`UiApp.Options`, SDK 0.8.2+) for real window-wide file drops.
 - `on-hover-enter` / `on-hover-leave` (markup events, codes 11/12) for the hover-lit controls —
   see "Hover ink" below.
+- `RuntimeOptions.shortcuts` + `Options.on_command` for Cmd+V, and ONLY for Cmd+V. Every other key
+  in the app rides `on_key`; a Command-modified one cannot. AppKit resolves key equivalents against
+  the menu bar before the responder chain, so the stock Edit menu's Paste claims the chord and the
+  gpu_surface's `keyDown:` never runs — and the SDK's canvas answers that menu item by re-emitting
+  the chord only when a text widget has focus, which this window never has. A registered `Shortcut`
+  installs a local `NSEventMaskKeyDown` monitor that runs before `NSApp.sendEvent:`, ahead of the
+  menu. `main.zig`'s `app_shortcuts` carries this.
+- A hand-bound `clipboard.paste` over `src/pasteboard.zig`. Two payload shapes, one reply
+  (`"<nominal>\x00<read>"`): a file URL loads like a pick, raw pixels are written into the cache
+  `staged` slot and paired with an invented Desktop name, which reuses `Model.stash_path_buffer`'s
+  run-is-about-one-path/reads-another split rather than adding a second mechanism.
 - A hand-bound `shell.reveal` host command over `-[NSWorkspace activateFileViewerSelectingURLs:]`
   (`src/workspace.zig`), for "Show in Finder". The SDK exposes no workspace or open-URL API at all,
   and the app spawns no subprocess, so `open -R` is not available either.
@@ -281,10 +296,13 @@ composite over any ground — and a test pins the separation in both schemes on 
   restating what the code plainly says.
 
 ## Two standing rules about automation
-- **Never automate a native file dialog** (open or save panel). The app runs as a bare executable
-  under `native dev`/`native build`; System Events cannot bring it frontmost, so global keystrokes
-  land on whatever IS frontmost instead — this already typed a stray path into a live session once.
-  Have the user drive every dialog by hand; everything else (button presses, chip selection,
-  status/result assertions) drives fine with `native automate widget-click`.
+- **Never send a global keystroke** — a native file dialog (open or save panel) above all, and
+  Cmd+V equally. The app runs as a bare executable under `native dev`/`native build`; System Events
+  cannot bring it frontmost, so the keystroke lands on whatever IS frontmost instead — this already
+  typed a stray path into a live session once. Have the user press the key by hand. Setting up the
+  pasteboard around such a press IS scriptable (`osascript -e 'set the clipboard to ...'`,
+  `pbcopy`), and so is asserting the result afterwards; only the press itself is theirs. Everything
+  else (button presses, chip selection, status/result assertions) drives fine with
+  `native automate widget-click`.
 - **File drops cannot be automated at all** (a different constraint from dialogs, same practical
   answer): have the user drag a real file onto the window by hand.

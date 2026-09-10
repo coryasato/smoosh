@@ -3,6 +3,22 @@
 For the engineering record — the decisions still in force, and the measurements the encoder work was
 held to — see [PLAN.md](PLAN.md) and [docs/phase-b-baseline.md](docs/phase-b-baseline.md).
 
+## v0.6 — 2026-09-10
+
+Paste. Copy an image anywhere on your Mac — a screenshot taken with Cmd-Ctrl-Shift-4, "Copy Image"
+in a browser, an image file copied in Finder — press Cmd+V over the Smoosh window, and it loads.
+
+- **Cmd+V loads whatever image is on the clipboard.** It works from the same window state a drop
+  does, and from there the run is identical: preview, size, Smoosh.
+- **A file copied in Finder keeps its own name**, and its compressed copies are filed beside the
+  original, exactly as if you had dragged it in.
+- **A copied picture with no file behind it goes to your Desktop** — a screenshot, or an image
+  copied out of a web page. It arrives as `Pasted Image`, and a second paste becomes
+  `Pasted Image 2` rather than writing over the first one's files.
+- **Pressing Cmd+V with no image on the clipboard says so** and leaves whatever you had loaded
+  untouched.
+- The empty window now mentions pasting alongside dropping and clicking.
+
 ## v0.5 — 2026-09-08
 
 Screenshots. Dragging one straight off its floating thumbnail is the fastest way to get a screenshot

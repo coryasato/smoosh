@@ -12,6 +12,7 @@ const imageio = @import("imageio.zig");
 const encoders = @import("encoders.zig");
 const chroma = @import("chroma.zig");
 const workspace = @import("workspace.zig");
+const pasteboard = @import("pasteboard.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -52,7 +53,7 @@ const window_title = "Smoosh";
 /// read, and they sat two releases apart (0.1.0 against 0.3.0) without a
 /// single warning. `tests.zig` now parses `app.zon` and fails naming the
 /// field that drifted — bump one and the other is not optional.
-pub const app_version = "0.5.0";
+pub const app_version = "0.6.0";
 pub const app_name = "smoosh";
 pub const app_display_name = "Smoosh";
 pub const app_bundle_id = "dev.native_sdk.smoosh";
@@ -1112,6 +1113,8 @@ pub const Msg = union(enum) {
     pick_file, // dropzone clicked
     dialog_result: native_sdk.EffectHostResult, // host open-dialog callback
     dropped_file: []const u8, // on_drop callback — a file dragged onto the window
+    paste, // Cmd+V — the `app.paste` shortcut, through `onCommand`
+    paste_result: native_sdk.EffectHostResult, // `clipboard.paste` callback -> the pasted image's nominal and read paths
     stash_result: native_sdk.EffectHostResult, // `file.stash` callback -> the cache copy's path, then on to the stat
     stat_result: native_sdk.EffectHostResult, // host file-size callback -> original_size
     probe_result: native_sdk.EffectHostResult, // host ImageIO properties callback -> dimensions, UTI, megapixel check
@@ -1142,12 +1145,15 @@ pub const Msg = union(enum) {
     toggle_color_scheme, // footer appearance toggle
     appearance_changed: AppearanceState, // `on_appearance` — the input to `tokens`
 
-    // Dispatched by effect/host-call result paths, never from markup.
-    // Naming them keeps `native check`'s warnings meaningful: an unlisted
-    // Msg with no binding is a real bug, not expected noise.
+    // Dispatched by host-call results and the app-level input hooks
+    // (`on_drop`, `on_command`), never from markup. Naming them keeps
+    // `native check`'s warnings meaningful: an unlisted Msg with no
+    // binding is a real bug, not expected noise.
     pub const view_unbound = .{
         "dialog_result",
         "dropped_file",
+        "paste",
+        "paste_result",
         "stash_result",
         "stat_result",
         "probe_result",
@@ -1239,6 +1245,7 @@ const save_copy_key: u64 = 13;
 const reveal_key: u64 = 14;
 const stash_key: u64 = 15;
 const destination_key: u64 = 16;
+const paste_key: u64 = 17;
 
 /// Host-call names our own `HostBridge` answers (see `main`). Not SDK
 /// vocabulary — we bind the seam, so we name it.
@@ -1253,6 +1260,9 @@ const host_file_stash = "file.stash";
 /// two directories `update` cannot derive itself (the screenshot folder
 /// and the app cache's outbox) — see `HostBridge.destinationFor`.
 const host_destination = "file.destination";
+/// Reads an image off the general pasteboard — see `src/pasteboard.zig`
+/// for why the SDK's own clipboard seam cannot serve this.
+const host_clipboard_paste = "clipboard.paste";
 /// "Show in Finder" — see `src/workspace.zig` for why revealing a file
 /// needs a seam of our own at all.
 const host_reveal = "shell.reveal";
@@ -1715,6 +1725,42 @@ pub fn onDrop(drop: platform.FileDropEvent) ?Msg {
     return .{ .dropped_file = drop.paths[0] };
 }
 
+/// The one chrome shortcut this app registers, and the id it dispatches.
+///
+/// **Cmd+V cannot go through `on_key`**, which is where every other key
+/// in this app lives. Two things stand between a Command-modified key
+/// and the canvas: AppKit resolves key EQUIVALENTS against the menu bar
+/// before the responder chain, so the standard Edit menu's Paste item
+/// claims it and the surface's `keyDown:` never runs; and the SDK's own
+/// canvas view answers that menu item by re-emitting the chord only when
+/// a text widget has focus — this window has no text widgets, so it
+/// returns having done nothing. `RuntimeOptions.shortcuts` installs a
+/// local `NSEventMaskKeyDown` monitor instead, which runs BEFORE
+/// `NSApp.sendEvent:` and therefore before the menu ever sees the event.
+///
+/// Registration also has to be a modified key: `isValidShortcutBinding`
+/// rejects a bare character precisely so a registration can never steal
+/// typing.
+const paste_shortcut_id = "app.paste";
+
+pub const app_shortcuts = [_]platform.Shortcut{.{
+    .id = paste_shortcut_id,
+    .key = "v",
+    // `primary` is the platform's own "the modifier shortcuts use" —
+    // Command here. Stating `.command` instead would be the same key on
+    // macOS and the wrong one everywhere else.
+    .modifiers = .{ .primary = true },
+}};
+
+/// `Options.on_command` — the landing point for shortcut and menu
+/// commands. `.paste` is safe unconditionally: the arm only issues a
+/// host request, and an empty pasteboard is a named failure rather than
+/// a bad state, so there is nothing to gate on here.
+pub fn onCommand(name: []const u8) ?Msg {
+    if (std.mem.eql(u8, name, paste_shortcut_id)) return .paste;
+    return null;
+}
+
 /// Keyboard shortcuts, from `Options.on_key`. It only fires for keys
 /// nothing else claimed — a Tab'd-to button keeps its own Enter/Space,
 /// and this window has no text fields and no anchored surfaces to
@@ -1833,6 +1879,30 @@ pub fn parseDestinationReply(bytes: []const u8) ?DestinationInfo {
     };
 }
 
+/// `clipboard.paste`'s answer, split. See `HostBridge.pasteImage` for
+/// what the bridge puts in each half.
+pub const PasteInfo = struct {
+    /// The path the run is about — a real file for the Finder-copy
+    /// shape, an invented name in a real directory for the raw-bytes
+    /// one.
+    nominal: []const u8,
+    /// Where the bytes are, when that is not `nominal`. Empty for the
+    /// Finder-copy shape, which needs no indirection.
+    read: []const u8,
+};
+
+/// `"<nominal>\x00<read>"`, the NUL-delimited shape
+/// `parseDestinationReply` already uses. A missing second field is
+/// malformed rather than an empty `read`: the bridge always writes the
+/// separator, so its absence means the reply is not one of ours.
+pub fn parsePasteReply(bytes: []const u8) ?PasteInfo {
+    var it = std.mem.splitScalar(u8, bytes, 0);
+    const nominal = it.next() orelse return null;
+    if (nominal.len == 0) return null;
+    const read = it.next() orelse return null;
+    return .{ .nominal = nominal, .read = read };
+}
+
 /// Starts the load chain for a path that just arrived — from the open
 /// panel (`.dialog_result`'s ok branch) or a real window drop
 /// (`.dropped_file`). Both land here because the chain itself doesn't
@@ -1862,6 +1932,29 @@ fn beginLoad(model: *Model, fx: *Effects, path: []const u8) void {
         });
         return;
     }
+    beginStat(model, fx);
+}
+
+/// `beginLoad` for a source whose bytes are ALREADY somewhere of our
+/// own: the paste of raw pasteboard pixels, which the bridge has written
+/// into the cache before answering (`HostBridge.pasteImage`).
+///
+/// `nominal` is the path the run is ABOUT — the name on the file card,
+/// what `outputPath` derives from, and what the destination probe asks
+/// about. For a paste it names a file that does not exist and never
+/// will; only its DIRECTORY is real. `read` is where the bytes actually
+/// are. That split is exactly what `Model.stash_path_buffer` already
+/// means, so the paste rides the machinery the ephemeral-source stash
+/// built rather than a second one — with the `file.stash` hop skipped,
+/// because the copy has already happened.
+fn beginLoadStashed(model: *Model, fx: *Effects, nominal: []const u8, read: []const u8) void {
+    model.status = .loading;
+    model.setPath(nominal);
+    model.clearResults();
+    model.clearPreview();
+    // AFTER `setPath`, which clears the stash: a new file's reads start
+    // at the new file, and this one's reads start at the copy.
+    model.setStashPath(read);
     beginStat(model, fx);
 }
 
@@ -1915,6 +2008,45 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // same chain a dialog pick starts — a picked-file and a
         // dropped-file are indistinguishable to `update` past this point.
         .dropped_file => |dropped_path| beginLoad(model, fx, dropped_path),
+
+        // Cmd+V. The pasteboard cannot be read from `update` — it is an
+        // AppKit call, and `update` is pure — so this is a host command
+        // like every other acquisition, and the arm is just the request.
+        // `.loading` optimistically, exactly as `.pick_file` does: the
+        // raw-bytes shape writes a file before it answers, and that is
+        // the one moment a paste is not instant.
+        .paste => {
+            model.status = .loading;
+            fx.hostRequest(.{
+                .key = paste_key,
+                .name = host_clipboard_paste,
+                .on_result = Effects.hostMsg(.paste_result),
+            });
+        },
+
+        // The pasteboard's answer, in the one shape both payloads share:
+        // a path the run is ABOUT, and optionally a second path the bytes
+        // are actually AT (see `beginLoadStashed`).
+        //
+        // A failure here is the empty/text clipboard, and it is reported
+        // rather than swallowed: the user pressed a key and is owed an
+        // answer. It deliberately does NOT clear a file already loaded —
+        // nothing was acquired, so there is nothing to replace, and the
+        // card the user was looking at stays put behind the message.
+        .paste_result => |result| {
+            if (!result.ok) return model.fail("No image on the clipboard.", .{});
+            const paste = parsePasteReply(result.bytes) orelse
+                return model.fail("No image on the clipboard.", .{});
+            if (paste.read.len == 0) {
+                // A file copied in Finder: an ordinary path, and from
+                // here indistinguishable from a pick or a drop — the
+                // ephemeral check in `beginLoad` included, since a file
+                // copied out of /tmp is as perishable as one dragged.
+                beginLoad(model, fx, paste.nominal);
+            } else {
+                beginLoadStashed(model, fx, paste.nominal, paste.read);
+            }
+        },
 
         // The ephemeral-source hop (see `beginLoad`). A failure here is
         // reported as an unreadable file, which is exactly what it is: the
@@ -2091,6 +2223,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fx.cancel(probe_key);
             fx.cancel(thumbnail_key);
             fx.cancel(destination_key);
+            fx.cancel(paste_key);
             fx.cancel(avif_encode_key);
             fx.cancel(webp_encode_key);
             fx.cancel(save_dialog_key);
@@ -2315,6 +2448,10 @@ const HostBridge = struct {
     var stash_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
     /// `destinationFor`'s answer carries two paths and a flag.
     var destination_reply_buf: [platform.max_dialog_path_bytes * 2 + 4]u8 = undefined;
+    /// `pasteImage`'s two answers: the pasteboard's own path (or the
+    /// invented nominal one), and the NUL-joined reply built from it.
+    var paste_path_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+    var paste_reply_buf: [platform.max_dialog_path_bytes * 2 + 1]u8 = undefined;
 
     // ------------------------------------------------------ worker carrier
 
@@ -2644,6 +2781,7 @@ const HostBridge = struct {
         if (std.mem.eql(u8, name, host_save_file)) return self.saveFile(key, payload);
         if (std.mem.eql(u8, name, host_file_copy)) return self.copyFile(key, payload);
         if (std.mem.eql(u8, name, host_file_stash)) return self.stashFile(key, payload);
+        if (std.mem.eql(u8, name, host_clipboard_paste)) return self.pasteImage(key);
         if (std.mem.eql(u8, name, host_destination)) return self.destinationFor(key, payload);
         if (std.mem.eql(u8, name, host_reveal)) return self.revealPaths(key, payload);
         // The ImageIO reads and the encode return without answering — see
@@ -2771,6 +2909,120 @@ const HostBridge = struct {
             return self.reply(key, false, @errorName(err));
         };
         self.reply(key, true, destination);
+    }
+
+    /// Reads the general pasteboard and answers
+    /// `"<nominal>\x00<read>"` — the two paths `parsePasteReply` splits.
+    ///
+    /// Two payload shapes, and the FILE URL is tried first because it is
+    /// strictly better: a real path keeps the file's own name and lands
+    /// the outputs beside the original, which raw bytes can only invent.
+    /// It answers with an empty `read`, so `update` runs the ordinary
+    /// load — the ephemeral stash included, since an image copied out of
+    /// /tmp is as perishable as one dragged from there.
+    ///
+    /// Raw bytes (a Cmd-Ctrl-Shift-4 screenshot, "Copy Image" in a
+    /// browser) have no name and no home, so this invents both:
+    ///
+    ///  - the bytes go to the cache `staged` directory, the same single
+    ///    slot `stashFile` uses and clears the same way, and that is the
+    ///    `read` path;
+    ///  - the `nominal` path is `~/Desktop/Pasted Image.png`. It is never
+    ///    written. It exists so the machinery downstream has a name and a
+    ///    DIRECTORY to reason about, and the Desktop is the honest answer
+    ///    to "where does an image with no source folder go" — the same
+    ///    call v0.5 already makes for a screenshot stranded somewhere
+    ///    read-only.
+    ///
+    /// The nominal name is UNIQUIFIED against the outputs that would
+    /// actually be written (`.avif`/`.webp`), not against itself: the
+    /// silent-overwrite policy is about re-running on the same source,
+    /// and two different pasted images are not that. Without this, a
+    /// second paste would clobber the first one's files on the Desktop.
+    ///
+    /// Synchronous on the loop thread, like the other file commands and
+    /// for the same reason `stashFile` is — AppKit's pasteboard is
+    /// main-thread-only, so the read could not move off it even if the
+    /// write could.
+    fn pasteImage(self: *HostBridge, key: u64) void {
+        if (pasteboard.filePath(&paste_path_buf)) |path| {
+            const reply_text = std.fmt.bufPrint(&paste_reply_buf, "{s}\x00", .{path}) catch
+                return self.reply(key, false, "paste path too long");
+            return self.reply(key, true, reply_text);
+        }
+
+        const kind = pasteboard.imageKind() orelse
+            return self.reply(key, false, "no image on the pasteboard");
+
+        const home = homeDir() orelse return self.reply(key, false, "no home dir");
+        var desktop_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        const desktop = std.fmt.bufPrint(&desktop_buf, "{s}/Desktop", .{home}) catch
+            return self.reply(key, false, "desktop path too long");
+
+        var name_buf: [64]u8 = undefined;
+        const name = self.freePastedName(desktop, &name_buf) orelse
+            return self.reply(key, false, "no free name");
+        const nominal = std.fmt.bufPrint(&paste_path_buf, "{s}/{s}.{s}", .{
+            desktop,
+            name,
+            kind.extension(),
+        }) catch return self.reply(key, false, "paste path too long");
+
+        var staged_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        const staged_dir = cacheSubdir("staged", &staged_buf) orelse
+            return self.reply(key, false, "no cache dir");
+        // Same single-slot discipline as `stashFile`: the directory is
+        // deleted whole and remade, so the cache never accumulates
+        // pastes. Best-effort — a first run has nothing to delete.
+        std.Io.Dir.cwd().deleteTree(self.io, staged_dir) catch {};
+        std.Io.Dir.cwd().createDirPath(self.io, staged_dir) catch |err| {
+            return self.reply(key, false, @errorName(err));
+        };
+        const staged = std.fmt.bufPrint(&stash_path_buf, "{s}/{s}.{s}", .{
+            staged_dir,
+            name,
+            kind.extension(),
+        }) catch return self.reply(key, false, "stash path too long");
+
+        if (!pasteboard.writeImage(kind, staged)) {
+            return self.reply(key, false, "could not write the pasted image");
+        }
+
+        const reply_text = std.fmt.bufPrint(&paste_reply_buf, "{s}\x00{s}", .{ nominal, staged }) catch
+            return self.reply(key, false, "paste path too long");
+        self.reply(key, true, reply_text);
+    }
+
+    /// The first `Pasted Image`, `Pasted Image 2`, ... whose AVIF and
+    /// WebP outputs both do not already exist in `dir`. Null when every
+    /// candidate is taken, which answers the paste as a failure rather
+    /// than silently overwriting — a folder holding 99 pasted smooshes is
+    /// a situation to stop at, not to guess through.
+    ///
+    /// The `.png`/`.jpg` source name itself is deliberately NOT checked:
+    /// it is never written to this directory (the bytes live in the
+    /// cache), so an unrelated `Pasted Image.png` a user parked on their
+    /// Desktop is not a conflict.
+    fn freePastedName(self: *HostBridge, dir: []const u8, buffer: []u8) ?[]const u8 {
+        var index: u32 = 1;
+        while (index <= 99) : (index += 1) {
+            const name = if (index == 1)
+                std.fmt.bufPrint(buffer, "Pasted Image", .{}) catch return null
+            else
+                std.fmt.bufPrint(buffer, "Pasted Image {d}", .{index}) catch return null;
+            var taken = false;
+            for ([_][]const u8{ "avif", "webp" }) |extension| {
+                var probe_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+                const candidate = std.fmt.bufPrint(&probe_buf, "{s}/{s}.{s}", .{ dir, name, extension }) catch
+                    return null;
+                if (std.Io.Dir.cwd().statFile(self.io, candidate, .{})) |_| {
+                    taken = true;
+                    break;
+                } else |_| {}
+            }
+            if (!taken) return name;
+        }
+        return null;
     }
 
     /// Answers `"<0|1>\x00<screenshot dir>\x00<outbox dir>"` for the source
@@ -2921,6 +3173,7 @@ pub fn main(init: std.process.Init) !void {
         .update_fx = update,
         .on_drop = onDrop,
         .on_key = onKey,
+        .on_command = onCommand,
         .tokens_fn = tokens,
         .on_appearance = onAppearance,
         .markup = .{
@@ -2936,6 +3189,10 @@ pub fn main(init: std.process.Init) !void {
     defer runtime.deinit();
     native_sdk.Runtime.initAt(runtime, .{
         .platform = mac_platform.platform(),
+        // Installed on the platform at start-up (`flow.zig`'s
+        // `configureShortcuts`) and delivered back as a `.command` event
+        // that `on_command` maps. See `app_shortcuts`.
+        .shortcuts = &app_shortcuts,
         .security = .{
             .permissions = &app_permissions,
             .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } },

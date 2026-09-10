@@ -38,13 +38,14 @@ const vendor_archives = [_][]const u8{
 };
 
 /// Frameworks `src/imageio.zig` rides in on, plus the two
-/// `src/workspace.zig` needs for "Show in Finder". The SDK adds the
-/// ImageIO set to the exe itself via its private `linkPlatform`, but not
-/// to the test artifact — stating them here is what lets
-/// `src/imageio_tests.zig` run under `native test` at all.
+/// `src/workspace.zig` needs for "Show in Finder" and `src/pasteboard.zig`
+/// needs for Cmd+V. The SDK adds the ImageIO set to the exe itself via
+/// its private `linkPlatform`, but not to the test artifact — stating
+/// them here is what lets `src/imageio_tests.zig` run under
+/// `native test` at all.
 ///
-/// AppKit is `NSWorkspace`, Foundation is the `NSString`/`NSURL`/`NSArray`
-/// the reveal call is built out of. AppKit re-exports Foundation, so the
+/// AppKit is `NSWorkspace` and `NSPasteboard`, Foundation is the
+/// `NSString`/`NSURL`/`NSArray`/`NSData` those two calls are built out of. AppKit re-exports Foundation, so the
 /// link would succeed without it; it is named anyway because the code
 /// calls into it directly and a framework you use is a framework you
 /// state.

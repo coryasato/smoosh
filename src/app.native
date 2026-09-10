@@ -12,11 +12,13 @@
      treatment — disabled on exactly the guard that makes a press a no-op.
      The 46px that bought went to the preview frame.
 
-     The copy says "drop", not just "click" — `on_drop` (SDK 0.8.2+) makes
-     a real window-wide drag-and-drop land in the same load chain a picked
-     file does (see `main.zig`'s `onDrop`/`beginLoad`). The zone itself
-     stays a click target too: dropping anywhere in the window works, but
-     the zone is still the one thing worth pointing at. It is a WASH, not
+     The copy names all THREE ways in: `on_drop` (SDK 0.8.2+) makes a real
+     window-wide drag-and-drop land in the same load chain a picked file
+     does, and Cmd+V lands there too (see `main.zig`'s `onDrop`,
+     `onCommand`/`app_shortcuts`, and `beginLoad`). Paste is named here
+     because it is the only one of the three with no affordance at all —
+     the zone is a click target and the window takes a drag, but a
+     keystroke nobody mentions is a keystroke nobody presses. It is a WASH, not
      an outline: no `border` attribute exists on a panel and nothing in
      the SDK strokes dashes, so the recess is the whole affordance.
 
@@ -235,10 +237,10 @@
     </if>
     <else>
       <panel key="dropzone" grow="1" padding="16" background="surface_subtle" radius="xl"
-             on-press="pick_file" label="Drop an image, or click to choose one to compress">
+             on-press="pick_file" label="Drop an image, paste one, or click to choose one to compress">
         <column gap="6" grow="1" main="center" cross="center">
           <icon name="folder-open" width="28" height="28" foreground="text_muted" />
-          <text text-alignment="center">Drop an image here — or click to choose</text>
+          <text text-alignment="center">Drop an image here — or paste, or click to choose</text>
           <text size="sm" foreground="text_muted" text-alignment="center">JPEG, PNG, HEIC, WebP, TIFF or GIF, up to 100 MB</text>
         </column>
       </panel>

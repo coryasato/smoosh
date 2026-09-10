@@ -10,7 +10,7 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 web formats (AVIF and/or WebP) without leaving your desktop.
 
 ## Status
-**v0.5 — feature-complete and zero-dependency.** Pick or drop an image, choose AVIF/WebP/Both,
+**v0.6 — feature-complete and zero-dependency.** Pick, drop or paste an image, choose AVIF/WebP/Both,
 Smoosh writes the outputs itself and says where they went; each landed result row carries its own
 save icon to copy that one file elsewhere. Ships as an ad-hoc-signed `.app`.
 
@@ -42,6 +42,10 @@ savings", since no client ever downloads both.
   hand-authored root.
 - Real window-wide drag-and-drop via `UiApp.Options.on_drop`, which re-enters the exact same load
   chain a picked file does.
+- Cmd+V, via a registered `platform.Shortcut` and `Options.on_command` — a file URL on the
+  pasteboard loads like a pick, raw pixels are written into the cache and filed to the Desktop. See
+  "Clipboard paste" under Roadmap for why neither the SDK's clipboard seam nor `on_key` could carry
+  this.
 - Accepts what macOS ImageIO decodes: JPEG, PNG, WebP, HEIC/HEIF, TIFF, GIF, BMP.
 
 ### Output handling
@@ -533,16 +537,40 @@ read-only-folder problem coupled to it are both fixed; the app-icon item is done
   destination split ABOVE lands, because until then everything is written beside the source. Build
   it as one arm of that classification, not before.
 
-- **Clipboard paste (Cmd+V).** Not the text-clipboard effect: `fx.readClipboard` is text/plain and
-  64 KiB. An image needs the rich-data pasteboard read (`runtime.readClipboardData` or equivalent —
-  the first task is confirming the SDK exposes one to a hand-authored root). Two payload shapes:
-    - a file URL on the pasteboard (image copied in Finder) → hand the path straight to `beginLoad`;
-    - raw bytes (a `Cmd-Ctrl-Shift-4` screenshot, "Copy Image" from a browser) → write to a temp
-      file then feed `beginLoad`, or decode the buffer directly if the `imageio` seam will take one.
-  Wiring, once an `on_key` hook exists: Cmd+V → a `.paste` Msg → an `update` arm that asks the
-  bridge to read the pasteboard (a host command, like `file.stat`) → the result re-enters the load
-  chain. Tests feed a fake host result for each payload shape. *Own session — the pasteboard type
-  negotiation is the whole task and can spill into platform-layer work.*
+- **Clipboard paste (Cmd+V) — SHIPPED in v0.6.** Both payload shapes land, through one host
+  command (`clipboard.paste`) answering `"<nominal>\x00<read>"`, which `parsePasteReply` splits.
+
+  **The SDK's clipboard seam turned out to be a dead end, for two independent reasons.**
+  `PlatformServices.readClipboardData(mime_type, buffer)` looks like the call and is not: its macOS
+  mime map (`NativeSdkPasteboardTypeForMime`) resolves `text/plain`, `text/html` and `text/rtf` and
+  returns nil for everything else, so an `image/png` read is unrepresentable rather than merely
+  awkward — and `max_clipboard_data_bytes` is 64 KiB anyway. `src/pasteboard.zig` is therefore an
+  Objective-C seam of its own, `workspace.zig`'s sibling. The bytes never enter the process:
+  `-[NSData writeToFile:atomically:]` does the copy, which is what keeps a multi-megabyte static
+  buffer out of the tree and makes the write atomic for free.
+
+  **Cmd+V could not go through `on_key`** either, which is where every other key in this app lives.
+  AppKit resolves key EQUIVALENTS against the menu bar before the responder chain, so the standard
+  Edit menu's Paste claims the chord and the surface's `keyDown:` never runs; the SDK's canvas view
+  answers that menu item by re-emitting the chord only when a text widget has focus, and this window
+  has none. `RuntimeOptions.shortcuts` + `Options.on_command` is the working seam — it installs a
+  local `NSEventMaskKeyDown` monitor that runs before `NSApp.sendEvent:`, so nothing downstream can
+  claim the event first. `main.zig`'s `app_shortcuts` carries the account.
+
+  The two shapes:
+    - **a file URL** (an image copied in Finder) → answered with an empty `read`, so it takes the
+      ordinary `beginLoad` — the ephemeral stash included, since a file copied out of /tmp is as
+      perishable as one dragged from there;
+    - **raw bytes** (a `Cmd-Ctrl-Shift-4` screenshot, "Copy Image" in a browser) → written into the
+      cache `staged` slot, and paired with an INVENTED nominal path on the Desktop. That reuses
+      `Model.stash_path_buffer`'s existing split (the run is ABOUT one path, it READS another)
+      rather than adding a second mechanism, and it is what puts the outputs somewhere durable
+      instead of in the purgeable cache. The nominal name is uniquified against the `.avif`/`.webp`
+      it would actually write, so a second paste is `Pasted Image 2` rather than a clobber — the
+      silent-overwrite policy is about re-running on the same source, which two pastes are not.
+
+  An empty or text-only pasteboard is `.failed` with "No image on the clipboard." and deliberately
+  does NOT clear a loaded file: nothing was acquired, so nothing was replaced.
 
 
 **Not planned — Dock-icon / Finder drop.** macOS delivers Dock-icon drops and "Open With" through
