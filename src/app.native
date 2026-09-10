@@ -241,7 +241,7 @@
         <column gap="6" grow="1" main="center" cross="center">
           <icon name="folder-open" width="28" height="28" foreground="text_muted" />
           <text text-alignment="center">Drop an image here — or paste, or click to choose</text>
-          <text size="sm" foreground="text_muted" text-alignment="center">JPEG, PNG, HEIC, WebP, TIFF or GIF, up to 100 MB</text>
+          <text size="sm" foreground="text_muted" text-alignment="center">JPEG, PNG, HEIC, WebP, AVIF, TIFF or GIF, up to 100 MB</text>
         </column>
       </panel>
     </else>

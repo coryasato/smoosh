@@ -50,20 +50,33 @@ fn msgSend2(comptime Ret: type, comptime A: type, comptime B: type) *const fn (I
 /// The image flavours worth taking off a pasteboard, in the order
 /// `imageKind` prefers them.
 ///
-/// PNG first because it is what `screencapture` and every browser's
-/// "Copy Image" of a PNG put there: lossless and already compact.
+/// One rule orders the whole list: **prefer the producer's own encoded
+/// bytes over anything re-rendered.** PNG first because it is what
+/// `screencapture` and every browser's "Copy Image" actually put there.
+/// Then the compressed originals. TIFF LAST, always — it is what macOS
+/// hands over when it has re-rendered the picture for the pasteboard,
+/// it is uncompressed, and it has already thrown away the one fact the
+/// original carried.
 ///
-/// **JPEG before TIFF, deliberately.** A browser copying a JPEG offers
-/// both, and taking the JPEG keeps the ORIGINAL entropy-coded bytes —
-/// which is what `chroma.zig`'s SOF parser reads to decide whether the
-/// AVIF encode may use 4:2:0. Through TIFF that fact is gone (the
-/// pasteboard has already decoded to RGB), and every pasted photo would
-/// silently encode at the conservative subsampling. TIFF is also
-/// uncompressed, so it is the largest possible way to move the same
-/// picture across the seam.
+/// That fact is why JPEG's position is load-bearing rather than
+/// cosmetic: a producer copying a JPEG offers `public.jpeg` AND
+/// `public.tiff` (verified on the real pasteboard, not inferred), and
+/// only the JPEG still has the entropy-coded bytes `chroma.zig`'s SOF
+/// parser reads to decide whether the AVIF encode may use 4:2:0.
+/// Through TIFF that is gone and every pasted photo would silently
+/// encode at the conservative subsampling.
+///
+/// WebP and AVIF are here for completeness, not because anything common
+/// produces them: every browser re-encodes to PNG when it puts an image
+/// on the pasteboard, so a WebP or AVIF on a web page reaches this app
+/// as `public.png`. They cost two entries and close the case where an
+/// app hands over its own bytes; without them that paste would report an
+/// empty clipboard.
 pub const Kind = enum {
     png,
     jpeg,
+    webp,
+    avif,
     tiff,
 
     /// The pasteboard UTI, which is also what `dataForType:` keys on.
@@ -71,6 +84,8 @@ pub const Kind = enum {
         return switch (self) {
             .png => "public.png",
             .jpeg => "public.jpeg",
+            .webp => "org.webmproject.webp",
+            .avif => "public.avif",
             .tiff => "public.tiff",
         };
     }
@@ -83,6 +98,8 @@ pub const Kind = enum {
         return switch (self) {
             .png => "png",
             .jpeg => "jpg",
+            .webp => "webp",
+            .avif => "avif",
             .tiff => "tiff",
         };
     }

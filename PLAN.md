@@ -39,14 +39,18 @@ savings", since no client ever downloads both.
 ### File acquisition
 - Native open dialog via `runtime.showOpenDialog`, called from a `HostCallBinding.request_fn` bound
   by hand in `src/main.zig` — see CLAUDE.md's "File acquisition, honestly" for why this requires a
-  hand-authored root.
+  hand-authored root. **It states no extension filter.** `image.probe` rules on the bytes and its
+  failure already names the supported formats, and neither a drop nor a paste consults a list — so
+  any list here is only a set of files the user can drag in but cannot pick. A partial one is worse
+  than none: `avif` was missing through v0.5 and greyed out real, decodable images.
 - Real window-wide drag-and-drop via `UiApp.Options.on_drop`, which re-enters the exact same load
   chain a picked file does.
 - Cmd+V, via a registered `platform.Shortcut` and `Options.on_command` — a file URL on the
   pasteboard loads like a pick, raw pixels are written into the cache and filed to the Desktop. See
   "Clipboard paste" under Roadmap for why neither the SDK's clipboard seam nor `on_key` could carry
   this.
-- Accepts what macOS ImageIO decodes: JPEG, PNG, WebP, HEIC/HEIF, TIFF, GIF, BMP.
+- Accepts what macOS ImageIO decodes: JPEG, PNG, WebP, AVIF, HEIC/HEIF, TIFF, GIF, BMP — the same
+  set through all three ways in, because only the probe decides.
 
 ### Output handling
 - Auto-save next to the source (`photo.jpg` → `photo.avif` / `photo.webp`) as soon as "Smoosh"
@@ -565,9 +569,19 @@ read-only-folder problem coupled to it are both fixed; the app-icon item is done
       cache `staged` slot, and paired with an INVENTED nominal path on the Desktop. That reuses
       `Model.stash_path_buffer`'s existing split (the run is ABOUT one path, it READS another)
       rather than adding a second mechanism, and it is what puts the outputs somewhere durable
-      instead of in the purgeable cache. The nominal name is uniquified against the `.avif`/`.webp`
-      it would actually write, so a second paste is `Pasted Image 2` rather than a clobber — the
-      silent-overwrite policy is about re-running on the same source, which two pastes are not.
+      instead of in the purgeable cache. The nominal name is a LOCAL timestamp
+      (`smoosh-2026-09-10-143005`), so two pastes cannot clobber each other's outputs and a Desktop
+      full of them says which is which. A re-press of Smoosh on the same pasted image deliberately
+      reuses the name — it is fixed at paste time, which is what makes a redo a redo.
+
+  The raw-bytes flavours are PNG, JPEG, WebP, AVIF, TIFF, in that order — **the producer's own
+  encoded bytes over anything re-rendered**, with TIFF last because it is what macOS hands over once
+  it has re-rendered the picture, uncompressed and stripped of the JPEG entropy data `chroma.zig`
+  reads. WebP and AVIF are there for completeness only: every browser re-encodes to PNG when it puts
+  an image on the pasteboard, verified by reading `NSPasteboard.types` directly — an image copy
+  carries `public.png`/`public.tiff`, a JPEG copy `public.jpeg`/`public.tiff`, and nothing else.
+  (AppleScript's `clipboard info` lists AVIF, GIF, BMP and more; those are its own *coercion
+  candidates*, not pasteboard flavours, and reading them as flavours will mislead you.)
 
   An empty or text-only pasteboard is `.failed` with "No image on the clipboard." and deliberately
   does NOT clear a loaded file: nothing was acquired, so nothing was replaced.

@@ -1879,6 +1879,44 @@ pub fn parseDestinationReply(bytes: []const u8) ?DestinationInfo {
     };
 }
 
+/// `strftime` over `localtime`, for `pastedName`. The `tm` it passes
+/// between them is OPAQUE — the two calls are libc's own pair, so its
+/// layout never has to be restated here, and getting a hand-written
+/// Darwin `struct tm` subtly wrong is exactly the silent corruption this
+/// avoids. `localtime` keeps its result in a static, which is safe here
+/// because the one caller runs on the loop thread.
+const CTm = opaque {};
+extern "c" fn time(destination: ?*i64) i64;
+extern "c" fn localtime(clock: *const i64) ?*CTm;
+extern "c" fn strftime(buffer: [*]u8, size: usize, format: [*:0]const u8, timeptr: *const CTm) usize;
+
+/// The name a raw-bytes paste is filed under: `smoosh-2026-09-10-143005`,
+/// extension added by the caller.
+///
+/// **LOCAL time, not UTC** — the name is read by a person looking at
+/// their Desktop, and one stamped four hours off their own clock is
+/// worse than no stamp. Seconds-resolution and no collision check: two
+/// pastes cannot land in the same second by hand, and the pasteboard
+/// would have to change between them for the collision to even matter.
+/// A re-press of Smoosh on the SAME pasted image deliberately does
+/// reuse the name — it is fixed at paste time, so a redo overwrites its
+/// own outputs, which is what the overwrite policy says a redo is.
+///
+/// The shape is `%Y-%m-%d-%H%M%S` rather than macOS's own screenshot
+/// spelling ("2026-09-10 at 14.30.05") because this one has no spaces
+/// and no dots before the extension: it survives a shell, a URL and a
+/// `find` invocation untouched, which a name the user will plausibly
+/// pipe somewhere should.
+pub fn pastedName(buffer: []u8) ?[]const u8 {
+    const now = time(null);
+    const parts = localtime(&now) orelse return null;
+    const len = strftime(buffer.ptr, buffer.len, "smoosh-%Y-%m-%d-%H%M%S", parts);
+    // `strftime` answers 0 for a buffer that could not hold the result,
+    // and cannot otherwise produce an empty string from this format.
+    if (len == 0) return null;
+    return buffer[0..len];
+}
+
 /// `clipboard.paste`'s answer, split. See `HostBridge.pasteImage` for
 /// what the bridge puts in each half.
 pub const PasteInfo = struct {
@@ -2104,12 +2142,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (!result.ok) {
                 // Unsupported or undecodable input.
                 return model.fail(
-                    "Not an image. Try JPEG, PNG, HEIC, WebP, TIFF or GIF.",
+                    "Not an image. Try JPEG, PNG, HEIC, WebP, AVIF, TIFF or GIF.",
                     .{},
                 );
             }
             const info = parseProbeReply(result.bytes) orelse return model.fail(
-                "Not an image. Try JPEG, PNG, HEIC, WebP, TIFF or GIF.",
+                "Not an image. Try JPEG, PNG, HEIC, WebP, AVIF, TIFF or GIF.",
                 .{},
             );
             model.source_width = info.width;
@@ -2765,15 +2803,6 @@ const HostBridge = struct {
         }
     }
 
-    /// What the open panel offers. Everything macOS ImageIO decodes that
-    /// we would plausibly be handed; `image.probe` is the real gate, and
-    /// its failure is a named error state, so this list only has to be
-    /// convenient, not exhaustive.
-    const image_filters = [_]platform.FileFilter{.{
-        .name = "Images",
-        .extensions = &.{ "jpg", "jpeg", "png", "heic", "heif", "webp", "tif", "tiff", "gif", "bmp" },
-    }};
-
     fn requestFn(context: *anyopaque, name: []const u8, key: u64, payload: []const u8) void {
         const self: *HostBridge = @ptrCast(@alignCast(context));
         if (std.mem.eql(u8, name, host_open_file)) return self.openFile(key);
@@ -2792,10 +2821,20 @@ const HostBridge = struct {
         self.reply(key, false, "unknown host command");
     }
 
+    /// **No `filters`, deliberately.** `OpenDialogOptions.filters`
+    /// defaults to empty, which shows everything, and that is the right
+    /// answer here: `image.probe` is the real gate — it rules on the
+    /// BYTES and its failure is already a named error state naming the
+    /// supported formats — and the two other ways in never consult a
+    /// list at all. A drop and a paste hand the path straight to
+    /// `beginLoad`, so any extension list here is a set of files the
+    /// user can drag in but cannot pick, which reads as a bug rather
+    /// than a filter. A partial list is worse than none: `avif` was
+    /// missing from it through v0.5 and greyed out real, decodable
+    /// images in the panel. Do not reintroduce one.
     fn openFile(self: *HostBridge, key: u64) void {
         const result = self.runtime.showOpenDialog(.{
             .title = "Choose an image to smoosh",
-            .filters = &image_filters,
         }, &dialog_path_buf) catch |err| {
             return self.reply(key, false, @errorName(err));
         };
@@ -2927,18 +2966,19 @@ const HostBridge = struct {
     ///  - the bytes go to the cache `staged` directory, the same single
     ///    slot `stashFile` uses and clears the same way, and that is the
     ///    `read` path;
-    ///  - the `nominal` path is `~/Desktop/Pasted Image.png`. It is never
+    ///  - the `nominal` path is `~/Desktop/smoosh-<timestamp>.png`. It is never
     ///    written. It exists so the machinery downstream has a name and a
     ///    DIRECTORY to reason about, and the Desktop is the honest answer
     ///    to "where does an image with no source folder go" — the same
     ///    call v0.5 already makes for a screenshot stranded somewhere
     ///    read-only.
     ///
-    /// The nominal name is UNIQUIFIED against the outputs that would
-    /// actually be written (`.avif`/`.webp`), not against itself: the
-    /// silent-overwrite policy is about re-running on the same source,
-    /// and two different pasted images are not that. Without this, a
-    /// second paste would clobber the first one's files on the Desktop.
+    /// The nominal name is a LOCAL TIMESTAMP (`pastedName`), which is
+    /// what keeps two different pastes from clobbering each other's
+    /// outputs on the Desktop — the silent-overwrite policy is about
+    /// re-running on the same source, and two pastes are not that. It
+    /// also reads: a Desktop of `smoosh-2026-09-10-143005.avif` says
+    /// which is which, where a counter would not.
     ///
     /// Synchronous on the loop thread, like the other file commands and
     /// for the same reason `stashFile` is — AppKit's pasteboard is
@@ -2960,8 +3000,8 @@ const HostBridge = struct {
             return self.reply(key, false, "desktop path too long");
 
         var name_buf: [64]u8 = undefined;
-        const name = self.freePastedName(desktop, &name_buf) orelse
-            return self.reply(key, false, "no free name");
+        const name = pastedName(&name_buf) orelse
+            return self.reply(key, false, "could not name the pasted image");
         const nominal = std.fmt.bufPrint(&paste_path_buf, "{s}/{s}.{s}", .{
             desktop,
             name,
@@ -2991,38 +3031,6 @@ const HostBridge = struct {
         const reply_text = std.fmt.bufPrint(&paste_reply_buf, "{s}\x00{s}", .{ nominal, staged }) catch
             return self.reply(key, false, "paste path too long");
         self.reply(key, true, reply_text);
-    }
-
-    /// The first `Pasted Image`, `Pasted Image 2`, ... whose AVIF and
-    /// WebP outputs both do not already exist in `dir`. Null when every
-    /// candidate is taken, which answers the paste as a failure rather
-    /// than silently overwriting — a folder holding 99 pasted smooshes is
-    /// a situation to stop at, not to guess through.
-    ///
-    /// The `.png`/`.jpg` source name itself is deliberately NOT checked:
-    /// it is never written to this directory (the bytes live in the
-    /// cache), so an unrelated `Pasted Image.png` a user parked on their
-    /// Desktop is not a conflict.
-    fn freePastedName(self: *HostBridge, dir: []const u8, buffer: []u8) ?[]const u8 {
-        var index: u32 = 1;
-        while (index <= 99) : (index += 1) {
-            const name = if (index == 1)
-                std.fmt.bufPrint(buffer, "Pasted Image", .{}) catch return null
-            else
-                std.fmt.bufPrint(buffer, "Pasted Image {d}", .{index}) catch return null;
-            var taken = false;
-            for ([_][]const u8{ "avif", "webp" }) |extension| {
-                var probe_buf: [platform.max_dialog_path_bytes]u8 = undefined;
-                const candidate = std.fmt.bufPrint(&probe_buf, "{s}/{s}.{s}", .{ dir, name, extension }) catch
-                    return null;
-                if (std.Io.Dir.cwd().statFile(self.io, candidate, .{})) |_| {
-                    taken = true;
-                    break;
-                } else |_| {}
-            }
-            if (!taken) return name;
-        }
-        return null;
     }
 
     /// Answers `"<0|1>\x00<screenshot dir>\x00<outbox dir>"` for the source

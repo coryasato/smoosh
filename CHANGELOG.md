@@ -13,10 +13,15 @@ in a browser, an image file copied in Finder — press Cmd+V over the Smoosh win
 - **A file copied in Finder keeps its own name**, and its compressed copies are filed beside the
   original, exactly as if you had dragged it in.
 - **A copied picture with no file behind it goes to your Desktop** — a screenshot, or an image
-  copied out of a web page. It arrives as `Pasted Image`, and a second paste becomes
-  `Pasted Image 2` rather than writing over the first one's files.
+  copied out of a web page. It is named for the moment you pasted it
+  (`smoosh-2026-09-10-143005`), so pastes never write over each other and a Desktop full of them
+  still tells you which is which.
 - **Pressing Cmd+V with no image on the clipboard says so** and leaves whatever you had loaded
   untouched.
+- **AVIF files can now be opened, not just dropped.** The open panel used to grey them out even
+  though dragging one in worked. It no longer filters by file type at all — it shows everything and
+  lets the "Not an image" message do the judging, exactly as a drop and a paste always have — and
+  AVIF is now named alongside the other formats in the window and in that message.
 - The empty window now mentions pasting alongside dropping and clicking.
 
 ## v0.5 — 2026-09-08

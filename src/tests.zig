@@ -20,6 +20,7 @@ const main = @import("main.zig");
 const imageio = @import("imageio.zig");
 const encoders = @import("encoders.zig");
 const chroma = @import("chroma.zig");
+const pasteboard = @import("pasteboard.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -2143,10 +2144,59 @@ test "onKey leaves Cmd+V alone, so the two key channels cannot both fire" {
     try testing.expect(main.onKey(.{ .phase = .key_down, .key = "v" }) == null);
 }
 
+test "pastedName stamps a real local time, in a shape that survives a shell" {
+    var buf: [64]u8 = undefined;
+    const name = main.pastedName(&buf) orelse return error.NoName;
+
+    // `smoosh-YYYY-MM-DD-HHMMSS`. Pinned by shape rather than by value:
+    // the clock is the input and there is nothing to fake it with.
+    try testing.expectEqualStrings("smoosh-", name[0..7]);
+    try testing.expectEqual(@as(usize, 24), name.len);
+
+    // Nothing a shell, a URL or a `find` would have to be told about —
+    // no spaces, and no dots ahead of the extension the caller appends.
+    for (name[7..]) |ch| {
+        try testing.expect(std.ascii.isDigit(ch) or ch == '-');
+    }
+
+    // strftime that failed would answer 0 and be caught above; strftime
+    // that ran against a broken `tm` would most likely stamp 1900 or
+    // 1970. Anything at or after this file was written is a real clock.
+    const year = try std.fmt.parseInt(u16, name[7..11], 10);
+    try testing.expect(year >= 2026);
+
+    // A buffer too small is null, not a truncated name — a half-written
+    // timestamp would be a silently colliding one.
+    var tiny: [8]u8 = undefined;
+    try testing.expect(main.pastedName(&tiny) == null);
+}
+
+test "the pasteboard image flavours prefer the producer's own bytes over a re-render" {
+    const Kind = pasteboard.Kind;
+    const order = std.enums.values(Kind);
+
+    // TIFF is what macOS hands over once it has re-rendered the picture:
+    // uncompressed, and stripped of the JPEG entropy data `chroma.zig`
+    // reads. It must never win over a flavour that is still the original.
+    try testing.expectEqual(Kind.tiff, order[order.len - 1]);
+    // PNG first: what `screencapture` and every browser "Copy Image"
+    // actually put on the pasteboard.
+    try testing.expectEqual(Kind.png, order[0]);
+
+    // Every flavour names a distinct real extension — the file card
+    // shows it, so two flavours sharing one would misreport a paste.
+    for (order, 0..) |kind, i| {
+        try testing.expect(kind.extension().len > 0);
+        for (order[i + 1 ..]) |other| {
+            try testing.expect(!std.mem.eql(u8, kind.extension(), other.extension()));
+        }
+    }
+}
+
 test "parsePasteReply splits the two paths, and rejects a reply that is not ours" {
-    const both = main.parsePasteReply("/Users/someone/Desktop/Pasted Image.png\x00/cache/staged/Pasted Image.png").?;
-    try testing.expectEqualStrings("/Users/someone/Desktop/Pasted Image.png", both.nominal);
-    try testing.expectEqualStrings("/cache/staged/Pasted Image.png", both.read);
+    const both = main.parsePasteReply("/Users/someone/Desktop/smoosh-2026-09-10-143005.png\x00/cache/staged/smoosh-2026-09-10-143005.png").?;
+    try testing.expectEqualStrings("/Users/someone/Desktop/smoosh-2026-09-10-143005.png", both.nominal);
+    try testing.expectEqualStrings("/cache/staged/smoosh-2026-09-10-143005.png", both.read);
 
     // The Finder-copy shape: the separator is still written, the second
     // field is just empty.
@@ -2217,8 +2267,8 @@ test "pasting raw pixels reads the cache copy and files the outputs on the Deskt
     // What the bridge answers for a Cmd-Ctrl-Shift-4 screenshot: the
     // pixels written into the cache, and an invented Desktop name that
     // is never itself written — only its directory is real.
-    const nominal = "/Users/someone/Desktop/Pasted Image.png";
-    const cached = "/Users/someone/Library/Caches/smoosh/staged/Pasted Image.png";
+    const nominal = "/Users/someone/Desktop/smoosh-2026-09-10-143005.png";
+    const cached = "/Users/someone/Library/Caches/smoosh/staged/smoosh-2026-09-10-143005.png";
     try h.paste(nominal, cached);
 
     // No second copy: the bridge already wrote the bytes, so the
@@ -2249,7 +2299,7 @@ test "pasting raw pixels reads the cache copy and files the outputs on the Deskt
     try testing.expectEqualStrings(cached, h.model().readPath());
 
     const tree = try buildTree(arena, h.model());
-    _ = try expectByText(tree.root, .text, "Pasted Image.png");
+    _ = try expectByText(tree.root, .text, "smoosh-2026-09-10-143005.png");
 
     // And the outputs land beside the nominal name, which is the whole
     // point of inventing one: on the Desktop, not in the purgeable cache.
@@ -2258,7 +2308,7 @@ test "pasting raw pixels reads the cache copy and files the outputs on the Deskt
     var it = std.mem.splitScalar(u8, (h.encodeRequest(.avif) orelse return error.NoHostRequest).payload, 0);
     _ = it.next();
     try testing.expectEqualStrings(cached, it.next() orelse return error.MalformedPayload);
-    try testing.expectEqualStrings("/Users/someone/Desktop/Pasted Image.avif", try h.encodeDest(.avif));
+    try testing.expectEqualStrings("/Users/someone/Desktop/smoosh-2026-09-10-143005.avif", try h.encodeDest(.avif));
 }
 
 test "a clipboard with no image says so and leaves the loaded file alone" {
@@ -2312,7 +2362,7 @@ test "a paste in flight at reset is cancelled outright, not merely ignored" {
     // a file before it answers — long enough for a Reset to land first.
     // The cancel releases the slot, so that answer has nowhere to go and
     // cannot resurrect a file the user just cleared.
-    try testing.expectError(error.EffectNotFound, h.fx().feedHostResult(request.key, true, "/Users/someone/Desktop/Pasted Image.png\x00/cache/staged/Pasted Image.png"));
+    try testing.expectError(error.EffectNotFound, h.fx().feedHostResult(request.key, true, "/Users/someone/Desktop/smoosh-2026-09-10-143005.png\x00/cache/staged/smoosh-2026-09-10-143005.png"));
     try h.drain();
     try testing.expectEqual(Status.idle, h.model().status);
     try testing.expect(!h.model().hasFile());

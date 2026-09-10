@@ -216,8 +216,11 @@ says how much you are over.
   menu. `main.zig`'s `app_shortcuts` carries this.
 - A hand-bound `clipboard.paste` over `src/pasteboard.zig`. Two payload shapes, one reply
   (`"<nominal>\x00<read>"`): a file URL loads like a pick, raw pixels are written into the cache
-  `staged` slot and paired with an invented Desktop name, which reuses `Model.stash_path_buffer`'s
-  run-is-about-one-path/reads-another split rather than adding a second mechanism.
+  `staged` slot and paired with an invented Desktop name (`pastedName`, a LOCAL timestamp via
+  `strftime` over `localtime` — the `tm` stays opaque, so no hand-written Darwin struct can be
+  subtly wrong), which reuses `Model.stash_path_buffer`'s run-is-about-one-path/reads-another split
+  rather than adding a second mechanism. The open panel states NO extension filter, for the reason
+  `openFile` gives: the probe is the gate, and drops and pastes consult no list.
 - A hand-bound `shell.reveal` host command over `-[NSWorkspace activateFileViewerSelectingURLs:]`
   (`src/workspace.zig`), for "Show in Finder". The SDK exposes no workspace or open-URL API at all,
   and the app spawns no subprocess, so `open -R` is not available either.
