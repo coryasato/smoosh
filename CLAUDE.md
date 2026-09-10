@@ -2,14 +2,15 @@
 
 ## Product
 **Smoosh** is a tiny native macOS utility that compresses images into modern web formats (AVIF
-and/or WebP) with a drag-and-drop interface.
+and/or WebP). Three ways in, all landing in one load chain: drop, paste (Cmd+V), or click to pick.
 
 Goal: replace the "upload to TinyPNG / Squoosh / browser tab" workflow with a zero-friction local
 tool that feels instantaneous.
 
 **`PLAN.md` is the source of truth** for what is done and what is next. `CHANGELOG.md` is the
-history. This file holds working context that neither of those covers: the traps, the seams, and
-the reasons the tree is shaped the way it is.
+history. `README.md` is what the app PROMISES — the only doc written for someone who will not read
+the code. This file holds working context that none of those covers: the traps, the seams, and the
+reasons the tree is shaped the way it is.
 
 ## Stack
 - **Framework**: [Native SDK](https://native-sdk.dev)
@@ -62,6 +63,16 @@ the drop is WINDOW-wide (a real drag carries no `view_label` or `point`, so the 
 promise a targeted zone), the widget-level `canvas_widget_file_drop` channel is a dead end that no
 real drag ever reaches, and a drag-over highlight is impossible — the AppKit host emits nothing on
 `draggingEntered:`.
+
+Cmd+V is a THIRD seam, and it needed the hand-authored root twice over: `RuntimeOptions`
+carries `.shortcuts`, which only a root that builds its own Runtime can state, and the pasteboard
+read is a `HostCallBinding` of ours (`clipboard.paste` → `src/pasteboard.zig`). Both the SDK's
+obvious answers are dead ends and were verified from its source, not assumed — `on_key` never sees
+the chord (AppKit resolves key equivalents against the menu bar first, and the SDK's canvas answers
+the Edit menu's Paste only when a text widget has focus, which this window never has), and
+`PlatformServices.readClipboardData` resolves text mime types ONLY and caps at 64 KiB. A pasted
+FILE re-enters the same load chain a picked one does; pasted PIXELS are written to the cache first
+and paired with an invented Desktop name. PLAN.md's "Clipboard paste" carries the full account.
 
 ## Core Principles for this project
 1. **Extremely simple UX** — drop zone is the entire product. Minimal chrome.
@@ -289,6 +300,18 @@ composite over any ground — and a test pins the separation in both schemes on 
   about behavior.
 - Every new test assertion gets mutation-checked — break what it pins and confirm it fails, and
   fails for the right reason. See PLAN.md's "Testing strategy".
+- **`README.md` moves with every capability change** — the same trigger as a version bump, so if
+  the work earns a CHANGELOG entry it earns a README pass. UI polish does not. It is the one doc
+  with no test and no `native check` behind it, and it went two releases stale because nothing
+  named it as a deliverable. Four places rot silently, so read all four on each pass:
+  - **the ways in** ("What it does" — drop, paste, pick);
+  - **the accepted formats** and the limits;
+  - **where outputs land**, which is no longer one answer;
+  - **"Rough edges"**, which is a claim about the CURRENT build. A fixed bug left standing there is
+    worse than having no section at all — it tells users something false about the app they are
+    running. Delete an entry the moment it stops being true.
+
+  The file listing at the bottom is the fifth: a new `src/*.zig` seam belongs in it.
 - **The comments are the most valuable thing in this tree, and the load-bearing ones are the
   longest — never prune them by volume.** Write and keep: traps that cost a day to rediscover
   (`build.zig`'s two modules, the framework search path, the archive link order, the mandatory

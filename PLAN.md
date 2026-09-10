@@ -17,14 +17,18 @@ save icon to copy that one file elsewhere. Ships as an ad-hoc-signed `.app`.
 **Where the outputs go is decided per file, before the run** — beside the source when that folder
 takes a write, the Desktop for a screenshot stranded somewhere read-only, and nowhere-but-Save-As
 otherwise (see `Destination` in `src/main.zig`). An ephemeral source is copied into the app cache
-first, so a screenshot dragged off its floating thumbnail survives macOS deleting it mid-run.
+first, so a screenshot dragged off its floating thumbnail survives macOS deleting it mid-run; the
+same split carries a paste of raw pixels, which has no source folder to sit beside and is filed to
+the Desktop under a timestamp.
 
 The whole pipeline runs in-process: Apple ImageIO reads (`src/imageio.zig`), vendored static
 libavif/libaom/libwebp write (`src/encoders.zig` over `src/encode.c`), and the encode runs on a
 worker thread so the window keeps painting. **The app spawns no subprocess and needs nothing
 installed.**
 
-What is left is the standalone-app gaps — see "Roadmap".
+What is left is the standalone-app gaps — arm64-only, notarization, launch time — plus a
+performance pass nobody has measured yet. Both are Roadmap tracks; the deferred-features list is
+empty. Two items remain undecided rather than unbuilt: the Dock-icon / Finder drop and a CLI.
 
 ## Product behavior
 
@@ -42,7 +46,7 @@ savings", since no client ever downloads both.
   hand-authored root. **It states no extension filter.** `image.probe` rules on the bytes and its
   failure already names the supported formats, and neither a drop nor a paste consults a list — so
   any list here is only a set of files the user can drag in but cannot pick. A partial one is worse
-  than none: `avif` was missing through v0.5 and greyed out real, decodable images.
+  than none: `avif` was missing from it and greyed out real, decodable images in the panel.
 - Real window-wide drag-and-drop via `UiApp.Options.on_drop`, which re-enters the exact same load
   chain a picked file does.
 - Cmd+V, via a registered `platform.Shortcut` and `Options.on_command` — a file URL on the
@@ -194,10 +198,12 @@ and `native check` are necessary and never sufficient.
 
 - `native automate widget-click` drives the real UI for anything reachable without a native dialog
   or a real file drop.
-- **Never automate a native file dialog** (open or save panel). The app runs as a bare executable
-  under `native dev`/`native build`, and System Events cannot bring it frontmost, so global
-  keystrokes land on whatever IS frontmost instead — this already typed a stray path into a live
-  session once. Have the user drive every dialog by hand.
+- **Never send a global keystroke** — a native file dialog (open or save panel) above all, and
+  Cmd+V equally. The app runs as a bare executable under `native dev`/`native build`, and System
+  Events cannot bring it frontmost, so the keystroke lands on whatever IS frontmost instead — this
+  already typed a stray path into a live session once. Have the user press the key by hand. Setting
+  the pasteboard up around such a press IS scriptable (`osascript -e 'set the clipboard to ...'`,
+  `pbcopy`), and so is asserting the result afterwards; only the press itself is theirs.
 - **File drops cannot be automated at all** — a different constraint, same practical answer: have
   the user drag a real file onto the window by hand.
 - Test fixtures live under `test-images/` (gitignored); `docs/phase-b-baseline.md` carries the
@@ -217,10 +223,24 @@ and `native check` are necessary and never sufficient.
 - **arm64 only.** The vendored archives are non-fat arm64-macos; producing an x86_64 or universal
   build is unexplored. A genuine gap the moment the `.app` is handed to anyone else.
 - **Launch time has never been measured.**
+- **`~/Desktop` is hardcoded in two places now.** A custom `com.apple.screencapture location` is
+  not read — that needs a `CFPreferencesCopyAppValue` binding, since the app spawns no subprocess —
+  so both the screenshot rescue (`Destination.desktop`) and a raw-bytes paste file to `~/Desktop`
+  literally. A user who has moved their screenshot folder gets their files somewhere they did not
+  choose. One binding fixes both.
+- **A raw-bytes paste writes its file on the loop thread.** `clipboard.paste` must read the
+  pasteboard from the main thread (AppKit), and `-[NSData writeToFile:atomically:]` then runs there
+  too, so a very large pasted image stalls the window for the length of one write. Moving it would
+  mean reading the pasteboard on the loop and handing the `NSData` to a worker — real work for a
+  hitch nobody has reported at screenshot sizes.
 
 ## Roadmap
-Three tracks, independent of each other. Each carries a model/effort suggestion — judgment calls
+Four tracks, independent of each other. Each carries a model/effort suggestion — judgment calls
 about how much of the work is taste versus mechanism, not benchmarks.
+
+**§4 is empty of open work.** Every deferred feature has shipped; what remains under it is the two
+items marked "not planned / not decided" — the Dock-icon drop and the CLI — which are decisions
+still to be taken, not tasks waiting to be picked up. §1 and §3 are the live tracks.
 
 ### 1. Performance
 **Measure before touching anything.** The app is already effectively instant on normal photos, and
@@ -251,7 +271,9 @@ footer): <https://claude.ai/code/artifact/682de599-1cc7-4306-aac0-bbf9d886c2e6>
 **The board is now behind the app.** Iterating against it means reading "Where the build left the
 board" below first; every entry there is a place the drawn spec and the running app disagree, and
 in each the app is deliberate. Re-seeding the board from the built UI is the obvious next move
-before another visual pass.
+before another visual pass — and it has fallen one step further behind since: v0.6 moved the drop
+zone's two lines (`Drop an image here — or paste, or click to choose`, and `AVIF` added to the
+format list). Copy, not geometry, so nothing measured below changed.
 
 Constraint respected: the app is meant to live in a corner of the desktop, so it must stay correct
 at `window_min_width` (420). That floor is a TEST, not a comment — `tests.zig` lays the tallest
@@ -410,9 +432,16 @@ person: **a real file drop** and **any native dialog** (see CLAUDE.md's two stan
 ### 3. The standalone-app review
 The umbrella, not a task. The correctness half was covered by the Phase B review (2026-08-30) —
 one real bug found and fixed (the case-insensitive `same_path` collision). What it did NOT touch is
-the last four "Known limitations" above: **arm64-only**, **notarization** (currently ad-hoc
-signed, fine for one machine and not for distribution), **the icon's Dock shape** (now a scoped
-session in §4), and **launch time**.
+everything that only bites once the `.app` leaves this machine, and that is the whole remaining
+content of this track:
+- **arm64-only.** The vendored archives are non-fat; a universal build is unexplored. See "Known
+  limitations".
+- **Notarization.** Currently ad-hoc signed — fine for one machine, not for distribution. The
+  decision itself is recorded under "Key decisions carried forward"; what is unexplored is the work.
+- **Launch time has never been measured.** See "Known limitations".
+
+The icon's Dock shape WAS on this list and is done — see "App icon" below for the geometry that
+keeps it settled.
 
 *Suggested: **Opus 5, high**, or run `/code-review ultra` for the correctness sweep — it is
 user-triggered and billed, so it cannot be launched from inside a session.*
@@ -429,8 +458,14 @@ transparency** — `design/icon-original.png` is the pre-fix source, kept for co
 `build.zig` or `app.zon` is involved beyond the path; the geometry is the entire contract.
 
 ### 4. Deferred features — each its own session
-One real want. The latent bug this list carried (the screenshot that vanished mid-run) and the
-read-only-folder problem coupled to it are both fixed; the app-icon item is done too.
+**Nothing here is open.** Every item has shipped: the latent bug this list carried (the screenshot
+that vanished mid-run), the read-only-folder problem coupled to it, the app icon, and clipboard
+paste. The entries are kept because each records WHY its shape is what it is, and a reader changing
+that code needs the account more than the checkbox.
+
+What is left below the shipped items is two DECISIONS, not tasks — the Dock-icon / Finder drop and
+the CLI. Neither is scheduled; both are described so the decision can be taken with the constraints
+already in hand rather than rediscovered.
 
 - **Read-only source folders, and the screenshot-that-vanishes bug.** Two coupled problems, both
   invisible from a Terminal `native dev` run (the responsible process is the terminal, which
@@ -466,7 +501,8 @@ read-only-folder problem coupled to it are both fixed; the app-icon item is done
 
   Still deferred inside this: a CUSTOM `com.apple.screencapture location` is not read (that needs a
   `CFPreferencesCopyAppValue` binding, since the app spawns no subprocess), so `.desktop` is
-  literally `~/Desktop`. And `looksLikeScreenshot` does not chase LOCALIZED screenshot names — a
+  literally `~/Desktop` — and since v0.6 a raw-bytes paste files there too, so one binding now fixes
+  two features. Carried in "Known limitations". And `looksLikeScreenshot` does not chase LOCALIZED screenshot names — a
   German "Bildschirmfoto …" already filed in a read-only folder falls to `.ask` and gets a Save As
   rather than a wrong guess, which is the safe direction to be wrong in.
 
@@ -529,17 +565,11 @@ read-only-folder problem coupled to it are both fixed; the app-icon item is done
   `statusLine`'s `.done` arm now switches on `Destination`: `Done.` beside the source,
   `Saved to Desktop.` for the screenshot rescue, and `That folder is read-only — save a copy.` for
   `.ask`, which deliberately refuses to claim a save that did not happen. A lost format still wins
-  the line over any of them — the loss is what the user has to act on. For the record, the
-  "Show in Finder" control had already SHIPPED —
-  the footer reads `Done.` beside a hover-lit label that opens Finder with every output of the run
-  selected (`shell.reveal` → `NSWorkspace`, `src/workspace.zig`). It deliberately points at the
+  the line over any of them — the loss is what the user has to act on. The "Show in Finder" control
+  had already shipped alongside it: the footer reads `Done.` beside a hover-lit label that opens
+  Finder with every output of the run selected (`shell.reveal` → `NSWorkspace`, `src/workspace.zig`). It deliberately points at the
   AUTOMATIC write and never follows a Save As: a user who drove a save panel already knows where
   that copy went, and the button exists to unveil the write nobody was asked about.
-
-  What is still owed is the COPY: when the destination is not source-adjacent the line must read
-  `Saved to Desktop.` instead of `Done.` That string cannot exist until the writability-probe
-  destination split ABOVE lands, because until then everything is written beside the source. Build
-  it as one arm of that classification, not before.
 
 - **Clipboard paste (Cmd+V) — SHIPPED in v0.6.** Both payload shapes land, through one host
   command (`clipboard.paste`) answering `"<nominal>\x00<read>"`, which `parsePasteReply` splits.

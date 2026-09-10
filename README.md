@@ -5,9 +5,9 @@ and/or WebP back, next to the original. No upload, no browser tab, no account.
 
 ## What it does
 
-Drag an image onto the window — or click the drop zone to pick one. Smoosh shows a preview and the
-original file size. Choose **AVIF**, **WebP**, or **Both**, press **Smoosh**, and the compressed
-files land next to the original:
+Drag an image onto the window, press **Cmd+V** to paste one, or click the drop zone to pick one.
+Smoosh shows a preview and the original file size. Choose **AVIF**, **WebP**, or **Both**, press
+**Smoosh**, and the compressed files land next to the original:
 
 ```
 large.jpg
@@ -42,9 +42,28 @@ Outputs are named after the source and overwrite a previous Smoosh run silently 
 is "redo this". A format whose output would *be* the source is skipped and says so, so a `.webp`
 source never overwrites itself.
 
+### Where they land
+
+Beside the original, normally. Smoosh works out where a file's outputs can go *before* you press
+Smoosh, so it never finishes the work and then discovers it has nowhere to put it:
+
+- **Beside the original** when that folder takes a write.
+- **On your Desktop** for a screenshot sitting somewhere read-only — macOS parked it there, and the
+  Desktop is where its owner already expects to find it. The status line says `Saved to Desktop.`
+  rather than a bare "Done.", so you are never left guessing.
+- **Nowhere, until you say** for anything else in a read-only folder. The line reads
+  `That folder is read-only — save a copy.` and each result's save icon puts it where you want it.
+  Smoosh will not guess a folder for your files.
+
+A **pasted** picture with no file behind it — a screenshot, or an image copied out of a web page —
+goes to the Desktop under the time you pasted it (`smoosh-2026-09-10-143005.avif`), so pastes never
+write over each other. A pasted *file* is treated exactly like a dragged one.
+
 ## Input
 
-JPEG, PNG, WebP, HEIC/HEIF, TIFF, GIF and BMP — whatever macOS itself can decode.
+JPEG, PNG, WebP, AVIF, HEIC/HEIF, TIFF, GIF and BMP — whatever macOS itself can decode. The same
+set however the file arrives: the open panel does not filter by type, because the only thing that
+can honestly judge an image is a look at its bytes.
 
 Up to **100 MB** or **50 megapixels**, whichever comes first. Past either, Smoosh names the limit
 and your file's actual size instead of trying.
@@ -77,8 +96,9 @@ paid Apple Developer identity.
 
 ### Rough edges
 
-The app icon renders as a square tile in the Dock rather than sitting flush like other Mac apps —
-its source PNG has no alpha channel and draws its own rounded-square background.
+If you have moved your screenshot folder off the Desktop, Smoosh does not know: a screenshot rescued
+from a read-only folder, and a pasted picture with no file behind it, both go to `~/Desktop`
+literally.
 
 ## How it's built
 
@@ -114,13 +134,15 @@ A clean `native build` proves the code compiles, not that it works — changes a
 the running app.
 
 ```
-src/main.zig      the app: Model, Msg, update, effects
-src/app.native    the view
-src/imageio.zig   the ImageIO seam: probe, thumbnail, decode
-src/encoders.zig  the encoder seam, over the C shim in src/encode.c
-src/chroma.zig    the source-container chroma table + JPEG SOF parser
-third_party/      vendored encode-only static archives
-app.zon           identity, window, permissions, capabilities
+src/main.zig        the app: Model, Msg, update, effects
+src/app.native      the view
+src/imageio.zig     the ImageIO seam: probe, thumbnail, decode
+src/encoders.zig    the encoder seam, over the C shim in src/encode.c
+src/chroma.zig      the source-container chroma table + JPEG SOF parser
+src/pasteboard.zig  the NSPasteboard seam behind Cmd+V
+src/workspace.zig   the NSWorkspace seam behind "Show in Finder"
+third_party/        vendored encode-only static archives
+app.zon             identity, window, permissions, capabilities
 ```
 
 [PLAN.md](PLAN.md) holds the decisions, requirements and open work.
