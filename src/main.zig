@@ -13,6 +13,7 @@ const encoders = @import("encoders.zig");
 const chroma = @import("chroma.zig");
 const workspace = @import("workspace.zig");
 const pasteboard = @import("pasteboard.zig");
+const dockopen = @import("dockopen.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -42,6 +43,11 @@ const dev = builtin.mode == .Debug;
 pub const canvas_label = "main-canvas";
 const window_title = "Smoosh";
 
+/// The one window's id, shared by `AppInfo.main_window` and every
+/// hand-made dispatch into the app (`onDockOpen`). The runtime's own
+/// events carry it; a direct caller has to state it.
+const main_window_id: platform.WindowId = 1;
+
 /// The app's identity, stated here because a hand-authored root builds
 /// its own `AppInfo` — the CLI runner would derive these from `app.zon`
 /// at comptime, and this tree has no such path (same reason the window
@@ -53,7 +59,7 @@ const window_title = "Smoosh";
 /// read, and they sat two releases apart (0.1.0 against 0.3.0) without a
 /// single warning. `tests.zig` now parses `app.zon` and fails naming the
 /// field that drifted — bump one and the other is not optional.
-pub const app_version = "0.6.0";
+pub const app_version = "0.7.0";
 pub const app_name = "smoosh";
 pub const app_display_name = "Smoosh";
 pub const app_bundle_id = "dev.native_sdk.smoosh";
@@ -1720,9 +1726,48 @@ fn beginSave(model: *Model, fx: *Effects, output: Output) void {
 /// (`allow_multiple` defaults false), so a drop and a pick behave alike.
 /// Empty `paths` (e.g. a drag of something with no file) returns null, so
 /// `handleRuntimeEvent` dispatches nothing.
+/// The formats Smoosh PROMISES, named in the one failure a user sees for
+/// a file it cannot read. It is a promise in two places at once:
+/// `app.zon`'s `.file_associations` extension list has to accept every
+/// format named here, or the Dock tile refuses a drag for a file the app
+/// would have opened happily. `tests.zig` pins that agreement — the list
+/// and this sentence cannot drift apart silently.
+///
+/// The set is deliberately smaller than what ImageIO can actually decode:
+/// the probe rules on the bytes and will read more than this (BMP among
+/// them). Naming fewer formats than are accepted is safe; naming more
+/// than `app.zon` declares is not.
+pub const unsupported_source_message = "Not an image. Try JPEG, PNG, HEIC, WebP, AVIF, TIFF or GIF.";
+
 pub fn onDrop(drop: platform.FileDropEvent) ?Msg {
     if (drop.paths.len == 0) return null;
     return .{ .dropped_file = drop.paths[0] };
+}
+
+/// `dockopen.Handler` — a file dragged onto the Dock tile, or opened
+/// through Finder's "Open With". It is NOT an `on_*` hook: the SDK has no
+/// document channel, so this arrives on the delegate method
+/// `src/dockopen.zig` adds and dispatches by hand.
+///
+/// `.dropped_file` rather than a Msg of its own, because there is nothing
+/// to tell apart downstream — a Dock drop and a window drop are both an
+/// absolute path to a file that already exists, and `beginLoad` is
+/// indifferent to which one it got. A separate Msg would only be a second
+/// name for the same arm.
+///
+/// Dispatching straight from an AppKit callback is what `UiApp.dispatch`
+/// is for ("direct callers — command handlers, embedders, tests"), and it
+/// is already correct BEFORE the first frame: a launch-with-document
+/// request that beats the installing rebuild still applies to the model,
+/// and the installing rebuild then renders the accumulated state. That is
+/// the whole of the app-not-running case — there is no separate path.
+fn onDockOpen(context: *anyopaque, path: []const u8) void {
+    const bridge: *HostBridge = @ptrCast(@alignCast(context));
+    // A rebuild failure here has nowhere to go: this is the bottom of an
+    // Objective-C call, so returning an error would unwind into AppKit.
+    // `dispatch` has already reported it through the app's own dispatch
+    // error channel by this point.
+    bridge.app_state.dispatch(bridge.runtime, main_window_id, .{ .dropped_file = path }) catch {};
 }
 
 /// The one chrome shortcut this app registers, and the id it dispatches.
@@ -2142,12 +2187,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (!result.ok) {
                 // Unsupported or undecodable input.
                 return model.fail(
-                    "Not an image. Try JPEG, PNG, HEIC, WebP, AVIF, TIFF or GIF.",
+                    unsupported_source_message,
                     .{},
                 );
             }
             const info = parseProbeReply(result.bytes) orelse return model.fail(
-                "Not an image. Try JPEG, PNG, HEIC, WebP, AVIF, TIFF or GIF.",
+                unsupported_source_message,
                 .{},
             );
             model.source_width = info.width;
@@ -2219,7 +2264,28 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.dest_dir_len = 0;
             if (result.ok) {
                 if (parseDestinationReply(result.bytes)) |info| {
-                    if (!info.source_dir_writable) {
+                    // An EPHEMERAL source's folder is doomed, not
+                    // unwritable, and the probe cannot tell the
+                    // difference: `/var/folders/.../screencaptureui/` is
+                    // the user's own temp directory and takes a write
+                    // happily right up until macOS tears it down, which
+                    // it does seconds after the drag. The probe wins that
+                    // race almost always — it runs during the load — and
+                    // the encode, which runs whenever the user gets round
+                    // to pressing Smoosh, almost always loses it. The
+                    // result was an output written into a directory that
+                    // no longer existed, reported as a folder-permissions
+                    // failure it was never about.
+                    //
+                    // So ephemerality forces the same branch unwritability
+                    // does. `isEphemeralSource` is the SAME predicate that
+                    // decided to stash the bytes in the first place, and
+                    // it has to be: any source whose bytes were worth
+                    // rescuing has a folder not worth writing to. A
+                    // screenshot then lands on the Desktop (where macOS
+                    // was about to put it anyway) and anything else falls
+                    // to `.ask`.
+                    if (!info.source_dir_writable or isEphemeralSource(model.path())) {
                         if (looksLikeScreenshot(model.path())) {
                             model.destination = .desktop;
                             model.setDestDir(info.screenshot_dir);
@@ -3148,7 +3214,7 @@ pub fn main(init: std.process.Init) !void {
         .bundle_id = app_bundle_id,
         .window_title = window_title,
         .main_window = .{
-            .id = 1,
+            .id = main_window_id,
             .label = "main",
             .title = window_title,
             .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
@@ -3225,6 +3291,19 @@ pub fn main(init: std.process.Init) !void {
         .bind_services_fn = HostBridge.bindServicesFn,
         .shutdown_fn = HostBridge.shutdownFn,
     });
+
+    // Dock-tile drops and Finder's "Open With", through a delegate method
+    // added to the SDK's own app delegate. MUST be here: after `bridge` is
+    // populated (the handler dereferences it) and before `runtime.run`,
+    // which is where the host sets `NSApp.delegate` and AppKit snapshots
+    // which methods that delegate has. See `src/dockopen.zig`'s header.
+    //
+    // The answer is deliberately not checked. A false here means Dock
+    // drops never arrive; the window drop, the paste and the picker are
+    // all untouched, and there is no user-facing state that could honestly
+    // report it — the app cannot tell a delegate it failed to extend from
+    // a Dock the user never drags onto.
+    _ = dockopen.install(bridge, onDockOpen);
 
     try runtime.run(app_state.app());
 }

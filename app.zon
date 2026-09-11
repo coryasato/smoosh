@@ -3,11 +3,39 @@
     .name = "smoosh",
     .display_name = "Smoosh",
     .description = "A tiny native macOS app that compresses images into modern web formats.",
-    .version = "0.6.0",
+    .version = "0.7.0",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
     .permissions = .{ "view", "command" },
-    .capabilities = .{ "native_views", "gpu_surfaces", "file_drops" },
+    .capabilities = .{ "native_views", "gpu_surfaces", "file_drops", "file_associations" },
+    // Dock-tile drops and Finder's "Open With". This block is one half of
+    // that feature and `src/dockopen.zig` is the other: without
+    // `CFBundleDocumentTypes` in the packaged Info.plist, LaunchServices
+    // does not believe Smoosh opens images, the Dock tile never highlights,
+    // and the delegate method is never called. Both halves or neither.
+    //
+    // **The extension list cannot be omitted the way the open panel's
+    // filter is.** That filter is absent on purpose — the probe rules on
+    // the bytes, so any list there is only a set of files the user can drag
+    // in but cannot pick. Here there is no such choice: the SDK's packager
+    // emits `CFBundleTypeExtensions`/`CFBundleTypeMIMETypes` and has no
+    // `LSItemContentTypes` path, so "any image" (`public.image`) is not
+    // expressible and the types must be enumerated. Keep this list in step
+    // with `Model.sourceKind`'s table — a format missing here is one the
+    // Dock tile refuses to accept for a file the app could have opened.
+    //
+    // `viewer` deliberately, not `editor`: Smoosh reads an image and writes
+    // new files beside it, and the role only exists to tell LaunchServices
+    // whether to offer the app as a candidate DEFAULT for the type. It
+    // should never become one.
+    .file_associations = .{
+        .{
+            .name = "Image",
+            .role = "viewer",
+            .extensions = .{ "jpg", "jpeg", "png", "heic", "heif", "webp", "avif", "tif", "tiff", "gif", "bmp" },
+            .mime_types = .{ "image/jpeg", "image/png", "image/heic", "image/heif", "image/webp", "image/avif", "image/tiff", "image/gif", "image/bmp" },
+        },
+    },
     .shell = .{
         .windows = .{
             .{

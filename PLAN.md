@@ -28,7 +28,7 @@ installed.**
 
 What is left is the standalone-app gaps — arm64-only, notarization, launch time — plus a
 performance pass nobody has measured yet. Both are Roadmap tracks; the deferred-features list is
-empty. Two items remain undecided rather than unbuilt: the Dock-icon / Finder drop and a CLI.
+empty. One item remains undecided rather than unbuilt: a CLI.
 
 ## Product behavior
 
@@ -49,12 +49,25 @@ savings", since no client ever downloads both.
   than none: `avif` was missing from it and greyed out real, decodable images in the panel.
 - Real window-wide drag-and-drop via `UiApp.Options.on_drop`, which re-enters the exact same load
   chain a picked file does.
+- **An ephemeral source never writes beside itself.** `isEphemeralSource` decides two things, not
+  one: whether to stash the BYTES, and whether the source's folder can hold the OUTPUT. The second
+  half was missing until v0.7 and the bug it caused was invisible in a fast test — a
+  `screencaptureui` staging directory is the user's own temp dir and answers the write probe
+  truthfully (`writable`) during the load, then stops existing seconds later, so the output landed
+  in a directory that had been torn down and reported a folder-permissions failure it was never
+  about. Whoever presses Smoosh quickly never sees it. The two predicates have to move together:
+  any source whose bytes were worth rescuing has a folder not worth writing to.
 - Cmd+V, via a registered `platform.Shortcut` and `Options.on_command` — a file URL on the
   pasteboard loads like a pick, raw pixels are written into the cache and filed to the Desktop. See
   "Clipboard paste" under Roadmap for why neither the SDK's clipboard seam nor `on_key` could carry
   this.
+- A drag onto the DOCK TILE, and Finder's "Open With", via an `application:openURLs:` method
+  `src/dockopen.zig` adds to the SDK's own app delegate. Re-enters the load chain as
+  `.dropped_file`, the same Msg the window drop uses. See "Dock-icon / Finder drop" under Roadmap.
 - Accepts what macOS ImageIO decodes: JPEG, PNG, WebP, AVIF, HEIC/HEIF, TIFF, GIF, BMP — the same
-  set through all three ways in, because only the probe decides.
+  set through the first three ways in, because only the probe decides. **The Dock tile is the one
+  exception**, and not by choice: LaunchServices rules on the extension before the app is even
+  woken, so `app.zon` has to enumerate them.
 
 ### Output handling
 - Auto-save next to the source (`photo.jpg` → `photo.avif` / `photo.webp`) as soon as "Smoosh"
@@ -238,9 +251,9 @@ and `native check` are necessary and never sufficient.
 Four tracks, independent of each other. Each carries a model/effort suggestion — judgment calls
 about how much of the work is taste versus mechanism, not benchmarks.
 
-**§4 is empty of open work.** Every deferred feature has shipped; what remains under it is the two
-items marked "not planned / not decided" — the Dock-icon drop and the CLI — which are decisions
-still to be taken, not tasks waiting to be picked up. §1 and §3 are the live tracks.
+**§4 is empty of open work.** Every deferred feature has shipped; what remains under it is the one
+item marked "not decided" — the CLI — which is a decision still to be taken, not a task waiting to
+be picked up. The Dock-icon drop was the other, and shipped in v0.7. §1 and §3 are the live tracks.
 
 ### 1. Performance
 **Measure before touching anything.** The app is already effectively instant on normal photos, and
@@ -438,6 +451,14 @@ content of this track:
   limitations".
 - **Notarization.** Currently ad-hoc signed — fine for one machine, not for distribution. The
   decision itself is recorded under "Key decisions carried forward"; what is unexplored is the work.
+  It has a cost on the ONE machine too, found the hard way in v0.7: TCC identifies an ad-hoc app by
+  its cdhash, which changes with every build, so each reinstall arrives as an app macOS has never
+  seen holding a permission record for one it knew. The symptom is a protected-folder write refused
+  with NO prompt, which reads exactly like an app bug and is not one —
+  `tccutil reset SystemPolicyDesktopFolder dev.native_sdk.smoosh` clears it. A Developer ID
+  signature is what actually ends it, because it gives the app an identity that survives a rebuild.
+  **Rule out TCC before believing a permissions bug**: the discriminator is that a stale grant
+  refuses silently, while a genuine first run prompts.
 - **Launch time has never been measured.** See "Known limitations".
 
 The icon's Dock shape WAS on this list and is done — see "App icon" below for the geometry that
@@ -617,14 +638,53 @@ already in hand rather than rediscovered.
   does NOT clear a loaded file: nothing was acquired, so nothing was replaced.
 
 
-**Not planned — Dock-icon / Finder drop.** macOS delivers Dock-icon drops and "Open With" through
-`application:openURLs:` (an `odoc` Apple Event), a different channel from the drag machinery
-`on_drop` uses. It would need `CFBundleDocumentTypes` / `LSItemContentTypes` in `app.zon` AND an
-openURLs hook reachable from the hand-authored root — and `runMacos`'s document handling is
-non-`pub`, so that may not exist without platform-layer work. It also only applies to the packaged
-`.app`. Set aside: the payoff over a window drop is thin, and the "type `smoosh`, drag a file in"
-workflow it is usually wanted for is the CLI's job (below). Revisit only if an openURLs hook proves
-to be a one-liner.
+### Dock-icon / Finder drop — shipped in v0.7
+The fourth way in, and the only one that works while the window is buried: a screenshot dragged onto
+the Dock tile from behind a browser. That case has no alternative — a window drop needs a visible
+window, and Cmd+V needs focus.
+
+macOS delivers it as a `kAEOpenDocuments` ("odoc") Apple Event, which NSApplication resolves to
+`application:openURLs:` on its delegate. **Two halves, both required**, and this entry was set aside
+for two releases on a reading of the second that turned out to be wrong:
+
+- `app.zon`'s `.file_associations` → `CFBundleDocumentTypes` in the packaged Info.plist. Fully
+  supported by the SDK already (`manifest.zig`'s `FileAssociationMetadata`, emitted by
+  `package.zig`), and `native check` validates it. Not a gap at all.
+- The delegate method, added by `src/dockopen.zig`. The earlier entry guessed this "may not exist
+  without platform-layer work" because `runMacos`'s document handling is non-`pub`. It never needed
+  `runMacos`: `appkit_host.m` owns `NSApp.delegate` as a real Objective-C class
+  (`NativeSdkAppDelegate`) compiled into this binary, so `class_addMethod` reaches it the same way
+  `workspace.zig` reaches NSWorkspace, and `UiApp.dispatch` is `pub` and documented for exactly this
+  caller ("command handlers, embedders, tests"). No SDK change, no new platform event kind.
+
+**Three constraints, all load-bearing.**
+- **`install` must run before `runtime.run`.** AppKit snapshots which methods a delegate has when
+  `setDelegate:` is called, and the host does that inside `runWithCallback:`. Adding the method
+  afterwards leaves AppKit believing the delegate cannot open URLs and the drop is silently lost.
+  `NSApp` already exists by then — `[NSApplication sharedApplication]` runs in the host's `init`,
+  inside `MacPlatform.createWithOptions`.
+- **Extend the SDK's delegate; do not replace it.** The host installs its own only
+  `if (!NSApp.delegate)`, so setting one first would work — and would silently take the Dock-reopen
+  behaviour with it, plus anything a future SDK puts on that delegate. `class_addMethod` leaves it
+  whole and fails harmlessly if the SDK ever ships its own `application:openURLs:`.
+- **The extension list cannot be omitted the way the open panel's filter is.** That filter is absent
+  on purpose (above). Here there is no choice: the packager emits `CFBundleTypeExtensions` and has
+  no `LSItemContentTypes` path, so `public.image` is not expressible. `tests.zig` pins the list
+  against `unsupported_source_message` in both directions — a format the app promises but the
+  manifest omits is a file the tile refuses for no visible reason.
+
+**Deliberate limits.** A multi-file drop takes the first and ignores the rest silently, because the
+app holds one image everywhere else (`onDrop` takes `paths[0]` for the same reason). A drag out of a
+web page is refused by the Dock, and correctly: odoc carries file URLs and has no pixel lane at all,
+so pixels ride the pasteboard and files ride odoc, with no overlap. That is a clean split, not a
+gap — and it is why this is NOT the CLI's job after all: the earlier entry deflected to `smoosh
+hello.jpg`, which cannot be reached from a Dock drag by anyone who does not already have a shell
+open.
+
+**It only exists in the packaged `.app`** — a bare `native dev`/`native build` binary has no
+Info.plist, so LaunchServices knows nothing and the tile never highlights. Verification is therefore
+`native package` → install → drag by hand, and cannot be automated at all (the same practical answer
+as window drops, for a different reason).
 
 ## A Smoosh CLI — beyond the app
 **LAST. Deferred behind everything above** — do not pick this up unless the owner asks for it by

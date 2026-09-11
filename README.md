@@ -5,9 +5,9 @@ and/or WebP back, next to the original. No upload, no browser tab, no account.
 
 ## What it does
 
-Drag an image onto the window, press **Cmd+V** to paste one, or click the drop zone to pick one.
-Smoosh shows a preview and the original file size. Choose **AVIF**, **WebP**, or **Both**, press
-**Smoosh**, and the compressed files land next to the original:
+Drag an image onto the window or onto Smoosh's icon in the Dock, press **Cmd+V** to paste one, or
+click the drop zone to pick one. Smoosh shows a preview and the original file size. Choose **AVIF**,
+**WebP**, or **Both**, press **Smoosh**, and the compressed files land next to the original:
 
 ```
 large.jpg
@@ -65,6 +65,13 @@ JPEG, PNG, WebP, AVIF, HEIC/HEIF, TIFF, GIF and BMP — whatever macOS itself ca
 set however the file arrives: the open panel does not filter by type, because the only thing that
 can honestly judge an image is a look at its bytes.
 
+The **Dock icon** is the one exception, and it is macOS's rule rather than Smoosh's: the Dock decides
+whether to accept a drag before Smoosh ever sees it, from a list of file extensions in the installed
+app. It covers everything above, and it only accepts real files — a picture dragged straight out of
+a web page is not one, so use Cmd+V for those. Dropping several images at once loads the first.
+Images in Finder also gain an **Open With → Smoosh** entry; Smoosh never makes itself the default
+app for a format.
+
 Up to **100 MB** or **50 megapixels**, whichever comes first. Past either, Smoosh names the limit
 and your file's actual size instead of trying.
 
@@ -99,6 +106,22 @@ paid Apple Developer identity.
 If you have moved your screenshot folder off the Desktop, Smoosh does not know: a screenshot rescued
 from a read-only folder, and a pasted picture with no file behind it, both go to `~/Desktop`
 literally.
+
+Dock drops and "Open With" need the installed app. Running Smoosh straight from `native dev` or
+`native build` produces a bare binary that macOS gives no Dock identity, so neither door exists
+there — every other way in works normally.
+
+**Installing a new build resets macOS's folder permissions.** Smoosh is ad-hoc signed, and macOS
+identifies an ad-hoc app by a hash of its contents, so every build is a different app as far as
+privacy is concerned. After replacing `/Applications/Smoosh.app` the first save into a protected
+folder — Desktop, Documents, Downloads — asks again. If it is instead refused with no prompt at all,
+macOS is holding a permission record for the app you replaced; clear it and relaunch:
+
+```sh
+tccutil reset SystemPolicyDesktopFolder dev.native_sdk.smoosh
+```
+
+A Developer ID signature would end this, since it gives the app a stable identity across builds.
 
 ## How it's built
 
@@ -141,6 +164,7 @@ src/encoders.zig    the encoder seam, over the C shim in src/encode.c
 src/chroma.zig      the source-container chroma table + JPEG SOF parser
 src/pasteboard.zig  the NSPasteboard seam behind Cmd+V
 src/workspace.zig   the NSWorkspace seam behind "Show in Finder"
+src/dockopen.zig    the app-delegate seam behind Dock drops and "Open With"
 third_party/        vendored encode-only static archives
 app.zon             identity, window, permissions, capabilities
 ```

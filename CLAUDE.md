@@ -147,6 +147,12 @@ that hides until the other artifact is built.
   rules. Backs `clipboard.paste`. Its header records why the SDK's own `readClipboardData` cannot
   serve this (its macOS mime map resolves text types ONLY, and caps at 64 KiB regardless) and why
   the pasted bytes never enter the process — `-[NSData writeToFile:atomically:]` does the copy.
+- `src/dockopen.zig` — the app-delegate seam, behind Dock-tile drops and Finder's "Open With".
+  `workspace.zig`/`pasteboard.zig`'s sibling and written to the same rules. Adds
+  `application:openURLs:` to the SDK's own `NativeSdkAppDelegate` with `class_addMethod` rather than
+  installing a delegate of ours; its header records why extending beats replacing, and why `install`
+  MUST be called before `runtime.run` (AppKit snapshots the delegate's methods at `setDelegate:`,
+  which the host does inside `runWithCallback:`).
 - `src/chroma.zig` — the source-container chroma table plus the hand-rolled JPEG SOF parser, which
   is how `avifenc --yuv auto`'s behaviour survives decoding everything to RGBA. Pure over bytes.
 - `src/encoders.zig` — the Zig-to-encoder seam, the mirror of `imageio.zig`. `encodeAvif`/
@@ -216,6 +222,15 @@ says how much you are over.
 - **No `fx.spawn` anywhere** — the app runs no subprocess.
 - Hot-reload on `.native` files (Debug builds, via `.markup.watch_path`)
 - `on_drop` (`UiApp.Options`, SDK 0.8.2+) for real window-wide file drops.
+- `UiApp.dispatch`, called BY HAND from an Objective-C delegate method — the one place a `Msg`
+  enters without a runtime event behind it. It is `pub` and documented for exactly this ("direct
+  callers — command handlers, embedders, tests"), and it already handles the pre-install case: a
+  launch-with-document request that beats the first frame applies to the model and the installing
+  rebuild renders it. See `src/dockopen.zig`.
+- `app.zon`'s `.file_associations` + the `file_associations` capability — the manifest half of the
+  Dock drop. The packager emits `CFBundleDocumentTypes` only; there is NO `LSItemContentTypes` path,
+  so `public.image` cannot be expressed and the extensions are enumerated by hand. `tests.zig` pins
+  that list against `unsupported_source_message` in both directions.
 - `on-hover-enter` / `on-hover-leave` (markup events, codes 11/12) for the hover-lit controls —
   see "Hover ink" below.
 - `RuntimeOptions.shortcuts` + `Options.on_command` for Cmd+V, and ONLY for Cmd+V. Every other key
@@ -331,4 +346,7 @@ composite over any ground — and a test pins the separation in both schemes on 
   else (button presses, chip selection, status/result assertions) drives fine with
   `native automate widget-click`.
 - **File drops cannot be automated at all** (a different constraint from dialogs, same practical
-  answer): have the user drag a real file onto the window by hand.
+  answer): have the user drag a real file onto the window by hand. The same goes for a DOCK-TILE
+  drop, which adds a second obstacle: it exists only in the packaged, LaunchServices-registered
+  `.app`, so `native dev` and `native build` cannot show it at all. Verifying it is
+  `native package` → install to `/Applications` → the user drags by hand.

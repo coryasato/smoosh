@@ -1298,6 +1298,56 @@ test "a writable source folder keeps writing beside the source" {
     try testing.expect(h.model().canReveal());
 }
 
+test "a screenshot dragged off the floating thumbnail is rescued even though its folder takes a write" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // The regression this pins: the staging directory is the user's own
+    // temp dir and answers the probe WRITABLE, because at load time it
+    // genuinely is. It stops existing seconds later, long before the user
+    // presses Smoosh — so believing the probe writes the output into a
+    // directory that is already gone.
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_screencaptureui_x/Screenshot 2026-09-08 at 10.14.02.png";
+    try h.drop(staged);
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/Screenshot 2026-09-08 at 10.14.02.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+    // WRITABLE, unlike the read-only test below - that is the whole point.
+    try h.destinationOk();
+
+    try testing.expectEqual(main.Destination.desktop, h.model().destination);
+    try testing.expectEqualStrings("/Users/someone/Desktop", h.model().destDir());
+
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+    try testing.expectEqualStrings(
+        "/Users/someone/Desktop/Screenshot 2026-09-08 at 10.14.02.avif",
+        try h.encodeDest(.avif),
+    );
+    try h.encodeOk(.avif, "102400");
+    try testing.expectEqualStrings("Saved to Desktop.", h.model().statusLine());
+}
+
+test "an ephemeral NON-screenshot whose folder takes a write still falls to ask" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    // The other half of the ephemeral rule. A drag promise out of some
+    // other app stages into a doomed directory too, but nothing licenses
+    // guessing the Desktop for it — that courtesy is the screenshot's
+    // alone, because macOS was about to put it there anyway.
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_someapp_x/diagram.png";
+    try h.drop(staged);
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/diagram.png");
+    try h.stat("184320");
+    try h.probe(1200, 900);
+    try h.thumbnail(140, 105);
+    try h.destinationOk();
+
+    try testing.expectEqual(main.Destination.ask, h.model().destination);
+}
+
 test "a screenshot in a read-only folder is rescued to the Desktop, and says so" {
     var h = try Harness.create();
     defer h.destroy();
@@ -2367,7 +2417,6 @@ test "a paste in flight at reset is cancelled outright, not merely ignored" {
     try testing.expectEqual(Status.idle, h.model().status);
     try testing.expect(!h.model().hasFile());
 }
-
 
 test "onKey: Enter smooshes, 1/2/3 pick the format, everything else is ignored" {
     const K = struct {
@@ -4482,6 +4531,114 @@ test "app.zon and AppInfo agree on every identity field" {
             );
             return error.ManifestDisagreesWithAppInfo;
         }
+    }
+}
+
+// ------------------------------------ app.zon file associations
+//
+// Dock-tile drops and "Open With" are gated by LaunchServices, which
+// reads `CFBundleDocumentTypes` out of the packaged Info.plist and
+// nothing else. The SDK's packager builds that from `app.zon`'s
+// `.file_associations` extension list, and has no `LSItemContentTypes`
+// path — so "any image" is not expressible and the types are enumerated
+// by hand. An enumerated list drifts.
+//
+// The drift that MATTERS is one-directional: the app tells the user
+// which formats it takes (`unsupported_source_message`), and a format
+// named there but missing from the list is a file the Dock tile refuses
+// for no reason the user can see. The reverse is fine — the probe reads
+// more than the message advertises, so declaring extras costs nothing.
+
+/// The extensions inside `.extensions = .{ ... }` in an `app.zon` source.
+/// Same rationale as `zonField`: the block is ours and flat, and the
+/// alternative is a ZON parser for one array of string literals.
+fn zonExtensions(source: []const u8, out: [][]const u8) []const []const u8 {
+    const at = std.mem.indexOf(u8, source, ".extensions = .{") orelse return out[0..0];
+    const start = at + ".extensions = .{".len;
+    const end = std.mem.indexOfScalarPos(u8, source, start, '}') orelse return out[0..0];
+    var count: usize = 0;
+    var cursor = start;
+    while (std.mem.indexOfScalarPos(u8, source[0..end], cursor, '"')) |open_quote| {
+        const close_quote = std.mem.indexOfScalarPos(u8, source[0..end], open_quote + 1, '"') orelse break;
+        if (count == out.len) break;
+        out[count] = source[open_quote + 1 .. close_quote];
+        count += 1;
+        cursor = close_quote + 1;
+    }
+    return out[0..count];
+}
+
+test "app.zon declares an extension for every format the app promises" {
+    const manifest = @embedFile("app.zon");
+
+    var extension_buf: [32][]const u8 = undefined;
+    const declared = zonExtensions(manifest, &extension_buf);
+    if (declared.len == 0) return error.NoFileAssociationExtensions;
+
+    // Every format `unsupported_source_message` names, and the
+    // extensions LaunchServices needs to see for it. A format with two
+    // spellings needs BOTH declared — a tile that takes `.jpg` and
+    // refuses `.jpeg` is the exact bug this catches.
+    const promises = [_]struct { format: []const u8, extensions: []const []const u8 }{
+        .{ .format = "JPEG", .extensions = &.{ "jpg", "jpeg" } },
+        .{ .format = "PNG", .extensions = &.{"png"} },
+        .{ .format = "HEIC", .extensions = &.{"heic"} },
+        .{ .format = "WebP", .extensions = &.{"webp"} },
+        .{ .format = "AVIF", .extensions = &.{"avif"} },
+        .{ .format = "TIFF", .extensions = &.{ "tif", "tiff" } },
+        .{ .format = "GIF", .extensions = &.{"gif"} },
+    };
+
+    for (promises) |promise| {
+        // The table is only meaningful while the message still makes the
+        // promise. Adding a format to the message without adding it here
+        // would otherwise pass silently.
+        if (std.mem.indexOf(u8, main.unsupported_source_message, promise.format) == null) {
+            std.debug.print(
+                "this table claims the app promises {s}, but unsupported_source_message no longer names it\n",
+                .{promise.format},
+            );
+            return error.PromiseTableStale;
+        }
+        for (promise.extensions) |extension| {
+            var found = false;
+            for (declared) |candidate| {
+                if (std.mem.eql(u8, candidate, extension)) found = true;
+            }
+            if (!found) {
+                std.debug.print(
+                    "app.zon .file_associations has no \"{s}\" but the app promises {s} - the Dock tile will refuse it\n",
+                    .{ extension, promise.format },
+                );
+                return error.PromisedFormatNotAssociated;
+            }
+        }
+    }
+}
+
+test "every format named in the failure message has a row in the promise table" {
+    // The other direction of the same drift, and the one a reader is
+    // likelier to cause: widening the message is a one-word edit, and
+    // without this the new format would never reach `app.zon`.
+    const named = [_][]const u8{ "JPEG", "PNG", "HEIC", "WebP", "AVIF", "TIFF", "GIF" };
+    var covered: usize = 0;
+    for (named) |format| {
+        if (std.mem.indexOf(u8, main.unsupported_source_message, format) != null) covered += 1;
+    }
+
+    // Count the formats the message actually names by counting its
+    // separators: "A, B, C ... or Z" - commas plus the one "or".
+    var commas: usize = 0;
+    for (main.unsupported_source_message) |byte| {
+        if (byte == ',') commas += 1;
+    }
+    const named_in_message = commas + 2;
+    if (named_in_message != covered) {
+        std.debug.print(
+            "unsupported_source_message names {d} formats but only {d} are in the association test's table\n",
+            .{ named_in_message, covered },
+        );
+        return error.PromisedFormatUncovered;
     }
 }
 

@@ -3,6 +3,31 @@
 For the engineering record — the decisions still in force, and the measurements the encoder work was
 held to — see [PLAN.md](PLAN.md) and [docs/phase-b-baseline.md](docs/phase-b-baseline.md).
 
+## v0.7 — 2026-09-11
+
+Drop onto the Dock icon. Smoosh can be buried behind a browser and still take an image: drag a file
+onto its icon in the Dock and it comes forward with the picture already loaded.
+
+- **Drag an image onto the Smoosh icon in the Dock** — from Finder, from the Desktop, from a
+  screenshot sitting where macOS left it. The tile highlights when it will take the file, and the
+  run from there is identical to dragging onto the window: preview, size, Smoosh.
+- **"Open With → Smoosh"** now appears on images in Finder, which is the same door by another
+  handle. Smoosh never becomes the default app for any format — it only offers itself.
+- **Dragging several images at once takes the first** and ignores the rest. Smoosh works on one
+  image at a time everywhere else, and this is no different.
+- Dragging a picture straight out of a web page onto the Dock icon does not work, and cannot: the
+  Dock only accepts real files. Use Cmd+V for that — copy the image and paste it into the window.
+
+This needs the packaged app. A Smoosh run straight from a build has no Dock identity for macOS to
+attach any of this to.
+
+**Fixed: a screenshot dragged off its floating thumbnail could fail to save.** It depended on how
+long you took to press Smoosh. macOS stages that screenshot in a temporary folder and clears that
+folder away a few seconds later; Smoosh copied the picture out in time but still aimed its output at
+the folder, so a quick press landed and an unhurried one failed with a folder-permissions message
+that had nothing to do with permissions. Those screenshots now go to the Desktop, where macOS was
+about to file the original anyway, and the status line says so.
+
 ## v0.6 — 2026-09-10
 
 Paste. Copy an image anywhere on your Mac — a screenshot taken with Cmd-Ctrl-Shift-4, "Copy Image"
