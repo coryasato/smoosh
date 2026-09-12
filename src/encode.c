@@ -47,7 +47,7 @@ void smoosh_encode_free(uint8_t *p) {
 // `encoder->quality = 58` / `encoder->speed = 6` literally, since we vendor
 // the same libaom avifenc links.
 int smoosh_encode_avif(const uint8_t *rgba, int w, int h,
-                       int yuv_format, int quality, int speed,
+                       int yuv_format, int quality, int speed, int max_threads,
                        uint8_t **out, size_t *out_len) {
     if (w <= 0 || h <= 0) return 1;
 
@@ -82,12 +82,16 @@ int smoosh_encode_avif(const uint8_t *rgba, int w, int h,
     encoder->quality = quality;
     encoder->qualityAlpha = quality;
     encoder->speed = speed;
-    // Single-threaded on purpose: libaom's rate control carries FP math and
-    // the parity gate compares byte sizes against the recorded baseline
-    // (`docs/phase-b-baseline.md`). Determinism beat the few ms a second
-    // thread would save while parity was being established; PLAN.md's
-    // roadmap lists revisiting this now that parity is banked.
-    encoder->maxThreads = 1;
+    // `encoders.encodeThreads()` decides the count; this shim only carries
+    // it. What makes that safe is measured, not assumed: the encoded bytes
+    // are IDENTICAL for every count >= 2 and differ only at exactly 1
+    // (`docs/phase-b-baseline.md`, "Round 2"). So a machine-derived count
+    // cannot make the output machine-dependent -- but a count that could
+    // fall back to 1 WOULD, which is why `encodeThreads` floors at 2.
+    //
+    // `autoTiling` stays off (libavif's default). Tiles are the other
+    // thread knob and they DO change the bytes; threads alone do not.
+    encoder->maxThreads = max_threads;
 
     if (avifEncoderWrite(encoder, image, &output) != AVIF_RESULT_OK) goto done;
     rc = copy_out(output.data, output.size, out, out_len);

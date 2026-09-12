@@ -159,9 +159,11 @@ that hides until the other artifact is built.
   `encodeWebp` plus the three version probes that pin the archive versions. Unlike `imageio.zig` it
   does NOT hand-roll the C ABI — the libavif/libwebp encode APIs are struct-heavy, so
   `src/encode.c` does the struct work and exposes a flat scalar ABI this file declares in three
-  lines.
-- `src/encode.c` — that shim. The only C in the tree. Reproduces `avifenc -q 58 --speed 6` /
-  `cwebp -q 80` through the C APIs; tags sRGB explicitly since the decode drops the ICC profile.
+  lines. It also owns the ONE encoder setting that is not a pinned constant — `encodeThreads`,
+  derived from the host's core count; see "The thread count is safe to vary" below.
+- `src/encode.c` — that shim. The only C in the tree. Reproduces
+  `avifenc -q 58 --speed 6 --jobs N` / `cwebp -q 80` through the C APIs; tags sRGB explicitly since
+  the decode drops the ICC profile.
 - `src/tests.zig` — unit tests, pulled in by a `test {}` block at the bottom of `main.zig`.
 - `src/imageio_tests.zig` — the ImageIO seam's own tests, likewise imported by `main.zig`'s `test`
   block. Its fixtures are PNGs embedded as byte literals, because `test-images/` is gitignored; the
@@ -335,6 +337,27 @@ composite over any ground — and a test pins the separation in both schemes on 
   message; "do not simplify JPEG to 4:2:0"). Don't write, and cut on sight: historical narration
   ("this used to be X", "the `sips -g` hop this replaces"), milestone archaeology, and anything
   restating what the code plainly says.
+
+## The thread count is safe to vary; the tile count would not be
+`avifEncoder.maxThreads` is the only encoder setting derived from the machine rather than pinned,
+and the reason that does not perturb `docs/phase-b-baseline.md` is a MEASUREMENT, not a principle:
+libaom's output is **byte-identical at every thread count from 2 to 16** and differs only at
+exactly **1** (Round 2 in that file — by hash, over the whole fixture set). So the bytes are a
+function of *threaded or not*, never of *how many*, and a 4-core Mac and a 16-core Mac emit the
+same file.
+
+Two things follow, and both are load-bearing:
+
+- **`encoders.min_avif_threads` floors the count at 2**, and a test pins that. A count that could
+  reach 1 would make one class of machine silently emit an output no other machine does, off the
+  baseline. The floor is the whole guard.
+- **`autoTiling` stays off.** Tiles are the other threading knob and they DO change the bytes.
+  Turning it on is a parity re-measure, not a tuning tweak.
+
+Do not "simplify" the derived count back to a constant, and do not re-propose
+`drawToRgba8`'s `@memset` or `copy_out`'s memcpy as optimizations: both were measured (0.04% and
+below-noise respectively against a 1800 ms encode) and deliberately kept. PLAN.md §1 records the
+verdicts so they are not rediscovered.
 
 ## Two standing rules about automation
 - **Never send a global keystroke** — a native file dialog (open or save panel) above all, and

@@ -73,6 +73,41 @@ pub const avif_quality: c_int = 58;
 pub const avif_speed: c_int = 6;
 pub const webp_quality: c_int = 80;
 
+/// The floor `encodeThreads` clamps to, and the reason it exists.
+///
+/// libaom emits DIFFERENT bytes at exactly one thread than it does at two
+/// or more, and identical bytes at every count from 2 upward — measured
+/// over the whole fixture set, by hash and not merely by size
+/// (`docs/phase-b-baseline.md`, "Round 2"). So the output is a function of
+/// "threaded or not", not of "how many". Flooring at 2 is what keeps a
+/// machine-derived count from making the encode machine-dependent: a
+/// single-core host must still take the threaded path, or it alone would
+/// produce bytes nothing else does.
+pub const min_avif_threads: c_int = 2;
+
+/// How many threads libaom may use for one AVIF encode.
+///
+/// Half the logical cores, floored at `min_avif_threads`. Two things pick
+/// that shape, both measured on a 4P+4E M1 (`docs/phase-b-baseline.md`,
+/// "Round 2"):
+///
+///   - **Half, not all.** The two formats of a "Both" run are two
+///     concurrent workers, and WebP's encode is single-threaded with no
+///     knob to change that. Handing AVIF every core makes AVIF finish
+///     sooner and the RUN finish later, because it starves the WebP worker
+///     — 4 threads gave a 754 ms wall against 809 ms at 8. Half the cores
+///     is the measured optimum here and lands on the performance-core
+///     count on every Apple Silicon part.
+///   - **Cores, not a constant.** 4 is only optimal for this machine.
+///
+/// Safe to vary per machine ONLY because of the byte-identity above; read
+/// `min_avif_threads` before changing the clamp.
+pub fn encodeThreads() c_int {
+    const cpus = std.Thread.getCpuCount() catch return min_avif_threads;
+    const half: c_int = @intCast(cpus / 2);
+    return @max(min_avif_threads, half);
+}
+
 pub const Error = error{
     /// libavif (or the RGB->YUV conversion feeding it) rejected the frame.
     AvifEncodeFailed,
@@ -91,6 +126,7 @@ extern fn smoosh_encode_avif(
     yuv_format: c_int,
     quality: c_int,
     speed: c_int,
+    max_threads: c_int,
     out: *?[*]u8,
     out_len: *usize,
 ) c_int;
@@ -117,7 +153,9 @@ pub const Encoded = struct {
 };
 
 /// Encode `pixels` (straight-alpha 8-bit RGBA, `width * height * 4` bytes,
-/// top-down) as AVIF, reproducing `avifenc -q 58 --speed 6`. `subsampling`
+/// top-down) as AVIF, reproducing `avifenc -q 58 --speed 6 --jobs N` --
+/// see `encodeThreads` for the N and for why it does not perturb the
+/// recorded baseline. `subsampling`
 /// is what `chroma.forSource` decided the source container would have
 /// yielded — the one `avifenc --yuv auto` behaviour decoding to RGBA
 /// destroys.
@@ -137,6 +175,7 @@ pub fn encodeAvif(
         @intFromEnum(subsampling),
         avif_quality,
         avif_speed,
+        encodeThreads(),
         &out,
         &out_len,
     );

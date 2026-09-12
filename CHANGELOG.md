@@ -3,6 +3,19 @@
 For the engineering record — the decisions still in force, and the measurements the encoder work was
 held to — see [PLAN.md](PLAN.md) and [docs/phase-b-baseline.md](docs/phase-b-baseline.md).
 
+## v0.8 — 2026-09-12
+
+Faster. A 12-megapixel photo — an ordinary phone picture — used to take about two seconds to come
+out as AVIF. It now takes about three-quarters of a second, for a byte-for-byte identical file.
+
+- **AVIF encoding uses several of your Mac's cores instead of one.** Nothing about the picture
+  changes: the file Smoosh writes is identical to the one it wrote before, down to the byte. It
+  just arrives sooner. The gain is largest on big photos and on "Both", where it is roughly 2.4x.
+- **Small images were always fast and still are** — this is not something you will notice on an
+  icon or a screenshot of a dialog box.
+
+Smoosh never froze while it worked, so this does not fix a hang. It shortens a wait.
+
 ## v0.7 — 2026-09-11
 
 Drop onto the Dock icon. Smoosh can be buried behind a browser and still take an image: drag a file

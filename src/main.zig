@@ -59,7 +59,7 @@ const main_window_id: platform.WindowId = 1;
 /// read, and they sat two releases apart (0.1.0 against 0.3.0) without a
 /// single warning. `tests.zig` now parses `app.zon` and fails naming the
 /// field that drifted — bump one and the other is not optional.
-pub const app_version = "0.7.0";
+pub const app_version = "0.8.0";
 pub const app_name = "smoosh";
 pub const app_display_name = "Smoosh";
 pub const app_bundle_id = "dev.native_sdk.smoosh";

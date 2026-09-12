@@ -4030,6 +4030,32 @@ test "libaom links, at the version the baseline was measured against" {
     try testing.expectEqualStrings(encoders.pinned.libaom, encoders.libaomVersion());
 }
 
+// The AVIF thread policy. `encodeThreads` is allowed to vary with the host
+// — that is the whole point of it — so what these pin is the property that
+// makes varying SAFE, not the number itself.
+//
+// libaom's bytes differ at exactly one thread and are identical at every
+// count from 2 up (`docs/phase-b-baseline.md`, "Round 2"). A count that
+// could reach 1 would therefore make one class of machine emit an output
+// no other machine does, silently, and off the parity baseline. The floor
+// is the guard, and it is the assertion worth having.
+
+test "the AVIF thread count never falls to the one value that changes the bytes" {
+    try testing.expect(encoders.encodeThreads() >= encoders.min_avif_threads);
+    try testing.expect(encoders.min_avif_threads >= 2);
+}
+
+test "the AVIF thread count leaves room for the WebP worker beside it" {
+    // Half the cores, not all of them: WebP's encode is single-threaded
+    // with no knob, and starving it makes the Both-mode WALL time worse
+    // even as AVIF's own time improves (754 ms at 4 threads against 809 ms
+    // at 8, on a 4P+4E M1). Below a 4-core host the floor takes over and
+    // this has nothing left to say.
+    const cpus = std.Thread.getCpuCount() catch return;
+    if (cpus < 2 * @as(usize, @intCast(encoders.min_avif_threads))) return;
+    try testing.expect(encoders.encodeThreads() <= @as(c_int, @intCast(cpus - 1)));
+}
+
 /// A small opaque RGBA gradient — enough to exercise the RGB->YUV path and
 /// the container muxer without depending on a gitignored fixture.
 fn rgbaGradient(buffer: []u8, width: u32, height: u32) []u8 {

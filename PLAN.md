@@ -10,7 +10,7 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 web formats (AVIF and/or WebP) without leaving your desktop.
 
 ## Status
-**v0.6 — feature-complete and zero-dependency.** Pick, drop or paste an image, choose AVIF/WebP/Both,
+**v0.8 — feature-complete and zero-dependency.** Pick, drop or paste an image, choose AVIF/WebP/Both,
 Smoosh writes the outputs itself and says where they went; each landed result row carries its own
 save icon to copy that one file elsewhere. Ships as an ad-hoc-signed `.app`.
 
@@ -26,9 +26,9 @@ libavif/libaom/libwebp write (`src/encoders.zig` over `src/encode.c`), and the e
 worker thread so the window keeps painting. **The app spawns no subprocess and needs nothing
 installed.**
 
-What is left is the standalone-app gaps — arm64-only, notarization, launch time — plus a
-performance pass nobody has measured yet. Both are Roadmap tracks; the deferred-features list is
-empty. One item remains undecided rather than unbuilt: a CLI.
+What is left is the standalone-app gaps — arm64-only, notarization, launch time. That is one
+Roadmap track; the deferred-features list is empty and the performance pass is done bar one
+size-vs-speed decision. One item remains undecided rather than unbuilt: a CLI.
 
 ## Product behavior
 
@@ -232,7 +232,8 @@ and `native check` are necessary and never sufficient.
   file. The cost is **peak memory, not latency**: two full-resolution RGBA buffers live at once, up
   to ~400 MB at the 50 MP guard. The two decodes run concurrently on separate threads. Sharing one
   decode would mean a refcounted buffer outliving both slots — real complexity for a memory win
-  only, so this is a deliberate trade.
+  only, so this is a deliberate trade. Measured since (`docs/phase-b-baseline.md`, "Round 2"): a
+  decode is 3-8% of a run, so the "not latency" half is a number now, not an expectation.
 - **arm64 only.** The vendored archives are non-fat arm64-macos; producing an x86_64 or universal
   build is unexplored. A genuine gap the moment the `.app` is handed to anyone else.
 - **Launch time has never been measured.**
@@ -253,28 +254,40 @@ about how much of the work is taste versus mechanism, not benchmarks.
 
 **§4 is empty of open work.** Every deferred feature has shipped; what remains under it is the one
 item marked "not decided" — the CLI — which is a decision still to be taken, not a task waiting to
-be picked up. The Dock-icon drop was the other, and shipped in v0.7. §1 and §3 are the live tracks.
+be picked up. The Dock-icon drop was the other, and shipped in v0.7. **§1 is down to one open
+decision** (the libaom rebuild) since v0.8 measured the rest, so **§3 is the live track.**
 
 ### 1. Performance
-**Measure before touching anything.** The app is already effectively instant on normal photos, and
-optimizing without a number is how the parity gate gets perturbed for nothing. Every change here
-must be re-checked against `docs/phase-b-baseline.md`.
+**Measured, and mostly done.** `docs/phase-b-baseline.md`'s "Round 2" carries the numbers and the
+method; this is what they settled.
 
-Ranked by payoff-to-risk:
-- **`drawToRgba8`'s `@memset(pixels, 0)`** — a full-buffer write, up to 200 MB, redundant because
-  our transforms always cover the whole destination. Cheapest real win, no parity risk.
-- **`encoder->maxThreads = 1`** — the single biggest wall-clock lever on large photos. Set for
-  determinism while parity was being established; parity is banked now, so this is re-measurable as
-  a decision rather than a constraint.
-- **libaom rebuilt `-Os` instead of `-O3`** — Homebrew's is 5.4 MB against our 8.1 MB, so this
-  meaningfully cuts the 10.94 MB binary. Needs a full parity re-measure: libaom's rate control
-  carries FP math and optimization level can change contraction.
-- **`copy_out`'s extra malloc+memcpy** of the whole encoded buffer in `src/encode.c` — tidy, low
-  payoff, zero risk.
-- **The Both-mode double decode** — see "Known limitations". Memory, not latency.
+**The ranking this section used to carry was inverted.** Four of its five items were guesses from
+reading the code, and the profile disagreed with all four: the item flagged as needing the most
+care was the only one that paid, and the two ranked cheapest are unmeasurable. Kept here as the
+reason not to re-propose them.
 
-*Suggested: **Opus 5, medium** for the measuring and the first two items; **high** if touching
-encoder settings or rebuilding an archive, where the parity judgment is the whole task.*
+- **`encoder->maxThreads = 1` — shipped in v0.8, and it was the whole task.** 2.4x on the wall
+  clock of a "Both" run (1838 ms -> 754 ms on a 12 MP photo). The determinism the setting was
+  protecting turned out not to need it: libaom's bytes are **identical at every thread count from
+  2 to 16** and differ only at exactly 1, so `encoders.encodeThreads` derives the count from the
+  host and `min_avif_threads` floors it at 2. Half the logical cores, because WebP's encode is
+  single-threaded and handing AVIF every core makes AVIF finish sooner and the RUN finish later.
+- **`drawToRgba8`'s `@memset(pixels, 0)` — measured, kept, do not re-propose.** 0.72 ms on a 48 MB
+  buffer, inside a 1800 ms encode: **0.04%**. It is worth more where it is, as the guarantee that
+  the buffer is defined if a draw ever fails to cover the destination, than the 0.04% is worth.
+- **`copy_out`'s extra malloc+memcpy — measured, kept, do not re-propose.** Below noise (1800 ms
+  against 1811 ms, and the two orderings swap between runs).
+- **The Both-mode double decode** — unchanged, and the numbers back the original call: decode is
+  3-8% of a run. Memory, not latency. See "Known limitations".
+
+**Still open, and it now pulls against the item above.** **libaom rebuilt `-Os` instead of `-O3`**:
+`libaom.a` is 7.7 MB of the 10.49 MB binary, so the size prize is real, but `-Os` trades speed for
+bytes on the path that just turned out to be the entire latency budget. A size-vs-speed decision to
+take against Round 2's numbers, not the pre-threading ones — and unlike the rest of this section it
+needs a full parity re-measure, since optimization level can change libaom's FP contraction.
+
+*Suggested: **Opus 5, high** if the libaom rebuild is picked up — the parity judgment is the whole
+task. Nothing else here is open.*
 
 ### 2. UI and style polish
 **Shipped as v1 of the UI.** The canvas is the ORIGIN of this design, no longer a description of

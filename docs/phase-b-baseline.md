@@ -494,3 +494,84 @@ fixtures (`ui.png`/`ui.jpg`, the class that justified vendoring libaom), graysca
 Display-P3 conversions and the orientation-tagged sources. The four WebP/AVIF sources that
 produced **fail** under Phase A now encode (`photo.webp`/`large.webp` shown; `.avif` sources
 likewise), which is the capability gain PLAN.md's "Known limitations" promised.
+
+# Round 2 (2026-09-12) — the AVIF thread count, and what the parity gate actually constrains
+
+Recorded on macOS 26.6 / Apple Silicon **M1 (4 performance + 4 efficiency cores)**, against the
+same vendored archives every round above used (libavif 1.4.2, `aom [enc]:3.14.1`, libwebp 1.6.0).
+This round changed **one setting** — `avifEncoder.maxThreads`, which had been pinned to 1 — and
+exists to record the measurement that made the change safe.
+
+Measured by a throwaway harness that linked the tree's own `third_party/*.a`, `src/encode.c` and
+`src/imageio.zig` and replayed the real `decode -> encode` path. It is NOT in the repo: the finding
+below is a property of libaom, and re-deriving it would need a rebuilt harness anyway once the
+archives change. The invocation it replays is `avifenc -q 58 --speed 6 --jobs N`.
+
+## The finding: thread count does not change the bytes — except at exactly 1
+
+Encoded output, `size/hash` (Wyhash, low 24 bits), across the fixture set:
+
+| Fixture | `maxThreads = 1` | `maxThreads = 2, 3, 4, 5, 6, 8, 16` |
+|---|---|---|
+| `large.jpg` | 712234 / `c846d0` | **711400 / `6dd415`** |
+| `photo-420.jpg` | 615065 / `42dfa1` | **613532 / `d65438`** |
+| `photo.heic` | 654656 / `903dc` | **654001 / `5bfad`** |
+| `iphone-rotated-p3.heic` | 601990 / `680d31` | **602033 / `6846c1`** |
+| `rotated-gps.jpg` | 714337 / `cdec63` | **713774 / `123482`** |
+| `gray.jpg` | 520683 / `6d2d99` | **520430 / `89117c`** |
+| `ui.png` | 8398 / `8742f6` | **8375 / `a866e4`** |
+| `alpha16.png` | 2232 / `c3d015` | **2236 / `ade012`** |
+
+Every count from 2 to 16 is **byte-identical** — the same hash, not merely the same size. Only 1
+differs, and by -0.27% to +0.18%, against a ±15% gate: roughly 50x inside it. The `maxThreads = 1`
+column is what every round above this one recorded, so those numbers remain the baseline and are
+not invalidated.
+
+**The consequence is the whole point.** The output is a function of *threaded or not*, not of *how
+many threads*, so a count derived from the host's core count cannot make the encode
+machine-dependent — a 4-core Mac and a 16-core Mac emit the same file. A count that could fall back
+to **1** would break that, which is why `encoders.min_avif_threads` floors at 2 and a test pins it.
+
+This holds only with `autoTiling` off (libavif's default, and what `src/encode.c` states
+explicitly). Tiles are the other threading knob and they *do* change the bytes.
+
+## Why half the cores, and not all of them
+
+A "Both" run is two concurrent workers, and WebP's encode is single-threaded with no knob to change
+that. Wall time for both formats together, `large.jpg` (4000x3000), best of 3:
+
+| `maxThreads` | wall | AVIF | WebP |
+|---|---|---|---|
+| 1 | 1838 ms | 1838 ms | 692 ms |
+| 2 | 1032 ms | 1032 ms | 709 ms |
+| 3 | 758 ms | 758 ms | 709 ms |
+| **4** | **754 ms** | 679 ms | 754 ms |
+| 6 | 787 ms | 589 ms | 787 ms |
+| 8 | 809 ms | 556 ms | 809 ms |
+
+Past 4 threads AVIF keeps getting faster and **the run gets slower** — the AVIF worker starves the
+WebP one, and WebP becomes the long pole. Half the logical cores is the optimum here and lands on
+the performance-core count on every Apple Silicon part; `encoders.encodeThreads` states it.
+
+`photo.heic` and `iphone-rotated-p3.heic` show the same shape with the optimum at 3-4.
+
+## The three items this round retired
+
+The roadmap ranked five performance items. Measured, the ranking was inverted — the one flagged as
+needing the most care was the only one that paid, and the two ranked cheapest are unmeasurable.
+`large.jpg`, best of 5, for scale against the 1800 ms single-threaded AVIF encode:
+
+| Item | Cost | Verdict |
+|---|---|---|
+| `drawToRgba8`'s `@memset(pixels, 0)` | **0.72 ms** on a 48 MB buffer | **0.04%** of the encode. Kept — it is worth more as the guarantee that the buffer is defined if a draw ever fails to cover it. |
+| `copy_out`'s malloc+memcpy | **below noise** (1800 vs 1811 ms, unordered) | Kept. |
+| `unpremultiply` (not on the list; for scale) | 5.3 ms | — |
+| decode, JPEG / HEIC | 54 ms / 112-148 ms | 3-8% of a run. The Both-mode double decode remains a memory trade, not a latency one. |
+
+## Still open: libaom rebuilt `-Os`
+
+`libaom.a` is 7.7 MB of the 10.49 MB binary, so the size prize is real — but `-Os` on the hot
+encoder trades speed for bytes on the path this round just established as the entire latency
+budget. **These two items pull against each other and should be decided together**, against these
+numbers rather than the pre-threading ones. Unlike this round it needs a full parity re-measure:
+optimization level can change libaom's floating-point contraction.
