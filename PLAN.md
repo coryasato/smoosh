@@ -26,9 +26,9 @@ libavif/libaom/libwebp write (`src/encoders.zig` over `src/encode.c`), and the e
 worker thread so the window keeps painting. **The app spawns no subprocess and needs nothing
 installed.**
 
-What is left is the standalone-app gaps — arm64-only, notarization, launch time. That is one
-Roadmap track; the deferred-features list is empty and the performance pass is done bar one
-size-vs-speed decision. One item remains undecided rather than unbuilt: a CLI.
+What is left is the standalone-app gaps — arm64-only, notarization, launch time. That is the one
+live Roadmap track; the deferred-features list is empty and the performance pass closed in v0.8.
+One item remains undecided rather than unbuilt: a CLI.
 
 ## Product behavior
 
@@ -254,12 +254,15 @@ about how much of the work is taste versus mechanism, not benchmarks.
 
 **§4 is empty of open work.** Every deferred feature has shipped; what remains under it is the one
 item marked "not decided" — the CLI — which is a decision still to be taken, not a task waiting to
-be picked up. The Dock-icon drop was the other, and shipped in v0.7. **§1 is down to one open
-decision** (the libaom rebuild) since v0.8 measured the rest, so **§3 is the live track.**
+be picked up. The Dock-icon drop was the other, and shipped in v0.7. **§1 closed in v0.8** — every
+item measured, one shipped and the rest declined on the numbers — so **§3 is the only live
+track.**
 
 ### 1. Performance
-**Measured, and mostly done.** `docs/phase-b-baseline.md`'s "Round 2" carries the numbers and the
-method; this is what they settled.
+**Closed — this track has no open work.** `docs/phase-b-baseline.md`'s "Round 2" carries the
+numbers and the method; this is what they settled. Every item below is either shipped or measured
+and deliberately declined, and the verdicts are recorded so they are not rediscovered as fresh
+ideas.
 
 **The ranking this section used to carry was inverted.** Four of its five items were guesses from
 reading the code, and the profile disagreed with all four: the item flagged as needing the most
@@ -280,14 +283,21 @@ reason not to re-propose them.
 - **The Both-mode double decode** — unchanged, and the numbers back the original call: decode is
   3-8% of a run. Memory, not latency. See "Known limitations".
 
-**Still open, and it now pulls against the item above.** **libaom rebuilt `-Os` instead of `-O3`**:
-`libaom.a` is 7.7 MB of the 10.49 MB binary, so the size prize is real, but `-Os` trades speed for
-bytes on the path that just turned out to be the entire latency budget. A size-vs-speed decision to
-take against Round 2's numbers, not the pre-threading ones — and unlike the rest of this section it
-needs a full parity re-measure, since optimization level can change libaom's FP contraction.
+- **libaom rebuilt `-Os` instead of `-O3` — considered and DECLINED (2026-09-12).** `libaom.a` is
+  7.7 MB of the 10.49 MB binary, so the ~2.5 MB prize was real, and this is the one item on the
+  list that was never measured. It was declined on three grounds, in order of weight: it trades
+  speed for bytes on the path Round 2 had just established as the app's entire latency budget; the
+  binary is built from source rather than downloaded, so its size costs a user nothing at install
+  time; and it is the most expensive task left in the repo, because optimization level can change
+  libaom's FP contraction and the whole parity gate would have to be re-measured to find out. The
+  Homebrew comparison that motivated it (5.4 MB against our 8.1 MB) was never like-for-like —
+  different build config, and a dynamic library against a static archive.
 
-*Suggested: **Opus 5, high** if the libaom rebuild is picked up — the parity judgment is the whole
-task. Nothing else here is open.*
+  **Reopen it only if Smoosh starts being DISTRIBUTED as a download**, where binary size becomes
+  something a user pays for. Nothing else changes the arithmetic.
+
+*Nothing here is open. Read this section before proposing a performance change, not after — four of
+its five items are recorded refusals with numbers behind them.*
 
 ### 2. UI and style polish
 **Shipped as v1 of the UI.** The canvas is the ORIGIN of this design, no longer a description of

@@ -568,10 +568,15 @@ needing the most care was the only one that paid, and the two ranked cheapest ar
 | `unpremultiply` (not on the list; for scale) | 5.3 ms | — |
 | decode, JPEG / HEIC | 54 ms / 112-148 ms | 3-8% of a run. The Both-mode double decode remains a memory trade, not a latency one. |
 
-## Still open: libaom rebuilt `-Os`
+## libaom rebuilt `-Os` — the one item this round did NOT measure, and why it was declined
 
 `libaom.a` is 7.7 MB of the 10.49 MB binary, so the size prize is real — but `-Os` on the hot
 encoder trades speed for bytes on the path this round just established as the entire latency
-budget. **These two items pull against each other and should be decided together**, against these
-numbers rather than the pre-threading ones. Unlike this round it needs a full parity re-measure:
-optimization level can change libaom's floating-point contraction.
+budget. **These two items pull against each other.** Unlike everything else here it needs a full
+parity re-measure: optimization level can change libaom's floating-point contraction.
+
+**Declined the same day, unmeasured.** PLAN.md §1 records the reasoning and the one condition that
+would reopen it — Smoosh being distributed as a download, where binary size starts costing a user
+something. Stated here because this file is where a future reader will come looking for the
+measurement, and there is none to find: no `-Os` build was ever produced, so nothing in this
+document is a claim about one.
