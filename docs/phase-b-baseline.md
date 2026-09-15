@@ -575,7 +575,8 @@ encoder trades speed for bytes on the path this round just established as the en
 budget. **These two items pull against each other.** Unlike everything else here it needs a full
 parity re-measure: optimization level can change libaom's floating-point contraction.
 
-**Declined the same day, unmeasured.** PLAN.md §1 records the reasoning and the one condition that
+**Declined the same day, unmeasured.** PLAN.md's "Performance — measured and closed" records the
+reasoning and the one condition that
 would reopen it — Smoosh being distributed as a download, where binary size starts costing a user
 something. Stated here because this file is where a future reader will come looking for the
 measurement, and there is none to find: no `-Os` build was ever produced, so nothing in this

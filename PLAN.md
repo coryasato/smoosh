@@ -1,35 +1,110 @@
 # Smoosh — PLAN.md
 
-> Living plan: decisions still in force, requirements the code must keep satisfying, and what is
-> still open. This file and `docs/phase-b-baseline.md` are the engineering record between them —
-> `CHANGELOG.md` is written for users and carries no reasoning. Update this file as decisions are
-> made; add a user-facing line to the changelog as work ships.
+> **Living plan**: what is still open, the requirements the code must keep satisfying, and the
+> decisions still in force. Deliberately NOT a history — how and when something shipped lives in
+> `CHANGELOG.md` (for users) and in git; the encoder measurements live in
+> `docs/phase-b-baseline.md`; the traps you need before touching the code live in `CLAUDE.md`.
+> A line that records none of those three things does not belong here.
 
 ## Vision (one sentence)
 A beautiful, instant native macOS app that lets you drop an image and get back high-quality modern
 web formats (AVIF and/or WebP) without leaving your desktop.
 
 ## Status
-**v0.8 — feature-complete and zero-dependency.** Pick, drop or paste an image, choose AVIF/WebP/Both,
-Smoosh writes the outputs itself and says where they went; each landed result row carries its own
-save icon to copy that one file elsewhere. Ships as an ad-hoc-signed `.app`.
+**v0.8 — feature-complete, zero-dependency, and not distributed.** Pick, drop or paste an image,
+choose AVIF/WebP/Both, and Smoosh writes the outputs itself and says where they went; each landed
+result row carries its own save icon to copy that one file elsewhere. Ships as an ad-hoc-signed
+`.app`, arm64 only.
+
+The whole pipeline runs in-process: Apple ImageIO reads (`src/imageio.zig`), vendored static
+libavif/libaom/libwebp write (`src/encoders.zig` over `src/encode.c`), and each format encodes on
+its own worker thread — with libaom itself spread across several cores since v0.8 — so the window
+keeps painting. **The app spawns no subprocess and needs nothing installed.**
 
 **Where the outputs go is decided per file, before the run** — beside the source when that folder
 takes a write, the Desktop for a screenshot stranded somewhere read-only, and nowhere-but-Save-As
-otherwise (see `Destination` in `src/main.zig`). An ephemeral source is copied into the app cache
-first, so a screenshot dragged off its floating thumbnail survives macOS deleting it mid-run; the
-same split carries a paste of raw pixels, which has no source folder to sit beside and is filed to
-the Desktop under a timestamp.
+otherwise (see `Destination` in `src/main.zig`).
 
-The whole pipeline runs in-process: Apple ImageIO reads (`src/imageio.zig`), vendored static
-libavif/libaom/libwebp write (`src/encoders.zig` over `src/encode.c`), and the encode runs on a
-worker thread so the window keeps painting. **The app spawns no subprocess and needs nothing
-installed.**
+## What is open
+Two things, and neither is a task waiting to be picked up. **Everything else in this file is
+settled** — read it as constraint, not backlog.
 
-What is left is the standalone-app gaps — arm64-only, notarization, launch time. That is the one
-live Roadmap track; the deferred-features list is empty and the performance pass closed in v0.8.
-One item remains undecided rather than unbuilt: a CLI.
+1. **Distribution** — one decision with three costs attached. Nothing in it bites on the machine
+   that built the app, so none of it is worth doing until handing the `.app` to someone else is
+   actually the plan.
+2. **A CLI** — undecided on purpose, and deferred behind everything else.
 
+### Distribution — the gate, and what it costs
+**Treat this as ONE decision with three line items, not three loose ends: decide to distribute, and
+all of it comes due together.** That framing is deliberate: the same trigger governs the libaom
+`-Os` rebuild declined under "Performance — measured and closed" below. If distribution happens,
+reopen that too, because binary size starts costing a user something at download time.
+
+**What the app is today:** arm64-only, ad-hoc signed, not notarized. Verified 2026-09-12 — all four
+vendored archives and the binary report `arm64`; `codesign -dv` reports `Signature=adhoc`,
+`TeamIdentifier=not set`.
+
+**Ranked by size of the job.**
+
+- **arm64-only — the big one.** An Intel or Rosetta-less user cannot run it at all. The vendored
+  archives are non-fat, so this is a `third_party/` rebuild before it is a `build.zig` change:
+  every archive needs an x86_64 twin and a `lipo` pass, and `docs/phase-b-baseline.md`'s parity
+  gate would have to be re-measured on the second architecture.
+  → [Building a universal macOS binary][universal] · `third_party/README.md` carries the CMake
+  invocations that produced the current archives.
+- **Not notarized.** A copy that travels — AirDropped, emailed, downloaded — picks up a quarantine
+  flag and hits Gatekeeper's "unidentified developer" wall. Needs a paid Apple Developer identity.
+  The ad-hoc decision itself is under "Key decisions carried forward"; what is unexplored is the
+  work.
+  → [Notarizing macOS software before distribution][notarize] ·
+  [Customizing the notarization workflow][notary-workflow] (`xcrun notarytool`, then `stapler`) ·
+  `native package --signing` and the `native-sdk` skill for the packaging half.
+- **A Developer ID signature buys more than notarization does.** It also ends the TCC permission
+  churn — see CLAUDE.md, "Ad-hoc signing and the TCC trap", which is where that lives because it
+  is a debugging trap first and a distribution cost second. A local annoyance today; a support
+  burden the moment anyone else installs a second build. **One purchase settles this item and the
+  one above it.**
+
+**Launch time is measured and fine: ~300-400 ms warm** (ReleaseFast v0.8, exec to window on
+screen, three runs, ~50 ms polling granularity so read it as an upper bound). Cold-cache launch is
+unmeasured. Nothing here needs work; the item is retired rather than carried.
+
+*Suggested: **Opus 5, high** — but only once distribution is an actual decision. Read this whole
+section before starting: the three items are one purchase and one architecture sweep, and doing
+either without the other leaves the app still undistributable.*
+
+[universal]: https://developer.apple.com/documentation/apple-silicon/building-a-universal-macos-binary
+[notarize]: https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution
+[notary-workflow]: https://developer.apple.com/documentation/security/customizing-the-notarization-workflow
+
+### A Smoosh CLI — undecided, on purpose
+**LAST. Deferred behind everything above** — do not pick this up unless the owner asks for it by
+name.
+
+Not part of the desktop app and not on its roadmap: a second, tiny binary that shares the image
+core. `smoosh hello.jpg` writes `hello.avif` and `hello.webp` next to the source and exits.
+
+**Shape.**
+- Flags: `--avif`, `--webp` (both if neither is given), `--dest=<dir>` (default: beside the source).
+- `main` is: parse argv → for each requested format → `imageio.decode` → `encoders.encode{Avif,Webp}`
+  → atomic write. One Smoosh run per invocation; no batch progress, no watch mode, no config file.
+- Reuses `src/imageio.zig`, `src/encoders.zig`, `src/encode.c` UNCHANGED. They carry no Model / Msg
+  / Runtime dependency — `imageio.decode` already returns straight-alpha 8-bit sRGB callable off any
+  thread, and the encoders take that buffer directly. This is the dogfood: if the CLI cannot be
+  built cleanly on these seams, the seams are wrong.
+
+**Why it is its own session.** The cost is entirely in `build.zig`. A CLI is a third executable
+artifact that must replicate the exe's link wiring on its own module: compile `src/encode.c`
+exactly once (twice is a fatal `duplicate symbol`), link the vendored archives in order plus the
+mandatory libsharpyuv, and `addFrameworkPath` for ImageIO / CoreGraphics or the link fails with
+"searched paths: none". `build.zig`'s own comments flag every one of these as a trap that hides
+until the other artifact builds. Then argv parsing, exit codes, a smoke test, and a distribution
+decision (ship `smoosh` beside `Smoosh.app`; or a `--install` that symlinks it onto `PATH`).
+
+**What it unlocks.** `smoosh` + drag an image into the terminal — the quick path the app's window
+drop cannot be for a terminal user. And a Finder **Quick Action** becomes trivial: a `.workflow`
+bundle running `smoosh "$@"` on the selection, installed to `~/Library/Services/` or shipped inside
+the `.app`. The Quick Action has no independent design — it is this CLI with a Finder trigger.
 ## Product behavior
 
 ### Format selection
@@ -58,12 +133,13 @@ savings", since no client ever downloads both.
   about. Whoever presses Smoosh quickly never sees it. The two predicates have to move together:
   any source whose bytes were worth rescuing has a folder not worth writing to.
 - Cmd+V, via a registered `platform.Shortcut` and `Options.on_command` — a file URL on the
-  pasteboard loads like a pick, raw pixels are written into the cache and filed to the Desktop. See
-  "Clipboard paste" under Roadmap for why neither the SDK's clipboard seam nor `on_key` could carry
-  this.
+  pasteboard loads like a pick, raw pixels are written into the cache and filed to the Desktop.
+  CLAUDE.md's "Cmd+V is a THIRD seam" and `src/pasteboard.zig`'s header carry why neither the SDK's
+  clipboard seam nor `on_key` could serve this.
 - A drag onto the DOCK TILE, and Finder's "Open With", via an `application:openURLs:` method
   `src/dockopen.zig` adds to the SDK's own app delegate. Re-enters the load chain as
-  `.dropped_file`, the same Msg the window drop uses. See "Dock-icon / Finder drop" under Roadmap.
+  `.dropped_file`, the same Msg the window drop uses. See CLAUDE.md's "The Dock-tile drop: three
+  constraints, all load-bearing".
 - Accepts what macOS ImageIO decodes: JPEG, PNG, WebP, AVIF, HEIC/HEIF, TIFF, GIF, BMP — the same
   set through the first three ways in, because only the probe decides. **The Dock tile is the one
   exception**, and not by choice: LaunchServices rules on the extension before the app is even
@@ -141,6 +217,27 @@ measurements behind each are in `docs/phase-b-baseline.md`.
   fixture). **Do NOT simplify this to "JPEG → 4:2:0"**, and **do NOT invent an "is this
   photographic?" heuristic**; `src/chroma.zig` says why at length.
 
+## Known limitations
+- **"Both" decodes the source twice.** The two formats are two independent `image.encode` workers —
+  that independence is the partial-failure decision — and each calls `imageio.decode` on the same
+  file. The cost is **peak memory, not latency**: two full-resolution RGBA buffers live at once, up
+  to ~400 MB at the 50 MP guard. The two decodes run concurrently on separate threads. Sharing one
+  decode would mean a refcounted buffer outliving both slots — real complexity for a memory win
+  only, so this is a deliberate trade. Measured since (`docs/phase-b-baseline.md`, "Round 2"): a
+  decode is 3-8% of a run, so the "not latency" half is a number now, not an expectation.
+- **arm64 only.** The vendored archives are non-fat arm64-macos; producing an x86_64 or universal
+  build is unexplored. A genuine gap the moment the `.app` is handed to anyone else.
+- **`~/Desktop` is hardcoded in two places now.** A custom `com.apple.screencapture location` is
+  not read — that needs a `CFPreferencesCopyAppValue` binding, since the app spawns no subprocess —
+  so both the screenshot rescue (`Destination.desktop`) and a raw-bytes paste file to `~/Desktop`
+  literally. A user who has moved their screenshot folder gets their files somewhere they did not
+  choose. One binding fixes both.
+- **A raw-bytes paste writes its file on the loop thread.** `clipboard.paste` must read the
+  pasteboard from the main thread (AppKit), and `-[NSData writeToFile:atomically:]` then runs there
+  too, so a very large pasted image stalls the window for the length of one write. Moving it would
+  mean reading the pasteboard on the loop and handing the `NSData` to a worker — real work for a
+  hitch nobody has reported at screenshot sizes.
+
 ## Key decisions carried forward
 - **Partial failure in "Both" mode is partial SUCCESS.** The two encodes are independent; one
   landing while the other fails is `.done` with the failure named in the status bar. Only an
@@ -181,84 +278,7 @@ measurements behind each are in `docs/phase-b-baseline.md`.
   The cap that actually binds the preview is now the LAYOUT, not that budget — see
   `imageio.max_thumbnail_edge`.
 
-## Testing strategy
-Two tiers, in this order. Reaching for the GUI to answer a question a unit test answers faster is
-the failure mode to avoid.
-
-**Tier 1 — `native test` (`src/tests.zig`, `src/imageio_tests.zig`).** Deterministic, no GUI, no
-processes, no network. This is where logic gets proven. The markup/model seam is driven through the
-real dispatch path: build the markup against the real `Model`, find a widget, ask the tree for the
-`Msg`, feed it to `update`. Effects-bearing paths drive `Effects` in fake-executor mode
-(`fx.executor = .fake`, via the `Harness`) — assert the *request* an arm made, then feed the answer
-and drain. ImageIO and the real encoders are reachable here, because `build.zig` states the
-frameworks and archives on the test module too.
-
-**Every new assertion gets mutation-checked, not just run green.** Break the thing it claims to
-pin and confirm it fails — exactly one test, and the right one. A test that cannot fail is worse
-than none, and this discipline is what caught the format-mid-encode gap, a backwards `file.copy`
-payload, and two reset-guard tests that passed with the guard deleted.
-
-**Tier 2 — `native automate` against `native dev`.** Proves the real seam end to end. `native build`
-is ReleaseFast and has neither automation nor hot reload.
-
-**Fixtures are gitignored**, so tier-1 tests must never read `test-images/`. Anything image-shaped
-uses in-repo bytes: embedded PNG literals, or `canvas.png.writeRgba8` plus
-`harness.null_platform.image_decode = true` for the decode→register→draw path.
-
-## Verification strategy
-Every change ends with a check against the *running* app, not just a compile check. `native build`
-and `native check` are necessary and never sufficient.
-
-- `native automate widget-click` drives the real UI for anything reachable without a native dialog
-  or a real file drop.
-- **Never send a global keystroke** — a native file dialog (open or save panel) above all, and
-  Cmd+V equally. The app runs as a bare executable under `native dev`/`native build`, and System
-  Events cannot bring it frontmost, so the keystroke lands on whatever IS frontmost instead — this
-  already typed a stray path into a live session once. Have the user press the key by hand. Setting
-  the pasteboard up around such a press IS scriptable (`osascript -e 'set the clipboard to ...'`,
-  `pbcopy`), and so is asserting the result afterwards; only the press itself is theirs.
-- **File drops cannot be automated at all** — a different constraint, same practical answer: have
-  the user drag a real file onto the window by hand.
-- Test fixtures live under `test-images/` (gitignored); `docs/phase-b-baseline.md` carries the
-  recipe for regenerating each one and the inventory of what each proves.
-- **`docs/phase-b-baseline.md` is append-only.** It is the ±15% parity gate, recorded before any of
-  the native encode work and impossible to reconstruct afterwards. Every change to the encode path
-  is re-checked against it, and **chroma subsampling is part of the check** — a size-and-PSNR match
-  with the wrong `yuvFormat` is a failure.
-
-## Known limitations
-- **"Both" decodes the source twice.** The two formats are two independent `image.encode` workers —
-  that independence is the partial-failure decision — and each calls `imageio.decode` on the same
-  file. The cost is **peak memory, not latency**: two full-resolution RGBA buffers live at once, up
-  to ~400 MB at the 50 MP guard. The two decodes run concurrently on separate threads. Sharing one
-  decode would mean a refcounted buffer outliving both slots — real complexity for a memory win
-  only, so this is a deliberate trade. Measured since (`docs/phase-b-baseline.md`, "Round 2"): a
-  decode is 3-8% of a run, so the "not latency" half is a number now, not an expectation.
-- **arm64 only.** The vendored archives are non-fat arm64-macos; producing an x86_64 or universal
-  build is unexplored. A genuine gap the moment the `.app` is handed to anyone else.
-- **Launch time has never been measured.**
-- **`~/Desktop` is hardcoded in two places now.** A custom `com.apple.screencapture location` is
-  not read — that needs a `CFPreferencesCopyAppValue` binding, since the app spawns no subprocess —
-  so both the screenshot rescue (`Destination.desktop`) and a raw-bytes paste file to `~/Desktop`
-  literally. A user who has moved their screenshot folder gets their files somewhere they did not
-  choose. One binding fixes both.
-- **A raw-bytes paste writes its file on the loop thread.** `clipboard.paste` must read the
-  pasteboard from the main thread (AppKit), and `-[NSData writeToFile:atomically:]` then runs there
-  too, so a very large pasted image stalls the window for the length of one write. Moving it would
-  mean reading the pasteboard on the loop and handing the `NSData` to a worker — real work for a
-  hitch nobody has reported at screenshot sizes.
-
-## Roadmap
-Four tracks, independent of each other. Each carries a model/effort suggestion — judgment calls
-about how much of the work is taste versus mechanism, not benchmarks.
-
-**§4 is empty of open work.** Every deferred feature has shipped; what remains under it is the one
-item marked "not decided" — the CLI — which is a decision still to be taken, not a task waiting to
-be picked up. The Dock-icon drop was the other, and shipped in v0.7. **§1 closed in v0.8** — every
-item measured, one shipped and the rest declined on the numbers — so **§3 is the only live
-track.**
-
-### 1. Performance
+### Performance — measured and closed (v0.8)
 **Closed — this track has no open work.** `docs/phase-b-baseline.md`'s "Round 2" carries the
 numbers and the method; this is what they settled. Every item below is either shipped or measured
 and deliberately declined, and the verdicts are recorded so they are not rediscovered as fresh
@@ -299,22 +319,17 @@ reason not to re-propose them.
 *Nothing here is open. Read this section before proposing a performance change, not after — four of
 its five items are recorded refusals with numbers behind them.*
 
-### 2. UI and style polish
-**Shipped as v1 of the UI.** The canvas is the ORIGIN of this design, no longer a description of
-it — 12 window states across light and dark, plus three sheets (design tokens, the result row, the
-footer): <https://claude.ai/code/artifact/682de599-1cc7-4306-aac0-bbf9d886c2e6>
+## Design decisions
+The palette and geometry choices still in force. **Where the built app differs from the design
+canvas** — measured, and deliberate in every case — is in
+[`docs/design-board.md`](docs/design-board.md); read that before another visual pass. **What the
+markup cannot express at all** is in
+[`docs/native-sdk-constraints.md`](docs/native-sdk-constraints.md); read that when a design will
+not build, not before.
 
-**The board is now behind the app.** Iterating against it means reading "Where the build left the
-board" below first; every entry there is a place the drawn spec and the running app disagree, and
-in each the app is deliberate. Re-seeding the board from the built UI is the obvious next move
-before another visual pass — and it has fallen one step further behind since: v0.6 moved the drop
-zone's two lines (`Drop an image here — or paste, or click to choose`, and `AVIF` added to the
-format list). Copy, not geometry, so nothing measured below changed.
-
-Constraint respected: the app is meant to live in a corner of the desktop, so it must stay correct
-at `window_min_width` (420). That floor is a TEST, not a comment — `tests.zig` lays the tallest
-state (both formats landed) out at 420x400 and fails naming the overflow in points. The 144px
-preview frame is what pays for everything else and is load-bearing.
+**The layout floor is a TEST, not a comment.** The app must stay correct at `window_min_width`
+(420): `tests.zig` lays the tallest state out at 420x400 and fails naming the overflow in points.
+The 144px preview frame is what pays for everything else and is load-bearing.
 
 **Settled decisions.**
 - **The palette is app-owned**, set through `UiApp.Options.tokens_fn` (not `tokens`: the scheme is
@@ -376,120 +391,6 @@ preview frame is what pays for everything else and is load-bearing.
   with an inner label plate that collapses into mush at 14px. `download` is the arrow-into-tray
   glyph. The failure mark is `alert`, a circle with a bang, not a triangle.
 
-**What the markup cannot express** — every one of these was found by reading the SDK source after
-drawing something that could not be built:
-- **A `<panel>` strokes a hairline and casts a shadow whether or not you ask.**
-  `emitPanelWidgetChrome` always emits both and no attribute declines them, so the drop zone and
-  preview frame get their wash-only treatment from `controls.panel.stroke_width = 0` and a zeroed
-  `shadow.sm`. There is no dashed stroke anywhere in the SDK either. A `<badge>` DOES draw its own
-  border, but ONLY `variant="outline"` — there is no badge stroke-width attribute — so the savings
-  badge's 30–70% weight is `outline` and the other two are borderless by construction.
-- **`<status-bar>` is a BAND, not a line.** It fills its frame with `surface`, draws its own top
-  hairline, and insets text 14pt with no way to clear it (`padding="0"` falls back to the default).
-  That is the filled-footer treatment this design rejected, and it broke the left edge. The status
-  line is a plain `<text>`; one widget, one id, one colour either way.
-- **`<span>` carries no `foreground`** (only weight/scale/mono/italic/underline). A two-tone result
-  line needs separate `<text>` widgets and a model method per half — `resultLine` split into
-  `avifSize`/`avifSavings` and their WebP twins.
-- **`padding` is a single uniform number.** No per-side values anywhere. A result card's left inset
-  is a leading `<spacer width="2">` and its height is stated outright, because 10pt of padding
-  would be 10 top and bottom too.
-- **`<toggle-group>` paints nothing at all** (an explicit no-op arm in the render switch). The
-  segmented track is a `<row background="surface_pressed" radius="md" padding="1">` wrapped around
-  it. The thumb needs no styling — a ghost `toggle-button` is already transparent at rest and
-  `surface_subtle` when selected.
-- **A ghost variant resolves ONE `foreground` for both states.** `active_foreground` is consulted
-  only for `default` and detached-group members, and `foreground` is a token-NAME attribute that
-  takes no binding — so the board's muted-unselected/full-ink-selected segments cannot be built
-  without an `<if>` inside the `<for>` and the widget-identity collision that causes. All three
-  segments take full ink, which is also what macOS does: the thumb marks the selection, not the ink.
-- **No per-widget shadow, and no letter-spacing.** The label stays "Format" rather than a
-  tracked-out FORMAT.
-- **`background` takes a token NAME, not a hex** — and a `<badge>` ignores `background=` entirely.
-  A badge fill comes only from `variant`: `outline`/`ghost` are transparent, `destructive` is a
-  translucent wash (spoken for by the failure mark), and `default`/`primary` paint a solid fill
-  read from the `accent` STYLE channel (`accent_foreground` for the ink). So the savings badge's
-  70%+ "win" weight is `variant="primary" accent="success" accent-foreground="success_text"` — a
-  solid lilac chip with knockout ink — not `background="success"`, which renders as invisible
-  surface-on-surface text. Two more badge gotchas: a badge with no `radius` falls back to a
-  height/2 FULL pill on its fixed 20pt frame (every arm states `radius="sm"`, which is 6 — see the
-  radius bullet below), and `variant="outline"` pulls its ring from `tokens.colors.border` (grey) —
-  `foreground` only colours the text — so the 30–70% weight also needs `border-color="success"` to
-  ring in lilac.
-
-**Where the build left the board.** Read this before iterating — each is measured, not a drift.
-- **Light `text_muted` is `#6B6773`**, the value the drawn states use, not the `#75717C` the token
-  sheet lists. The lighter value measures 4.25:1 on `surface_subtle`, and muted ink lands on that
-  surface constantly (the drop zone's hint, every result row's size figure).
-- **The creams are warmer than the sheet.** `surface_subtle` `#F7F1EA` → `#F4ECDF` and
-  `surface_pressed` `#EAE1D3` → `#E7D7C7`. Not a correction — the sheet's values render exactly as
-  drawn — but a compensation for WHERE they render: on the canvas that patch sits inside a cream
-  window on a warm page and every neighbour confirms its warmth, while in a 540pt window on someone
-  else's desktop the same field has nothing warm near it and 13 points of red-over-blue reads as
-  grey. The ceiling is the track: past about `#F3EADB` for the cards it stops separating from them.
-  The track also went three points DARKER, because warming the cards had squeezed it to ΔL* 3.81.
-- **The peach is `#F2B79A` in both schemes**, deeper and slightly more saturated than the
-  `#F8CDB7` it replaced (which was itself `#F3B89A` + 6 L*). `#F8CDB7` cleared ΔL* ~11.8 on the
-  dark ground and read as a pale glowing bar with no body; `#F2B79A` drops ~5 L* and adds chroma so
-  the one saturated fill carries weight. This walks back the "muddy tan" objection to the darker
-  peach — at the button's size, against neutral desktops, and with one value serving both schemes,
-  body beats brightness. Still ONE value across light and dark: peach does not flip. Knockout ink
-  clears 8.1:1 either way.
-- **ONE outer radius, 10, on everything a hand lands on** — the segmented track, every button, and
-  a result card. The board draws the track at 8 against a 10 button, and side by side that reads as
-  a mistake rather than a distinction. The thumb keeps the board's one-step-in relationship (track
-  minus its own padding, so 8). Surfaces keep their own scale: preview frame 12, drop zone 16. The
-  `sm` step is 6, not 8: it is the savings badge's corner, and on the SDK's fixed 20pt badge frame
-  an 8pt corner reads as a pill where 6pt is the 30%-of-height rounded rect the 34pt result row
-  (10pt corner, 29%) sits it beside.
-  **The track will still look slightly larger than the buttons and that is structural**: it is the
-  segment height plus its padding, so it is always taller than the control inside it, and the same
-  arc on a taller shape reads differently. Measured and confirmed identical — the probe was setting
-  `radius.md` to 20, which moved the track and not the button.
-- **The action buttons are 30pt tall and Smoosh is 88 wide.** `size="sm"` IS 28, so the buttons
-  cannot reach the track's height through the rungs; both state it. Smoosh's width comes from
-  `min-width` on that one button rather than `button_inset_sm`, which would widen Reset, both Save
-  buttons and every segment with it — and the row has ~17pt of slack at the 420pt floor.
-- **The type scale is three sizes and no more**: 14 (file name, drop-zone headline), 13 (everything
-  else, labels and button text alike), 12 (the savings badge). `button_label_sm_step` is 1, not the
-  house 1.2, so `sm` button labels land on 13 with the text beside them instead of 12.8.
-
-**The contrast check is in the test suite**, over the real `tokens_fn` values: every adjacent
-surface pair at ΔL* ≥ 3 and in the right DIRECTION, every drawn text pair at 4.5:1, the spinner at
-3:1. Mutation-checked in both directions — restoring the `#17171C` dark track reports 2.07 L*,
-restoring `#75717C` reports 4.25:1, and lifting the track above the thumb reports the direction
-failure. The pairs asserted are the pairs the markup DRAWS, not the cross product of the palette.
-
-**Verified live, not from source.** Every claim above was checked against the running app through
-`native automate` — widget frames for geometry, framebuffer samples for colour, and a token probe
-where the two could not be told apart by eye. Two things remain unverifiable from here and need a
-person: **a real file drop** and **any native dialog** (see CLAUDE.md's two standing rules).
-
-### 3. The standalone-app review
-The umbrella, not a task. The correctness half was covered by the Phase B review (2026-08-30) —
-one real bug found and fixed (the case-insensitive `same_path` collision). What it did NOT touch is
-everything that only bites once the `.app` leaves this machine, and that is the whole remaining
-content of this track:
-- **arm64-only.** The vendored archives are non-fat; a universal build is unexplored. See "Known
-  limitations".
-- **Notarization.** Currently ad-hoc signed — fine for one machine, not for distribution. The
-  decision itself is recorded under "Key decisions carried forward"; what is unexplored is the work.
-  It has a cost on the ONE machine too, found the hard way in v0.7: TCC identifies an ad-hoc app by
-  its cdhash, which changes with every build, so each reinstall arrives as an app macOS has never
-  seen holding a permission record for one it knew. The symptom is a protected-folder write refused
-  with NO prompt, which reads exactly like an app bug and is not one —
-  `tccutil reset SystemPolicyDesktopFolder dev.native_sdk.smoosh` clears it. A Developer ID
-  signature is what actually ends it, because it gives the app an identity that survives a rebuild.
-  **Rule out TCC before believing a permissions bug**: the discriminator is that a stale grant
-  refuses silently, while a genuine first run prompts.
-- **Launch time has never been measured.** See "Known limitations".
-
-The icon's Dock shape WAS on this list and is done — see "App icon" below for the geometry that
-keeps it settled.
-
-*Suggested: **Opus 5, high**, or run `/code-review ultra` for the correctness sweep — it is
-user-triggered and billed, so it cannot be launched from inside a session.*
-
 ### App icon — settled, and the numbers that keep it settled
 `assets/icon.png` is RGBA on Apple's macOS template: a **1024² canvas with the artwork occupying
 824² centred, i.e. a 100px transparent margin on all four sides** (80.5%). Measured from the
@@ -501,239 +402,39 @@ which is exactly what the earlier art did. **Any replacement must keep the 824/1
 transparency** — `design/icon-original.png` is the pre-fix source, kept for comparison. Nothing in
 `build.zig` or `app.zon` is involved beyond the path; the geometry is the entire contract.
 
-### 4. Deferred features — each its own session
-**Nothing here is open.** Every item has shipped: the latent bug this list carried (the screenshot
-that vanished mid-run), the read-only-folder problem coupled to it, the app icon, and clipboard
-paste. The entries are kept because each records WHY its shape is what it is, and a reader changing
-that code needs the account more than the checkbox.
+## Testing and verification strategy
+Two tiers, in this order. Reaching for the GUI to answer a question a unit test answers faster is
+the failure mode to avoid.
 
-What is left below the shipped items is two DECISIONS, not tasks — the Dock-icon / Finder drop and
-the CLI. Neither is scheduled; both are described so the decision can be taken with the constraints
-already in hand rather than rediscovered.
+**Tier 1 — `native test` (`src/tests.zig`, `src/imageio_tests.zig`).** Deterministic, no GUI, no
+processes, no network. This is where logic gets proven. The markup/model seam is driven through the
+real dispatch path: build the markup against the real `Model`, find a widget, ask the tree for the
+`Msg`, feed it to `update`. Effects-bearing paths drive `Effects` in fake-executor mode
+(`fx.executor = .fake`, via the `Harness`) — assert the *request* an arm made, then feed the answer
+and drain. ImageIO and the real encoders are reachable here, because `build.zig` states the
+frameworks and archives on the test module too.
 
-- **Read-only source folders, and the screenshot-that-vanishes bug.** Two coupled problems, both
-  invisible from a Terminal `native dev` run (the responsible process is the terminal, which
-  already holds the TCC grants) and both real once packaged.
+**Every new assertion gets mutation-checked, not just run green.** Break the thing it claims to
+pin and confirm it fails — exactly one test, and the right one. A test that cannot fail is worse
+than none, and this discipline is what caught the format-mid-encode gap, a backwards `file.copy`
+payload, and two reset-guard tests that passed with the guard deleted.
 
-  *The read bug — **SHIPPED** (step 1 of the build order below).* An ephemeral source is now copied
-  into the app cache dir before anything reads it. `isEphemeralSource` (pure, in `main.zig`)
-  classifies the path; an ephemeral one gets one extra hop ahead of the stat — the `file.stash`
-  host command, which deletes and remakes `Library/Caches/smoosh/staged`, copies the bytes in, and
-  answers with the copy's path. `Model.readPath()` is what `image.probe`, `image.thumbnail` and
-  `image.encode`'s SOURCE field read; `Model.path()` stays the original, and remains what the file
-  card names, what `outputPath` derives the destination from, and what `beginEncode`'s `same_path`
-  guard compares against. Only the read moves. Ordinary sources are untouched and issue no stash at
-  all.
+**Tier 2 — `native automate` against `native dev`.** Proves the real seam end to end. `native build`
+is ReleaseFast and has neither automation nor hot reload.
 
-  *The write destination — **SHIPPED** (steps 2 and 4).* Classified UP FRONT rather than retried
-  after a failed write, because a blanket retry cannot tell a screenshot's staging directory apart
-  from a read-only USB stick and would drop files where nobody asked. The last hop of the load chain
-  is `file.destination`, which probes the SOURCE's folder with a real create-and-unlink (nothing
-  short of a real write is honest — a folder can be mode 0755 and yours and still refuse, on a
-  read-only mount, a full disk, an ACL or a sandbox denial) and returns that flag plus the two
-  directories `update` cannot derive itself. `update` owns the policy over those facts, as
-  `Model.Destination`:
-  - **`.beside_source`** — the folder took the write. Today's behaviour, `destDir` empty.
-  - **`.desktop`** — read-only AND `looksLikeScreenshot` (basename `Screenshot*`, or a
-    `screencaptureui` path). `outputPath` keeps the NAME and replaces the DIRECTORY.
-  - **`.ask`** — read-only, nothing else. Outputs are encoded into `Caches/smoosh/outbox` and Save As
-    is the only way out; `canReveal` is false and the status line refuses to claim a save.
+**Fixtures are gitignored**, so tier-1 tests must never read `test-images/`. Anything image-shaped
+uses in-repo bytes: embedded PNG literals, or `canvas.png.writeRgba8` plus
+`harness.null_platform.image_decode = true` for the decode→register→draw path.
 
-  A failed or malformed probe reply is NOT a load failure — it degrades to `.beside_source`, i.e.
-  exactly the behaviour that predates the probe, and a write that then cannot land still reports
-  `.write_failed` with the folder-permissions message.
+**Every change ends with a check against the RUNNING app.** `native build` and `native check` are
+necessary and never sufficient. `native automate widget-click` drives the real UI for anything
+reachable without a native dialog or a real file drop; **the two things that cannot be automated at
+all — a native dialog and a real file drop — are CLAUDE.md's "Two standing rules about
+automation"**, which is canonical for both. Do not restate them here.
 
-  Still deferred inside this: a CUSTOM `com.apple.screencapture location` is not read (that needs a
-  `CFPreferencesCopyAppValue` binding, since the app spawns no subprocess), so `.desktop` is
-  literally `~/Desktop` — and since v0.6 a raw-bytes paste files there too, so one binding now fixes
-  two features. Carried in "Known limitations". And `looksLikeScreenshot` does not chase LOCALIZED screenshot names — a
-  German "Bildschirmfoto …" already filed in a read-only folder falls to `.ask` and gets a Save As
-  rather than a wrong guess, which is the safe direction to be wrong in.
-
-  *Packaging (step 3) — **NOT NEEDED for correctness; the premise was wrong**.* This item read
-  "`NSDesktopFolderUsageDescription` in `app.zon`, or the Desktop write fails with no prompt."
-  Both halves are false, and both were checked rather than reasoned about.
-
-  **Measured** on macOS 26.6.2, against a packaged ad-hoc `.app` (`native package --target macos`)
-  with the grant reset between runs (`tccutil reset SystemPolicyDesktopFolder dev.native_sdk.smoosh`)
-  — the packaged app is the responsible process, which is what makes this the real test and a
-  `native dev` run useless for it:
-  - The bundle carries NO usage-description key (confirmed by reading the generated
-    `Contents/Info.plist`), and macOS still PROMPTS: *"Smoosh.app" would like to access files in
-    your Desktop folder.* The key is not a gate for the Desktop folder — unlike camera/microphone,
-    where a missing key is fatal. All it would add is the explanatory sentence under the title,
-    which is currently absent.
-  - **Allow** → both outputs land on the Desktop.
-  - **Don't Allow** → nothing is written and the run reports `.failed` with "Couldn't write to that
-    folder — check its permissions." (the both-formats collapse branch). No false "Saved to
-    Desktop." over files that do not exist.
-
-  So this is a COPY nicety, not a blocker, and the destination split ships without it.
-
-  If the reason line is ever wanted: the key still cannot be stated in `app.zon` —
-  `tooling/package.zig`'s `macosInfoPlist` builds `Contents/Info.plist` from a fixed template whose
-  only privacy strings come from `macosPrivacyUsageDescriptions`, hardcoded to the `microphone` and
-  `system_audio` permissions; there is no arbitrary-key passthrough in `app_manifest/types.zig` and
-  no user plist fragment is read. `build.zig` cannot reach it either, since packaging is CLI-side.
-  The cheap route is a post-package `plutil -insert`, and it needs NO re-sign: `codesign -dv` on the
-  packaged bundle reports `Info.plist=not bound` and `Sealed Resources=none`, because the ad-hoc
-  signature is linker-signed and covers only the Mach-O. The proper route is an SDK passthrough,
-  which is not this repo's to make.
-
-  *The write-failure sentence follows the destination — **SHIPPED**.* The generic "check the
-  folder's permissions" is only true for `.beside_source`. Aimed at the Desktop it was actively
-  misleading (a TCC denial is not a `chmod` problem — the folder IS writable and the app was
-  refused by Privacy & Security, so the user inspects Get Info, finds nothing wrong, and is stuck);
-  aimed at the app's own cache it was meaningless, since the user cannot act on our cache
-  directory's permissions at all. Two fns now carry it — `writeFailureAdvice` for the per-format
-  sentence and `writeFailureCollapsed` for the both-failed one — and their remedies agree per
-  destination, pinned separately because they can drift independently:
-
-  | destination | one format | both formats |
-  |---|---|---|
-  | `.beside_source` | `Couldn't save the AVIF — check the folder's permissions.` | `Couldn't write to that folder — check its permissions.` |
-  | `.desktop` | `Couldn't save the AVIF — check Privacy & Security.` | `Couldn't write to your Desktop — check Privacy & Security.` |
-  | `.ask` | `Couldn't save the AVIF — the disk may be full.` | `Couldn't write the compressed files — the disk may be full.` |
-
-  The collapsed forms are not the per-format sentence with the label removed: "Couldn't write to
-  that folder — check the folder's permissions." says folder twice, and the Desktop one NAMES the
-  Desktop because the user never chose it and "that folder" would point at nothing they have in
-  mind. A test pins every one of the six at or under the status line's ~65 characters — the bar
-  elides rather than wraps, and the clause that says what to do is the half that would be lost.
-
-  Build order: (1) the read fix standalone — **done**; (2) the writability-probe destination split —
-  **done**; (3) the plist string — **dropped, premise disproved above**; (4) the status-line copy —
-  **done**. This item is closed.
-
-- **"Saved to Desktop." for the special-cased writes — SHIPPED** (step 4 of the item above).
-  `statusLine`'s `.done` arm now switches on `Destination`: `Done.` beside the source,
-  `Saved to Desktop.` for the screenshot rescue, and `That folder is read-only — save a copy.` for
-  `.ask`, which deliberately refuses to claim a save that did not happen. A lost format still wins
-  the line over any of them — the loss is what the user has to act on. The "Show in Finder" control
-  had already shipped alongside it: the footer reads `Done.` beside a hover-lit label that opens
-  Finder with every output of the run selected (`shell.reveal` → `NSWorkspace`, `src/workspace.zig`). It deliberately points at the
-  AUTOMATIC write and never follows a Save As: a user who drove a save panel already knows where
-  that copy went, and the button exists to unveil the write nobody was asked about.
-
-- **Clipboard paste (Cmd+V) — SHIPPED in v0.6.** Both payload shapes land, through one host
-  command (`clipboard.paste`) answering `"<nominal>\x00<read>"`, which `parsePasteReply` splits.
-
-  **The SDK's clipboard seam turned out to be a dead end, for two independent reasons.**
-  `PlatformServices.readClipboardData(mime_type, buffer)` looks like the call and is not: its macOS
-  mime map (`NativeSdkPasteboardTypeForMime`) resolves `text/plain`, `text/html` and `text/rtf` and
-  returns nil for everything else, so an `image/png` read is unrepresentable rather than merely
-  awkward — and `max_clipboard_data_bytes` is 64 KiB anyway. `src/pasteboard.zig` is therefore an
-  Objective-C seam of its own, `workspace.zig`'s sibling. The bytes never enter the process:
-  `-[NSData writeToFile:atomically:]` does the copy, which is what keeps a multi-megabyte static
-  buffer out of the tree and makes the write atomic for free.
-
-  **Cmd+V could not go through `on_key`** either, which is where every other key in this app lives.
-  AppKit resolves key EQUIVALENTS against the menu bar before the responder chain, so the standard
-  Edit menu's Paste claims the chord and the surface's `keyDown:` never runs; the SDK's canvas view
-  answers that menu item by re-emitting the chord only when a text widget has focus, and this window
-  has none. `RuntimeOptions.shortcuts` + `Options.on_command` is the working seam — it installs a
-  local `NSEventMaskKeyDown` monitor that runs before `NSApp.sendEvent:`, so nothing downstream can
-  claim the event first. `main.zig`'s `app_shortcuts` carries the account.
-
-  The two shapes:
-    - **a file URL** (an image copied in Finder) → answered with an empty `read`, so it takes the
-      ordinary `beginLoad` — the ephemeral stash included, since a file copied out of /tmp is as
-      perishable as one dragged from there;
-    - **raw bytes** (a `Cmd-Ctrl-Shift-4` screenshot, "Copy Image" in a browser) → written into the
-      cache `staged` slot, and paired with an INVENTED nominal path on the Desktop. That reuses
-      `Model.stash_path_buffer`'s existing split (the run is ABOUT one path, it READS another)
-      rather than adding a second mechanism, and it is what puts the outputs somewhere durable
-      instead of in the purgeable cache. The nominal name is a LOCAL timestamp
-      (`smoosh-2026-09-10-143005`), so two pastes cannot clobber each other's outputs and a Desktop
-      full of them says which is which. A re-press of Smoosh on the same pasted image deliberately
-      reuses the name — it is fixed at paste time, which is what makes a redo a redo.
-
-  The raw-bytes flavours are PNG, JPEG, WebP, AVIF, TIFF, in that order — **the producer's own
-  encoded bytes over anything re-rendered**, with TIFF last because it is what macOS hands over once
-  it has re-rendered the picture, uncompressed and stripped of the JPEG entropy data `chroma.zig`
-  reads. WebP and AVIF are there for completeness only: every browser re-encodes to PNG when it puts
-  an image on the pasteboard, verified by reading `NSPasteboard.types` directly — an image copy
-  carries `public.png`/`public.tiff`, a JPEG copy `public.jpeg`/`public.tiff`, and nothing else.
-  (AppleScript's `clipboard info` lists AVIF, GIF, BMP and more; those are its own *coercion
-  candidates*, not pasteboard flavours, and reading them as flavours will mislead you.)
-
-  An empty or text-only pasteboard is `.failed` with "No image on the clipboard." and deliberately
-  does NOT clear a loaded file: nothing was acquired, so nothing was replaced.
-
-
-### Dock-icon / Finder drop — shipped in v0.7
-The fourth way in, and the only one that works while the window is buried: a screenshot dragged onto
-the Dock tile from behind a browser. That case has no alternative — a window drop needs a visible
-window, and Cmd+V needs focus.
-
-macOS delivers it as a `kAEOpenDocuments` ("odoc") Apple Event, which NSApplication resolves to
-`application:openURLs:` on its delegate. **Two halves, both required**, and this entry was set aside
-for two releases on a reading of the second that turned out to be wrong:
-
-- `app.zon`'s `.file_associations` → `CFBundleDocumentTypes` in the packaged Info.plist. Fully
-  supported by the SDK already (`manifest.zig`'s `FileAssociationMetadata`, emitted by
-  `package.zig`), and `native check` validates it. Not a gap at all.
-- The delegate method, added by `src/dockopen.zig`. The earlier entry guessed this "may not exist
-  without platform-layer work" because `runMacos`'s document handling is non-`pub`. It never needed
-  `runMacos`: `appkit_host.m` owns `NSApp.delegate` as a real Objective-C class
-  (`NativeSdkAppDelegate`) compiled into this binary, so `class_addMethod` reaches it the same way
-  `workspace.zig` reaches NSWorkspace, and `UiApp.dispatch` is `pub` and documented for exactly this
-  caller ("command handlers, embedders, tests"). No SDK change, no new platform event kind.
-
-**Three constraints, all load-bearing.**
-- **`install` must run before `runtime.run`.** AppKit snapshots which methods a delegate has when
-  `setDelegate:` is called, and the host does that inside `runWithCallback:`. Adding the method
-  afterwards leaves AppKit believing the delegate cannot open URLs and the drop is silently lost.
-  `NSApp` already exists by then — `[NSApplication sharedApplication]` runs in the host's `init`,
-  inside `MacPlatform.createWithOptions`.
-- **Extend the SDK's delegate; do not replace it.** The host installs its own only
-  `if (!NSApp.delegate)`, so setting one first would work — and would silently take the Dock-reopen
-  behaviour with it, plus anything a future SDK puts on that delegate. `class_addMethod` leaves it
-  whole and fails harmlessly if the SDK ever ships its own `application:openURLs:`.
-- **The extension list cannot be omitted the way the open panel's filter is.** That filter is absent
-  on purpose (above). Here there is no choice: the packager emits `CFBundleTypeExtensions` and has
-  no `LSItemContentTypes` path, so `public.image` is not expressible. `tests.zig` pins the list
-  against `unsupported_source_message` in both directions — a format the app promises but the
-  manifest omits is a file the tile refuses for no visible reason.
-
-**Deliberate limits.** A multi-file drop takes the first and ignores the rest silently, because the
-app holds one image everywhere else (`onDrop` takes `paths[0]` for the same reason). A drag out of a
-web page is refused by the Dock, and correctly: odoc carries file URLs and has no pixel lane at all,
-so pixels ride the pasteboard and files ride odoc, with no overlap. That is a clean split, not a
-gap — and it is why this is NOT the CLI's job after all: the earlier entry deflected to `smoosh
-hello.jpg`, which cannot be reached from a Dock drag by anyone who does not already have a shell
-open.
-
-**It only exists in the packaged `.app`** — a bare `native dev`/`native build` binary has no
-Info.plist, so LaunchServices knows nothing and the tile never highlights. Verification is therefore
-`native package` → install → drag by hand, and cannot be automated at all (the same practical answer
-as window drops, for a different reason).
-
-## A Smoosh CLI — beyond the app
-**LAST. Deferred behind everything above** — do not pick this up unless the owner asks for it by
-name.
-
-Not part of the desktop app and not on its roadmap: a second, tiny binary that shares the image
-core. `smoosh hello.jpg` writes `hello.avif` and `hello.webp` next to the source and exits.
-
-**Shape.**
-- Flags: `--avif`, `--webp` (both if neither is given), `--dest=<dir>` (default: beside the source).
-- `main` is: parse argv → for each requested format → `imageio.decode` → `encoders.encode{Avif,Webp}`
-  → atomic write. One Smoosh run per invocation; no batch progress, no watch mode, no config file.
-- Reuses `src/imageio.zig`, `src/encoders.zig`, `src/encode.c` UNCHANGED. They carry no Model / Msg
-  / Runtime dependency — `imageio.decode` already returns straight-alpha 8-bit sRGB callable off any
-  thread, and the encoders take that buffer directly. This is the dogfood: if the CLI cannot be
-  built cleanly on these seams, the seams are wrong.
-
-**Why it is its own session.** The cost is entirely in `build.zig`. A CLI is a third executable
-artifact that must replicate the exe's link wiring on its own module: compile `src/encode.c`
-exactly once (twice is a fatal `duplicate symbol`), link the vendored archives in order plus the
-mandatory libsharpyuv, and `addFrameworkPath` for ImageIO / CoreGraphics or the link fails with
-"searched paths: none". `build.zig`'s own comments flag every one of these as a trap that hides
-until the other artifact builds. Then argv parsing, exit codes, a smoke test, and a distribution
-decision (ship `smoosh` beside `Smoosh.app`; or a `--install` that symlinks it onto `PATH`).
-
-**What it unlocks.** `smoosh` + drag an image into the terminal — the quick path the app's window
-drop cannot be for a terminal user. And a Finder **Quick Action** becomes trivial: a `.workflow`
-bundle running `smoosh "$@"` on the selection, installed to `~/Library/Services/` or shipped inside
-the `.app`. The Quick Action has no independent design — it is this CLI with a Finder trigger.
+- Test fixtures live under `test-images/` (gitignored); `docs/phase-b-baseline.md` carries the
+  recipe for regenerating each one and the inventory of what each proves.
+- **`docs/phase-b-baseline.md` is append-only.** It is the ±15% parity gate, recorded before any of
+  the native encode work and impossible to reconstruct afterwards. Every change to the encode path
+  is re-checked against it, and **chroma subsampling is part of the check** — a size-and-PSNR match
+  with the wrong `yuvFormat` is a failure.

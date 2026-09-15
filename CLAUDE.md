@@ -72,7 +72,7 @@ the chord (AppKit resolves key equivalents against the menu bar first, and the S
 the Edit menu's Paste only when a text widget has focus, which this window never has), and
 `PlatformServices.readClipboardData` resolves text mime types ONLY and caps at 64 KiB. A pasted
 FILE re-enters the same load chain a picked one does; pasted PIXELS are written to the cache first
-and paired with an invented Desktop name. PLAN.md's "Clipboard paste" carries the full account.
+and paired with an invented Desktop name. `src/pasteboard.zig`'s header carries the rest.
 
 ## Core Principles for this project
 1. **Extremely simple UX** — drop zone is the entire product. Minimal chrome.
@@ -135,8 +135,11 @@ that hides until the other artifact is built.
 ### Repo layout
 - `src/main.zig` — the app. Hand-authored root: builds its own platform + Runtime.
 - `src/app.native` — markup view. Its header comment carries the widget-identity rule (every root
-  child is keyed) and the reasons for the shapes the SDK forced; PLAN.md's "UI and style polish"
-  carries the palette and geometry decisions.
+  child is keyed) and the reasons for the shapes the SDK forced. Three companions, each for a
+  different moment: PLAN.md's "Design decisions" carries the palette and geometry choices in force;
+  `docs/design-board.md` records where the built app deliberately differs from the design canvas
+  (read before a visual pass); `docs/native-sdk-constraints.md` catalogues what the markup simply
+  cannot express (read when a design will not build, not before).
 - `src/imageio.zig` — the whole ImageIO C-ABI seam (`extern fn`, not `@cImport`): `probe`,
   `thumbnail` and `decode`, all callable from a worker thread and all returning straight-alpha
   8-bit sRGB. `probe` and `thumbnail` are host commands; **`decode` deliberately is not** — a
@@ -316,7 +319,7 @@ composite over any ground — and a test pins the separation in both schemes on 
 - Verify against the *running* app via `native automate`. A clean `native build` proves nothing
   about behavior.
 - Every new test assertion gets mutation-checked — break what it pins and confirm it fails, and
-  fails for the right reason. See PLAN.md's "Testing strategy".
+  fails for the right reason. See PLAN.md's "Testing and verification strategy".
 - **`README.md` moves with every capability change** — the same trigger as a version bump, so if
   the work earns a CHANGELOG entry it earns a README pass. UI polish does not. It is the one doc
   with no test and no `native check` behind it, and it went two releases stale because nothing
@@ -356,8 +359,57 @@ Two things follow, and both are load-bearing:
 
 Do not "simplify" the derived count back to a constant, and do not re-propose
 `drawToRgba8`'s `@memset` or `copy_out`'s memcpy as optimizations: both were measured (0.04% and
-below-noise respectively against a 1800 ms encode) and deliberately kept. PLAN.md §1 records the
+below-noise respectively against a 1800 ms encode) and deliberately kept. PLAN.md's "Performance
+— measured and closed" records the
 verdicts so they are not rediscovered.
+
+## The Dock-tile drop: three constraints, all load-bearing
+`src/dockopen.zig` adds `application:openURLs:` to the SDK's own delegate. Each of these has a
+silent failure mode — nothing crashes, the drop just does not arrive.
+
+- **`install` must run before `runtime.run`.** AppKit snapshots which methods a delegate has when
+  `setDelegate:` is called, and the host does that inside `runWithCallback:`. Adding the method
+  afterwards leaves AppKit believing the delegate cannot open URLs and the drop is silently lost.
+  `NSApp` already exists by then — `[NSApplication sharedApplication]` runs in the host's `init`,
+  inside `MacPlatform.createWithOptions`.
+- **Extend the SDK's delegate; do not replace it.** The host installs its own only
+  `if (!NSApp.delegate)`, so setting one first would work — and would silently take the Dock-reopen
+  behaviour with it, plus anything a future SDK puts on that delegate. `class_addMethod` leaves it
+  whole and fails harmlessly if the SDK ever ships its own `application:openURLs:`.
+- **The extension list cannot be omitted the way the open panel's filter is.** That filter is absent
+  on purpose (above). Here there is no choice: the packager emits `CFBundleTypeExtensions` and has
+  no `LSItemContentTypes` path, so `public.image` is not expressible. `tests.zig` pins the list
+  against `unsupported_source_message` in both directions — a format the app promises but the
+  manifest omits is a file the tile refuses for no visible reason.
+
+**It only exists in the packaged `.app`.** A bare `native dev` / `native build` binary has no
+LaunchServices registration, so neither the Dock tile nor "Open With" appears there at all —
+verifying either is `native package` -> install -> the user drags by hand.
+
+## Ad-hoc signing and the TCC trap
+**Rule out TCC before believing a permissions bug.** This cost a day in v0.7 and the symptom is a
+perfect impostor of an app defect.
+
+macOS's TCC identifies an ad-hoc-signed app by its **cdhash**, which changes with every build. So
+each reinstall of `/Applications/Smoosh.app` arrives as an app macOS has never seen, while macOS is
+still holding a permission record for the app it knew. A write into a protected folder — Desktop,
+Documents, Downloads — is then refused with **no prompt at all**, which reads exactly like Smoosh
+mishandling a denial and is nothing of the kind.
+
+**The discriminator: a stale grant refuses SILENTLY, a genuine first run PROMPTS.** If no dialog
+appeared, suspect TCC before the code. Clear it and relaunch:
+
+```sh
+tccutil reset SystemPolicyDesktopFolder dev.native_sdk.smoosh
+```
+
+A Developer ID signature is what actually ends this, because it gives the app an identity that
+survives a rebuild — see PLAN.md's "Distribution", where it is one line item of that decision.
+
+Two corollaries worth stating: `native dev` and `native build` produce a bare binary with no bundle
+identity, so none of this applies there — it is a PACKAGED-app phenomenon only. And when testing a
+destination change, a stale grant will make a correct implementation look broken, so reset first
+and change code second.
 
 ## Two standing rules about automation
 - **Never send a global keystroke** — a native file dialog (open or save panel) above all, and
