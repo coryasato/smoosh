@@ -21,6 +21,7 @@ const imageio = @import("imageio.zig");
 const encoders = @import("encoders.zig");
 const chroma = @import("chroma.zig");
 const pasteboard = @import("pasteboard.zig");
+const prefs = @import("prefs.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -733,7 +734,7 @@ const Harness = struct {
     /// is the ordinary case: the source's own folder takes a write, so
     /// the outputs land beside it.
     fn destinationOk(self: *Harness) !void {
-        try self.destinationRaw(true, "1\x00/Users/someone/Desktop\x00/Users/someone/Library/Caches/smoosh/outbox");
+        try self.destinationRaw(true, "1\x00/Users/someone/Desktop\x00/Users/someone/Library/Caches/smoosh/outbox\x001");
     }
 
     /// The read-only-folder form: the probe could not write beside the
@@ -742,7 +743,7 @@ const Harness = struct {
         // `ok` is TRUE: the probe ran and answered. The flag is what says
         // the folder refused the write — a failed REQUEST is the separate
         // "could not ask" case, which degrades to `.beside_source`.
-        try self.destinationRaw(true, "0\x00/Users/someone/Desktop\x00/Users/someone/Library/Caches/smoosh/outbox");
+        try self.destinationRaw(true, "0\x00/Users/someone/Desktop\x00/Users/someone/Library/Caches/smoosh/outbox\x001");
     }
 
     fn destinationRaw(self: *Harness, ok: bool, reply: []const u8) !void {
@@ -1380,6 +1381,77 @@ test "a screenshot in a read-only folder is rescued to the Desktop, and says so"
     // ...and Show in Finder still applies: this IS the automatic write
     // nobody was asked about, which is exactly what that button unveils.
     try testing.expect(h.model().canReveal());
+}
+
+test "a moved screenshot folder is honored, and the copy stops naming the Desktop" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_screencaptureui_x/Screenshot 2026-09-08 at 10.14.02.png";
+    try h.drop(staged);
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/Screenshot 2026-09-08 at 10.14.02.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+    // The bridge resolved `com.apple.screencapture location` to somewhere
+    // that is not the Desktop — the last field is what says so.
+    try h.destinationRaw(true, "0\x00/Users/someone/Pictures/Shots\x00/Users/someone/Library/Caches/smoosh/outbox\x000");
+
+    try testing.expectEqual(main.Destination.screenshot_folder, h.model().destination);
+    try testing.expectEqualStrings("/Users/someone/Pictures/Shots", h.model().destDir());
+
+    try h.send(.{ .set_format = .avif });
+    try h.send(.smoosh);
+    try testing.expectEqualStrings(
+        "/Users/someone/Pictures/Shots/Screenshot 2026-09-08 at 10.14.02.avif",
+        try h.encodeDest(.avif),
+    );
+    try h.encodeOk(.avif, "102400");
+
+    // The whole point of the second arm: "Saved to Desktop." here would be
+    // a lie about a file in Pictures, which is the failure this pins.
+    try testing.expectEqualStrings("Saved to your screenshot folder.", h.model().statusLine());
+}
+
+test "a write refused in a moved screenshot folder names that folder, not the Desktop" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    const staged = "/var/folders/qh/8b1x/T/TemporaryItems/NSIRD_screencaptureui_x/Screenshot 2026-09-08 at 10.14.02.png";
+    try h.drop(staged);
+    try h.stash("/Users/someone/Library/Caches/smoosh/staged/Screenshot 2026-09-08 at 10.14.02.png");
+    try h.stat("184320");
+    try h.probe(2880, 1800);
+    try h.thumbnail(140, 87);
+    try h.destinationRaw(true, "0\x00/Users/someone/Documents/Shots\x00/Users/someone/Library/Caches/smoosh/outbox\x000");
+
+    try h.send(.{ .set_format = .both });
+    try h.send(.smoosh);
+    try h.encodeReply(.avif, false, "write");
+    try h.encodeReply(.webp, false, "write");
+
+    try testing.expectEqual(Status.failed, h.model().status);
+    try testing.expectEqualStrings(
+        "Couldn't write to your screenshot folder — Privacy & Security.",
+        h.model().errorMessage(),
+    );
+}
+
+test "a probe answer with no is-it-the-Desktop field is treated as unanswered" {
+    var h = try Harness.create();
+    defer h.destroy();
+
+    try h.pick("/Users/someone/Pictures/photo.jpg");
+    try h.stat("204800");
+    try h.probe(4000, 3000);
+    try h.thumbnail(140, 105);
+    // The pre-v0.9 three-field shape. Required rather than defaulted: a
+    // bridge that no longer matches this parser must degrade, not guess
+    // which of the two rescue sentences to print.
+    try h.destinationRaw(true, "0\x00/Users/someone/Desktop\x00/cache");
+
+    try testing.expectEqual(Status.ready, h.model().status);
+    try testing.expectEqual(main.Destination.beside_source, h.model().destination);
 }
 
 test "an ordinary file in a read-only folder is not guessed at — it asks" {
@@ -2127,7 +2199,7 @@ test "every write-failure sentence fits the status line" {
     // that ELIDES. A remedy clause pushed off the end is the specific
     // regression this pins — the reason the collapsed form exists at all.
     const max_status_chars = 65;
-    for ([_]main.Destination{ .beside_source, .desktop, .ask }) |destination| {
+    for ([_]main.Destination{ .beside_source, .desktop, .screenshot_folder, .ask }) |destination| {
         var h = try Harness.create();
         defer h.destroy();
 
@@ -2219,6 +2291,50 @@ test "pastedName stamps a real local time, in a shape that survives a shell" {
     // timestamp would be a silently colliding one.
     var tiny: [8]u8 = undefined;
     try testing.expect(main.pastedName(&tiny) == null);
+}
+
+test "a screenshot-location preference is turned into a path, or refused outright" {
+    const home = "/Users/someone";
+    var buf: [1024]u8 = undefined;
+
+    // The two shapes the preference actually arrives in: Screenshot.app
+    // writes an absolute path, `defaults write … "~/Shots"` keeps the
+    // tilde literally.
+    try testing.expectEqualStrings(
+        "/Users/someone/Pictures/Shots",
+        prefs.normalizeScreenshotDir("/Users/someone/Pictures/Shots", home, &buf).?,
+    );
+    try testing.expectEqualStrings(
+        "/Users/someone/Shots",
+        prefs.normalizeScreenshotDir("~/Shots", home, &buf).?,
+    );
+    try testing.expectEqualStrings(
+        "/Users/someone",
+        prefs.normalizeScreenshotDir("~", home, &buf).?,
+    );
+
+    // A trailing slash would make the is-it-the-Desktop comparison miss
+    // and `outputPath` join a double slash.
+    try testing.expectEqualStrings(
+        "/Users/someone/Shots",
+        prefs.normalizeScreenshotDir("/Users/someone/Shots///", home, &buf).?,
+    );
+    // ...but root is a directory and "" is not.
+    try testing.expectEqualStrings("/", prefs.normalizeScreenshotDir("/", home, &buf).?);
+
+    // Every refusal is a fallback to the Desktop at the call site, not an
+    // error: the value is user-writable and none of these is worth
+    // guessing at.
+    try testing.expect(prefs.normalizeScreenshotDir("", home, &buf) == null);
+    try testing.expect(prefs.normalizeScreenshotDir("Shots", home, &buf) == null);
+    try testing.expect(prefs.normalizeScreenshotDir("./Shots", home, &buf) == null);
+    try testing.expect(prefs.normalizeScreenshotDir("file:///Users/someone/Shots", home, &buf) == null);
+    try testing.expect(prefs.normalizeScreenshotDir("~/Shots", "", &buf) == null);
+
+    // A path too long is refused rather than truncated — a truncated one
+    // names a real directory that is not the one asked for.
+    var tiny: [8]u8 = undefined;
+    try testing.expect(prefs.normalizeScreenshotDir("/Users/someone/Shots", home, &tiny) == null);
 }
 
 test "the pasteboard image flavours prefer the producer's own bytes over a re-render" {

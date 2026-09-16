@@ -14,6 +14,7 @@ const chroma = @import("chroma.zig");
 const workspace = @import("workspace.zig");
 const pasteboard = @import("pasteboard.zig");
 const dockopen = @import("dockopen.zig");
+const prefs = @import("prefs.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -59,7 +60,7 @@ const main_window_id: platform.WindowId = 1;
 /// read, and they sat two releases apart (0.1.0 against 0.3.0) without a
 /// single warning. `tests.zig` now parses `app.zon` and fails naming the
 /// field that drifted — bump one and the other is not optional.
-pub const app_version = "0.8.0";
+pub const app_version = "0.9.0";
 pub const app_name = "smoosh";
 pub const app_display_name = "Smoosh";
 pub const app_bundle_id = "dev.native_sdk.smoosh";
@@ -456,8 +457,20 @@ pub const Destination = enum {
     /// The source's folder is read-only AND the source is a screenshot
     /// (`looksLikeScreenshot`) — so it is one macOS itself parked
     /// somewhere unwritable, and the screenshot folder is where its owner
-    /// already expects to find it. `dest_dir` names that folder.
+    /// already expects to find it. `dest_dir` names that folder, and it
+    /// is literally `~/Desktop`: the stock setting, and the only one that
+    /// may be NAMED in the copy.
     desktop,
+    /// The same rescue, aimed at a screenshot folder the user has MOVED
+    /// (`com.apple.screencapture location` — see `src/prefs.zig`).
+    ///
+    /// It is a separate arm rather than a flag beside `.desktop` because
+    /// the only thing that differs is the copy, and the copy is a switch
+    /// over this enum in three places. `update` cannot tell the two apart
+    /// itself — that needs `$HOME`, which lives in the bridge — so the
+    /// bridge sends the fact in `file.destination`'s reply and the policy
+    /// stays here.
+    screenshot_folder,
     /// The source's folder is read-only and nothing suggests where else
     /// the user would want the files — a read-only volume, a disc image,
     /// `/Applications`. The outputs are encoded into the app cache
@@ -1104,6 +1117,13 @@ pub const Model = struct {
                 // lie, which is the whole reason this is a switch.
                 .beside_source => "Done.",
                 .desktop => "Saved to Desktop.",
+                // The folder is the user's own choice and can be called
+                // anything, so it is described rather than named: a
+                // basename would have to be formatted into a buffer, and
+                // "Saved to Shots." names something only its owner would
+                // recognise. "your screenshot folder" is true whatever
+                // they called it, and points at the setting they made.
+                .screenshot_folder => "Saved to your screenshot folder.",
                 // Nothing the user can keep has been written: the outputs
                 // are in a cache the OS may purge, and Save As is the way
                 // out. The line has to say so, because "Done." over a
@@ -1556,7 +1576,13 @@ fn beginEncode(model: *Model, fx: *Effects, output: Output) void {
 fn writeFailureAdvice(destination: Destination) []const u8 {
     return switch (destination) {
         .beside_source => "check the folder's permissions.",
-        .desktop => "check Privacy & Security.",
+        // Both rescue arms give the TCC advice, including the moved one.
+        // It is a judgement call and worth stating: the folders people
+        // actually move screenshots to are Documents, Downloads, or a
+        // subfolder of one, and TCC covers those trees whole. A folder
+        // created outside them, where a mode bit is the likelier cause,
+        // is the rarer case — and this line has room for one answer.
+        .desktop, .screenshot_folder => "check Privacy & Security.",
         // Nothing about permissions to offer: this is the app's own cache
         // directory, so a failure here is the disk or the OS having purged
         // it mid-run, neither of which is a folder the user can fix.
@@ -1575,6 +1601,13 @@ fn writeFailureCollapsed(destination: Destination) []const u8 {
         // NAMING the Desktop matters: the user never chose it, so "that
         // folder" would point at something they have no reason to think of.
         .desktop => "Couldn't write to your Desktop — check Privacy & Security.",
+        // No "check" here, where the other three have one: naming the
+        // folder costs more characters than naming the Desktop does, and
+        // the 65-byte status line (pinned by a test) has room for the
+        // folder or the verb, not both. The folder wins — it is the fact
+        // the user cannot work out, and the three sibling sentences carry
+        // the imperative by parallel.
+        .screenshot_folder => "Couldn't write to your screenshot folder — Privacy & Security.",
         .ask => "Couldn't write the compressed files — the disk may be full.",
     };
 }
@@ -1899,16 +1932,23 @@ pub fn looksLikeScreenshot(path: []const u8) bool {
     return std.mem.startsWith(u8, path[name_start..], "Screenshot");
 }
 
-/// `file.destination`'s answer: `"<0|1>\x00<screenshot dir>\x00<outbox dir>"`.
-/// The flag is whether the SOURCE's own folder took a probe write; the two
-/// directories are the fallbacks, always sent so `update` can pick between
-/// them without a second round trip. NUL-delimited for the same reason
-/// `encodePayload` is: both fields are paths, and a path may contain a
-/// newline.
+/// `file.destination`'s answer:
+/// `"<0|1>\x00<screenshot dir>\x00<outbox dir>\x00<0|1>"`.
+///
+/// The first flag is whether the SOURCE's own folder took a probe write;
+/// the two directories are the fallbacks, always sent so `update` can pick
+/// between them without a second round trip. The last flag is whether the
+/// screenshot directory is literally `~/Desktop` — the one fact that
+/// separates `.desktop` from `.screenshot_folder`, and one `update` cannot
+/// work out for itself because it never holds `$HOME`.
+///
+/// NUL-delimited for the same reason `encodePayload` is: two fields are
+/// paths, and a path may contain a newline.
 pub const DestinationInfo = struct {
     source_dir_writable: bool,
     screenshot_dir: []const u8,
     outbox_dir: []const u8,
+    screenshot_dir_is_desktop: bool,
 };
 
 pub fn parseDestinationReply(bytes: []const u8) ?DestinationInfo {
@@ -1917,10 +1957,18 @@ pub fn parseDestinationReply(bytes: []const u8) ?DestinationInfo {
     if (flag.len != 1 or (flag[0] != '0' and flag[0] != '1')) return null;
     const screenshot_dir = it.next() orelse return null;
     const outbox_dir = it.next() orelse return null;
+    // Validated exactly like the first flag, and REQUIRED rather than
+    // defaulted: a reply missing it is a bridge that no longer matches
+    // this parser, and the honest answer to that is the same degradation
+    // a malformed flag already gets — `.beside_source`, unchanged
+    // behaviour — not a guess about which folder the copy may name.
+    const desktop_flag = it.next() orelse return null;
+    if (desktop_flag.len != 1 or (desktop_flag[0] != '0' and desktop_flag[0] != '1')) return null;
     return .{
         .source_dir_writable = flag[0] == '1',
         .screenshot_dir = screenshot_dir,
         .outbox_dir = outbox_dir,
+        .screenshot_dir_is_desktop = desktop_flag[0] == '1',
     };
 }
 
@@ -2287,7 +2335,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     // to `.ask`.
                     if (!info.source_dir_writable or isEphemeralSource(model.path())) {
                         if (looksLikeScreenshot(model.path())) {
-                            model.destination = .desktop;
+                            model.destination = if (info.screenshot_dir_is_desktop)
+                                .desktop
+                            else
+                                .screenshot_folder;
                             model.setDestDir(info.screenshot_dir);
                         } else {
                             model.destination = .ask;
@@ -2982,6 +3033,52 @@ const HostBridge = struct {
         return std.mem.span(home_z);
     }
 
+    /// The folder macOS puts screenshots in, written into `buffer`, plus
+    /// whether that folder is literally `~/Desktop`.
+    ///
+    /// The single answer to "where does an image with no home of its own
+    /// go" — both the screenshot rescue and the invented name for a
+    /// pasted picture ask it, and a user who has moved their screenshot
+    /// folder moved it for both.
+    ///
+    /// `~/Desktop` is the fallback for every way the preference can fail
+    /// to name a usable folder, INCLUDING one that no longer exists.
+    /// That last check is load-bearing rather than defensive: this
+    /// command deliberately never CREATES the screenshot directory (see
+    /// `destinationFor`), which was safe only while the answer was always
+    /// `~/Desktop`. A stale preference left pointing at a deleted folder
+    /// would otherwise send every output into a directory that is not
+    /// there, and surface as a write failure blamed on permissions.
+    ///
+    /// `null` only when the process has no `$HOME`, which is the same
+    /// condition `homeDir` reports and the callers already handle.
+    fn screenshotDir(self: *HostBridge, buffer: []u8) ?struct {
+        dir: []const u8,
+        is_desktop: bool,
+    } {
+        const home = homeDir() orelse return null;
+        var desktop_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        const desktop = std.fmt.bufPrint(&desktop_buf, "{s}/Desktop", .{home}) catch return null;
+
+        var raw_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        var moved_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        if (prefs.screenshotLocation(&raw_buf)) |raw| {
+            if (prefs.normalizeScreenshotDir(raw, home, &moved_buf)) |moved| {
+                const stat = std.Io.Dir.cwd().statFile(self.io, moved, .{}) catch null;
+                if (stat != null and stat.?.kind == .directory) {
+                    const dir = std.fmt.bufPrint(buffer, "{s}", .{moved}) catch return null;
+                    // A user who points the preference AT the Desktop gets
+                    // `.desktop` and the copy that names it — the setting
+                    // says where, not which sentence.
+                    return .{ .dir = dir, .is_desktop = std.mem.eql(u8, moved, desktop) };
+                }
+            }
+        }
+
+        const dir = std.fmt.bufPrint(buffer, "{s}", .{desktop}) catch return null;
+        return .{ .dir = dir, .is_desktop = true };
+    }
+
     /// `<cache>/<child>` for this app, e.g. `~/Library/Caches/smoosh/staged`.
     fn cacheSubdir(child: []const u8, buffer: []u8) ?[]const u8 {
         const home = homeDir() orelse return null;
@@ -3032,19 +3129,21 @@ const HostBridge = struct {
     ///  - the bytes go to the cache `staged` directory, the same single
     ///    slot `stashFile` uses and clears the same way, and that is the
     ///    `read` path;
-    ///  - the `nominal` path is `~/Desktop/smoosh-<timestamp>.png`. It is never
-    ///    written. It exists so the machinery downstream has a name and a
-    ///    DIRECTORY to reason about, and the Desktop is the honest answer
-    ///    to "where does an image with no source folder go" — the same
-    ///    call v0.5 already makes for a screenshot stranded somewhere
-    ///    read-only.
+    ///  - the `nominal` path is `<screenshot folder>/smoosh-<timestamp>.png`,
+    ///    the Desktop unless the user has moved it (`screenshotDir`). It is
+    ///    never written. It exists so the machinery downstream has a name
+    ///    and a DIRECTORY to reason about, and the screenshot folder is the
+    ///    honest answer to "where does an image with no source folder go" —
+    ///    the same call the rescue already makes for a screenshot stranded
+    ///    somewhere read-only, and someone who moved that folder moved it
+    ///    for both.
     ///
     /// The nominal name is a LOCAL TIMESTAMP (`pastedName`), which is
     /// what keeps two different pastes from clobbering each other's
-    /// outputs on the Desktop — the silent-overwrite policy is about
-    /// re-running on the same source, and two pastes are not that. It
-    /// also reads: a Desktop of `smoosh-2026-09-10-143005.avif` says
-    /// which is which, where a counter would not.
+    /// outputs there — the silent-overwrite policy is about re-running on
+    /// the same source, and two pastes are not that. It also reads: a
+    /// folder of `smoosh-2026-09-10-143005.avif` says which is which,
+    /// where a counter would not.
     ///
     /// Synchronous on the loop thread, like the other file commands and
     /// for the same reason `stashFile` is — AppKit's pasteboard is
@@ -3060,16 +3159,15 @@ const HostBridge = struct {
         const kind = pasteboard.imageKind() orelse
             return self.reply(key, false, "no image on the pasteboard");
 
-        const home = homeDir() orelse return self.reply(key, false, "no home dir");
-        var desktop_buf: [platform.max_dialog_path_bytes]u8 = undefined;
-        const desktop = std.fmt.bufPrint(&desktop_buf, "{s}/Desktop", .{home}) catch
-            return self.reply(key, false, "desktop path too long");
+        var home_buf: [platform.max_dialog_path_bytes]u8 = undefined;
+        const home_dir = self.screenshotDir(&home_buf) orelse
+            return self.reply(key, false, "no home dir");
 
         var name_buf: [64]u8 = undefined;
         const name = pastedName(&name_buf) orelse
             return self.reply(key, false, "could not name the pasted image");
         const nominal = std.fmt.bufPrint(&paste_path_buf, "{s}/{s}.{s}", .{
-            desktop,
+            home_dir.dir,
             name,
             kind.extension(),
         }) catch return self.reply(key, false, "paste path too long");
@@ -3117,9 +3215,10 @@ const HostBridge = struct {
     ///
     /// The outbox is created eagerly because `.ask` needs somewhere for
     /// the encode to land, and creating it here means `beginEncode` never
-    /// has to. The screenshot directory is NOT created: it is `~/Desktop`,
-    /// which exists, and if it somehow does not the write reports its own
-    /// failure rather than this command inventing a folder.
+    /// has to. The screenshot directory is NOT created — `screenshotDir`
+    /// only ever answers a folder that already exists, falling back to
+    /// `~/Desktop` otherwise, so there is nothing left for this command to
+    /// invent.
     fn destinationFor(self: *HostBridge, key: u64, source: []const u8) void {
         const dir_end = std.mem.lastIndexOfScalar(u8, source, '/') orelse
             return self.reply(key, false, "no directory");
@@ -3144,12 +3243,9 @@ const HostBridge = struct {
         // Both fallbacks are sent on every answer, writable or not: they
         // are constants for the process, and one round trip that carries
         // everything beats a second one at the moment a decision is made.
-        const home = homeDir() orelse "";
         var screenshot_buf: [platform.max_dialog_path_bytes]u8 = undefined;
-        const screenshot_dir = if (home.len == 0)
-            ""
-        else
-            std.fmt.bufPrint(&screenshot_buf, "{s}/Desktop", .{home}) catch "";
+        const screenshot = self.screenshotDir(&screenshot_buf);
+        const screenshot_dir = if (screenshot) |s| s.dir else "";
 
         var outbox_buf: [platform.max_dialog_path_bytes]u8 = undefined;
         const outbox_dir = blk: {
@@ -3158,10 +3254,15 @@ const HostBridge = struct {
             break :blk dir;
         };
 
-        const reply_text = std.fmt.bufPrint(&destination_reply_buf, "{s}\x00{s}\x00{s}", .{
+        const reply_text = std.fmt.bufPrint(&destination_reply_buf, "{s}\x00{s}\x00{s}\x00{s}", .{
             if (writable) "1" else "0",
             screenshot_dir,
             outbox_dir,
+            // With no `$HOME` there is no screenshot directory to describe,
+            // and `update` will never reach either rescue arm anyway — the
+            // empty directory above sees to that. "1" keeps the field
+            // valid without claiming a folder that was not named.
+            if (screenshot == null or screenshot.?.is_desktop) "1" else "0",
         }) catch return self.reply(key, false, "reply too long");
         self.reply(key, true, reply_text);
     }

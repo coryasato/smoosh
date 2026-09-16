@@ -72,7 +72,8 @@ the chord (AppKit resolves key equivalents against the menu bar first, and the S
 the Edit menu's Paste only when a text widget has focus, which this window never has), and
 `PlatformServices.readClipboardData` resolves text mime types ONLY and caps at 64 KiB. A pasted
 FILE re-enters the same load chain a picked one does; pasted PIXELS are written to the cache first
-and paired with an invented Desktop name. `src/pasteboard.zig`'s header carries the rest.
+and paired with an invented name in the screenshot folder (the Desktop unless the user has moved
+it — `src/prefs.zig`). `src/pasteboard.zig`'s header carries the rest.
 
 ## Core Principles for this project
 1. **Extremely simple UX** — drop zone is the entire product. Minimal chrome.
@@ -156,6 +157,13 @@ that hides until the other artifact is built.
   installing a delegate of ours; its header records why extending beats replacing, and why `install`
   MUST be called before `runtime.run` (AppKit snapshots the delegate's methods at `setDelegate:`,
   which the host does inside `runWithCallback:`).
+- `src/prefs.zig` — the CoreFoundation preferences seam, the fourth sibling of `workspace.zig` /
+  `pasteboard.zig` / `dockopen.zig`. Reads exactly one preference, `com.apple.screencapture`'s
+  `location`, which is what keeps the screenshot rescue and the pasted-picture name from assuming
+  the Desktop. Its header records the one rule the siblings do NOT follow: CoreFoundation's
+  Create/Copy functions return +1, so this module `CFRelease`s where they release nothing.
+  The path policy (`normalizeScreenshotDir`) is split out PURE so it can be tested without a live
+  preference on the machine running the tests; the CF read itself is untested, like `homeDir`.
 - `src/chroma.zig` — the source-container chroma table plus the hand-rolled JPEG SOF parser, which
   is how `avifenc --yuv auto`'s behaviour survives decoding everything to RGBA. Pure over bytes.
 - `src/encoders.zig` — the Zig-to-encoder seam, the mirror of `imageio.zig`. `encodeAvif`/
@@ -247,11 +255,12 @@ says how much you are over.
   menu. `main.zig`'s `app_shortcuts` carries this.
 - A hand-bound `clipboard.paste` over `src/pasteboard.zig`. Two payload shapes, one reply
   (`"<nominal>\x00<read>"`): a file URL loads like a pick, raw pixels are written into the cache
-  `staged` slot and paired with an invented Desktop name (`pastedName`, a LOCAL timestamp via
-  `strftime` over `localtime` — the `tm` stays opaque, so no hand-written Darwin struct can be
-  subtly wrong), which reuses `Model.stash_path_buffer`'s run-is-about-one-path/reads-another split
-  rather than adding a second mechanism. The open panel states NO extension filter, for the reason
-  `openFile` gives: the probe is the gate, and drops and pastes consult no list.
+  `staged` slot and paired with an invented name in the screenshot folder (`pastedName`, a LOCAL
+  timestamp via `strftime` over `localtime` — the `tm` stays opaque, so no hand-written Darwin
+  struct can be subtly wrong), which reuses `Model.stash_path_buffer`'s
+  run-is-about-one-path/reads-another split rather than adding a second mechanism. The open panel
+  states NO extension filter, for the reason `openFile` gives: the probe is the gate, and drops and
+  pastes consult no list.
 - A hand-bound `shell.reveal` host command over `-[NSWorkspace activateFileViewerSelectingURLs:]`
   (`src/workspace.zig`), for "Show in Finder". The SDK exposes no workspace or open-URL API at all,
   and the app spawns no subprocess, so `open -R` is not available either.

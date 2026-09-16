@@ -48,16 +48,19 @@ Beside the original, normally. Smoosh works out where a file's outputs can go *b
 Smoosh, so it never finishes the work and then discovers it has nowhere to put it:
 
 - **Beside the original** when that folder takes a write.
-- **On your Desktop** for a screenshot sitting somewhere read-only — macOS parked it there, and the
-  Desktop is where its owner already expects to find it. The status line says `Saved to Desktop.`
-  rather than a bare "Done.", so you are never left guessing.
+- **In your screenshot folder** for a screenshot sitting somewhere read-only — macOS parked it
+  there, and the folder it saves screenshots to is where its owner already expects to find it. That
+  is your Desktop unless you have moved it in Screenshot.app, which Smoosh reads and follows. The
+  status line says `Saved to Desktop.` — or `Saved to your screenshot folder.` if you have moved it
+  — rather than a bare "Done.", so you are never left guessing.
 - **Nowhere, until you say** for anything else in a read-only folder. The line reads
   `That folder is read-only — save a copy.` and each result's save icon puts it where you want it.
   Smoosh will not guess a folder for your files.
 
 A **pasted** picture with no file behind it — a screenshot, or an image copied out of a web page —
-goes to the Desktop under the time you pasted it (`smoosh-2026-09-10-143005.avif`), so pastes never
-write over each other. A pasted *file* is treated exactly like a dragged one.
+goes to that same screenshot folder, under the time you pasted it
+(`smoosh-2026-09-10-143005.avif`), so pastes never write over each other. A pasted *file* is treated
+exactly like a dragged one.
 
 ## Input
 
@@ -102,10 +105,6 @@ paid Apple Developer identity.
 - Nothing at runtime. No Homebrew packages, no external encoders, no Node.
 
 ### Rough edges
-
-If you have moved your screenshot folder off the Desktop, Smoosh does not know: a screenshot rescued
-from a read-only folder, and a pasted picture with no file behind it, both go to `~/Desktop`
-literally.
 
 Dock drops and "Open With" need the installed app. Running Smoosh straight from `native dev` or
 `native build` produces a bare binary that macOS gives no Dock identity, so neither door exists
@@ -166,6 +165,7 @@ src/chroma.zig      the source-container chroma table + JPEG SOF parser
 src/pasteboard.zig  the NSPasteboard seam behind Cmd+V
 src/workspace.zig   the NSWorkspace seam behind "Show in Finder"
 src/dockopen.zig    the app-delegate seam behind Dock drops and "Open With"
+src/prefs.zig       the CFPreferences seam: where macOS saves screenshots
 third_party/        vendored encode-only static archives
 app.zon             identity, window, permissions, capabilities
 ```

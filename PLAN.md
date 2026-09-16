@@ -11,7 +11,7 @@ A beautiful, instant native macOS app that lets you drop an image and get back h
 web formats (AVIF and/or WebP) without leaving your desktop.
 
 ## Status
-**v0.8 — feature-complete, zero-dependency, and not distributed.** Pick, drop or paste an image,
+**v0.9 — feature-complete, zero-dependency, and not distributed.** Pick, drop or paste an image,
 choose AVIF/WebP/Both, and Smoosh writes the outputs itself and says where they went; each landed
 result row carries its own save icon to copy that one file elsewhere. Ships as an ad-hoc-signed
 `.app`, arm64 only.
@@ -22,8 +22,8 @@ its own worker thread — with libaom itself spread across several cores since v
 keeps painting. **The app spawns no subprocess and needs nothing installed.**
 
 **Where the outputs go is decided per file, before the run** — beside the source when that folder
-takes a write, the Desktop for a screenshot stranded somewhere read-only, and nowhere-but-Save-As
-otherwise (see `Destination` in `src/main.zig`).
+takes a write, the screenshot folder for a screenshot stranded somewhere read-only, and
+nowhere-but-Save-As otherwise (see `Destination` in `src/main.zig`).
 
 ## What is open
 Two things, and neither is a task waiting to be picked up. **Everything else in this file is
@@ -133,7 +133,8 @@ savings", since no client ever downloads both.
   about. Whoever presses Smoosh quickly never sees it. The two predicates have to move together:
   any source whose bytes were worth rescuing has a folder not worth writing to.
 - Cmd+V, via a registered `platform.Shortcut` and `Options.on_command` — a file URL on the
-  pasteboard loads like a pick, raw pixels are written into the cache and filed to the Desktop.
+  pasteboard loads like a pick, raw pixels are written into the cache and filed to the screenshot
+  folder.
   CLAUDE.md's "Cmd+V is a THIRD seam" and `src/pasteboard.zig`'s header carry why neither the SDK's
   clipboard seam nor `on_key` could serve this.
 - A drag onto the DOCK TILE, and Finder's "Open With", via an `application:openURLs:` method
@@ -227,11 +228,6 @@ measurements behind each are in `docs/phase-b-baseline.md`.
   decode is 3-8% of a run, so the "not latency" half is a number now, not an expectation.
 - **arm64 only.** The vendored archives are non-fat arm64-macos; producing an x86_64 or universal
   build is unexplored. A genuine gap the moment the `.app` is handed to anyone else.
-- **`~/Desktop` is hardcoded in two places now.** A custom `com.apple.screencapture location` is
-  not read — that needs a `CFPreferencesCopyAppValue` binding, since the app spawns no subprocess —
-  so both the screenshot rescue (`Destination.desktop`) and a raw-bytes paste file to `~/Desktop`
-  literally. A user who has moved their screenshot folder gets their files somewhere they did not
-  choose. One binding fixes both.
 - **A raw-bytes paste writes its file on the loop thread.** `clipboard.paste` must read the
   pasteboard from the main thread (AppKit), and `-[NSData writeToFile:atomically:]` then runs there
   too, so a very large pasted image stalls the window for the length of one write. Moving it would
@@ -243,6 +239,17 @@ measurements behind each are in `docs/phase-b-baseline.md`.
   landing while the other fails is `.done` with the failure named in the status bar. Only an
   all-failed run is `.failed` — the worker writes its own output file, so anything else would
   contradict a file already on disk.
+- **The screenshot folder is READ from macOS, not assumed to be the Desktop.**
+  `com.apple.screencapture location` is the setting, `src/prefs.zig` the seam, and both places that
+  guess a folder consult it — the screenshot rescue and the invented home for a pasted picture.
+  `Destination` carries `.desktop` and `.screenshot_folder` as separate arms for one reason: the
+  only thing that differs is the copy, and a status line saying "Saved to Desktop." over a file in
+  Pictures is the class of lie this app does not tell. `update` cannot tell the two apart itself
+  (that needs `$HOME`), so the bridge sends the fact in `file.destination`'s reply.
+
+  A folder the preference names but that does NOT exist falls back to the Desktop. That check is
+  load-bearing, not defensive: `destinationFor` deliberately never creates the screenshot directory,
+  which was safe only while the answer was always `~/Desktop`.
 - **Save As is per-format**, not a single "Both" action. Each result row has its own save icon, each
   running its own one-shot save-dialog-then-copy round. Pressing either while a round is in flight
   is a no-op.

@@ -3,6 +3,23 @@
 For the engineering record — the decisions still in force, and the measurements the encoder work was
 held to — see [PLAN.md](PLAN.md) and [docs/phase-b-baseline.md](docs/phase-b-baseline.md).
 
+## v0.9 — 2026-09-16
+
+Smoosh now puts files where macOS puts screenshots, instead of assuming that is the Desktop.
+
+- **If you have moved your screenshot folder, Smoosh follows it.** macOS lets you choose where
+  screenshots are saved (Screenshot.app's Options menu), and Smoosh used to ignore that and write to
+  `~/Desktop` literally. Both places it guessed a folder now read your setting: a screenshot rescued
+  from a read-only folder, and a pasted picture with no file behind it.
+- **The status line stopped claiming "Desktop" when it isn't.** A rescued screenshot that landed
+  somewhere else now says `Saved to your screenshot folder.`, and a write that was refused there
+  names that folder rather than your Desktop.
+- **Nothing changes if you have not moved it**, which is the default — the wording and the folder
+  are exactly what they were.
+
+A folder that no longer exists is not used: if your setting points somewhere that has been deleted,
+Smoosh falls back to the Desktop rather than failing the write.
+
 ## v0.8 — 2026-09-12
 
 Faster. A 12-megapixel photo — an ordinary phone picture — used to take about two seconds to come
